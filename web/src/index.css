@@ -1,0 +1,72 @@
+@import "tailwindcss";
+@import "@xterm/xterm/css/xterm.css";
+
+@theme {
+  --color-app: #17181a;
+  --color-surface: #1e2023;
+  --color-raised: #232427;
+  --color-accent: #e2665e;
+  --color-on-accent: #1a0f0d;
+  --color-txt-primary: #f2f2f0;
+  --color-txt-bright: #e8e8e6;
+  --color-txt-secondary: #9a9c9f;
+  --color-txt-body: #c8cace;
+  --color-txt-dim: #6b6d70;
+  --color-txt-dimmer: #5c5e62;
+  --color-txt-placeholder: #3a3b3d;
+  --color-diff-added: #7ec699;
+  --color-diff-removed: #c1615c;
+  --color-border: rgba(255, 255, 255, 0.08);
+  --color-border-strong: rgba(255, 255, 255, 0.25);
+  --font-ui: "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+/* Modo claro: mismos tokens semanticos, valores invertidos. Se activa con la clase
+   .light en <html> (ver theme.ts) en vez de depender solo de prefers-color-scheme,
+   para que el toggle manual del usuario tenga la ultima palabra. */
+:root.light {
+  color-scheme: light;
+  --color-app: #f4f4f2;
+  --color-surface: #ffffff;
+  --color-raised: #ececea;
+  --color-accent: #cf5147;
+  --color-on-accent: #fdf3f2;
+  --color-txt-primary: #1c1d1f;
+  --color-txt-bright: #101113;
+  --color-txt-secondary: #55575c;
+  --color-txt-body: #33353a;
+  --color-txt-dim: #86888c;
+  --color-txt-dimmer: #9b9da0;
+  --color-txt-placeholder: #c3c5c8;
+  --color-diff-added: #2f8f5b;
+  --color-diff-removed: #b8443c;
+  --color-border: rgba(0, 0, 0, 0.1);
+  --color-border-strong: rgba(0, 0, 0, 0.28);
+}
+
+body {
+  background-color: var(--color-app);
+  color: var(--color-txt-body);
+  font-family: var(--font-ui);
+  margin: 0;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--color-txt-placeholder);
+}
+
+/* Los campos de la sidebar son notas, no un formulario: sin cajas ni bordes */
+.note-field {
+  background: transparent;
+  border: none;
+  outline: none;
+  padding: 0;
+  width: 100%;
+  resize: none;
+}
