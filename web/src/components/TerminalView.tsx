@@ -122,6 +122,7 @@ export function TerminalView({ instance, visible, onPersistFontSize, theme }: Te
       theme: terminalThemesByMode[theme],
       cursorBlink: true,
       scrollback: 5000,
+      smoothScrollDuration: 120,
       allowProposedApi: true,
       // Some TUIs send truecolor values (e.g. pure black) that bypass the theme palette;
       // this rewrites them on the fly so they are always readable on the background

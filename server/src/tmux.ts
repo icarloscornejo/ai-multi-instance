@@ -34,6 +34,7 @@ export async function createSession(sessionName: string, workingDirectory: strin
   // The tmux status bar is redundant inside the dashboard's embedded terminal
   await runTmux(["set-option", "-t", sessionName, "status", "off"]);
   await enableMouseMode(sessionName);
+  await reduceScrollStep();
 }
 
 // Without this tmux does not report the mouse wheel: xterm translates it into arrow
@@ -41,6 +42,22 @@ export async function createSession(sessionName: string, workingDirectory: strin
 // Idempotent, so it also migrates sessions that were already alive before this change.
 export async function enableMouseMode(sessionName: string): Promise<void> {
   await runTmux(["set-option", "-t", sessionName, "mouse", "on"]);
+}
+
+// tmux's default wheel binding scrolls 5 lines per tick, which feels like a jump
+// instead of a smooth scroll. Rebinding to 3 lines balances feel (less jumpy than 5)
+// against effort (1-2 lines per tick required too many ticks to cover any distance).
+// bind-key is a server-wide setting (this app runs on the default tmux
+// socket, not a dedicated one), so this affects every tmux session on the machine —
+// acceptable here since this dashboard is the only tmux user. Idempotent.
+async function reduceScrollStep(): Promise<void> {
+  // "\;" (not a bare ";") is required: tmux's own argv parser splits on a bare ";"
+  // into two separate top-level commands even without a shell involved, which would
+  // run send-keys immediately instead of chaining it into the bind-key action.
+  for (const keyTable of ["copy-mode", "copy-mode-vi"]) {
+    await runTmux(["bind-key", "-T", keyTable, "WheelUpPane", "select-pane", "\\;", "send-keys", "-X", "-N", "3", "scroll-up"]);
+    await runTmux(["bind-key", "-T", keyTable, "WheelDownPane", "select-pane", "\\;", "send-keys", "-X", "-N", "3", "scroll-down"]);
+  }
 }
 
 export async function sendCommandToSession(sessionName: string, command: string): Promise<void> {
