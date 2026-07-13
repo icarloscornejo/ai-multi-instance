@@ -23,7 +23,7 @@ cd ~/claude-multi-instance
 npm run dev
 ```
 
-Open <http://localhost:5173>.
+Open <http://claude.local> (`http://localhost` also works).
 
 1. **Initial setup** (once, or from the `Settings` button): add the folder paths where terminals will open. You can open multiple instances in the same folder at once; there is no per-folder limit.
 2. **New instance** (the `+` button): pick a location, give it a name, and optionally choose the Claude binary, model, and effort level. The dashboard opens a tmux session in that folder and launches the command. All fields are just a starting point — inside the terminal you can use `/model`, `/effort`, or any command as you normally would.
@@ -35,10 +35,10 @@ Open <http://localhost:5173>.
 ## How it works
 
 - **Backend** (`server/`): Node + Express + ws. Each instance is a tmux session (`ccdash-<id>`) created in its location folder. The browser attaches via WebSocket: the server spawns a pty running `tmux attach-session` and bridges the two. Detach on tab close, session stays alive.
-- **Frontend** (`web/`): React + Vite + xterm.js + Tailwind.
+- **Frontend** (`web/`): React + Vite + xterm.js + Tailwind, dev server on port 5173. `setup.sh` adds the `claude.local` entry to `/etc/hosts` and installs [Caddy](https://caddyserver.com) as a system service (`Caddyfile`) that proxies `http://claude.local` (port 80) to Vite, so the dashboard is reachable without a port suffix.
 - **State** (`data/instances.json`): instance registry and config, persists across restarts.
 - **Authentication**: none of its own. tmux starts your login shell, so environment variables (Vertex AI and others) arrive just as they do in any terminal.
 
 ## Requirements
 
-macOS with tmux, node 20.11+, and the `claude` CLI (all installed by `setup.sh`).
+macOS with tmux, node 20.11+, Caddy, and the `claude` CLI (all installed by `setup.sh`).

@@ -159,7 +159,78 @@ else
   exit 1
 fi
 
-# 5. Final checklist: what must be done manually by design
+# 5. claude.local: hostname + reverse proxy, so the dashboard is reachable at
+#    http://claude.local with no port suffix, while Vite keeps listening on its
+#    normal unprivileged port 5173 (macOS refuses to bind :80 without root).
+#    Caddy is installed as a brew service (a LaunchDaemon running as root, brew's
+#    standard way to let a service bind privileged ports) and proxies 80 -> 5173
+#    using the repo's Caddyfile.
+step "claude.local"
+
+# Needs a controlling terminal for sudo to prompt for the password (sudo talks to
+# /dev/tty directly, not stdin, so this works even when stdin is itself a pipe).
+# Without one (e.g. CI), skip with instructions instead of hanging.
+have_sudo_tty() { bash -c ': </dev/tty' 2>/dev/null; }
+run_as_root() { sudo "$@"; }
+
+# Both an A and an AAAA record: hostname resolvers that try IPv6 first (curl,
+# browsers) can otherwise stall for several seconds waiting on a network AAAA
+# lookup before falling back to the A record from this file.
+hosts_v4_line='127.0.0.1  claude.local'
+hosts_v6_line='::1  claude.local'
+hosts_v4_done=1
+hosts_v6_done=1
+grep -qE '^[[:space:]]*127\.0\.0\.1[[:space:]]+claude\.local([[:space:]]|$)' /etc/hosts 2>/dev/null || hosts_v4_done=0
+grep -qE '^[[:space:]]*::1[[:space:]]+claude\.local([[:space:]]|$)' /etc/hosts 2>/dev/null || hosts_v6_done=0
+missing_hosts_lines=()
+[[ "${hosts_v4_done}" -eq 0 ]] && missing_hosts_lines+=("${hosts_v4_line}")
+[[ "${hosts_v6_done}" -eq 0 ]] && missing_hosts_lines+=("${hosts_v6_line}")
+
+if [[ "${#missing_hosts_lines[@]}" -eq 0 ]]; then
+  ok "claude.local already in /etc/hosts"
+elif ! have_sudo_tty; then
+  warn "No terminal available to prompt for sudo. Add these lines to /etc/hosts manually:"
+  for line in "${missing_hosts_lines[@]}"; do echo "        ${line}"; done
+else
+  printf '%s\n' "${missing_hosts_lines[@]}" | run_as_root tee -a /etc/hosts >/dev/null
+  ok "claude.local added to /etc/hosts"
+fi
+
+if command -v caddy >/dev/null 2>&1; then
+  ok "caddy already installed ($(caddy version 2>/dev/null | head -1))"
+else
+  brew install caddy
+  ok "caddy installed"
+fi
+
+caddyfile_import="import ${INSTALL_DIR}/Caddyfile"
+brew_caddyfile="$(brew --prefix)/etc/Caddyfile"
+if [[ -f "${brew_caddyfile}" ]] && grep -qF "${caddyfile_import}" "${brew_caddyfile}"; then
+  caddy_config_done=1
+else
+  caddy_config_done=0
+fi
+
+if [[ "${caddy_config_done}" -eq 1 ]]; then
+  ok "Caddy already configured to proxy claude.local -> 5173"
+elif ! have_sudo_tty; then
+  warn "No terminal available to prompt for sudo. To finish claude.local setup manually:"
+  echo   "        echo '${caddyfile_import}' >> $(brew --prefix)/etc/Caddyfile"
+  echo   "        sudo brew services start caddy"
+else
+  echo "${caddyfile_import}" >> "${brew_caddyfile}"
+  ok "Caddy configured to proxy claude.local -> 5173"
+  # brew services runs Caddy as a root LaunchDaemon (sudo needed once here, not for
+  # "npm run dev"), so it can bind port 80 and keeps running across reboots.
+  if run_as_root brew services list 2>/dev/null | grep -qE '^caddy\s+started'; then
+    run_as_root brew services restart caddy >/dev/null
+  else
+    run_as_root brew services start caddy >/dev/null
+  fi
+  ok "Caddy running as a system service (survives reboots)"
+fi
+
+# 6. Final checklist: what must be done manually by design
 printf '\n\033[1;35m=== Done. Manual steps ===\033[0m\n'
 if [[ -z "${CLAUDE_CODE_USE_VERTEX:-}" ]]; then
   warn "CLAUDE_CODE_USE_VERTEX is not set in this shell."
@@ -172,7 +243,7 @@ cat <<EOF
 
   1. Start the dashboard:
        cd ${INSTALL_DIR} && npm run dev
-     then open http://localhost:5173
+     then open http://claude.local
 
   2. On the initial screen, add the folder paths where terminals will open.
      You can open multiple instances in the same folder at once.
