@@ -1,6 +1,16 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import type { Instance, UpdateInstancePayload } from "../types";
-import { buildLaunchCommandPreview } from "../launchCommand";
+import { buildLaunchCommandLines, buildLaunchCommandPreview } from "../launchCommand";
+
+// Splits an absolute path into indented tree lines so long paths read top-to-bottom
+// instead of wrapping mid-word in the narrow sidebar.
+function pathToTreeLines(path: string): { text: string; depth: number }[] {
+  const segments: string[] = path.split("/").filter((segment) => segment !== "");
+  return [
+    { text: "/", depth: 0 },
+    ...segments.map((segment, index) => ({ text: `└ ${segment}`, depth: index + 1 })),
+  ];
+}
 
 interface SidebarProps {
   instance: Instance;
@@ -9,17 +19,52 @@ interface SidebarProps {
   onDeleteRequest: (instance: Instance) => void;
 }
 
-function FieldLabel({ children }: { children: string }) {
-  return <div className="mb-[4px] text-[11px] text-txt-dim">{children}</div>;
+function FieldLabel({ children, action }: { children: string; action?: ReactNode }) {
+  return (
+    <div className="mb-[4px] flex items-center gap-[6px]">
+      <div className="text-[12px] font-extrabold text-txt-bright">{children}</div>
+      {action}
+    </div>
+  );
+}
+
+// navigator.clipboard requires a secure context (https, or the special-cased
+// "localhost"/127.0.0.1 hosts) — it silently throws on plain http://claude.local even
+// though that resolves to loopback, so fall back to the legacy execCommand copy there.
+async function copyText(value: string): Promise<void> {
+  if (window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch {
+      // fall through to the legacy fallback below
+    }
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  try {
+    document.execCommand("copy");
+  } finally {
+    document.body.removeChild(textarea);
+  }
 }
 
 function CopyButton({ value, title }: { value: string; title: string }) {
   const [copied, setCopied] = useState<boolean>(false);
 
   const copy = async (): Promise<void> => {
-    await navigator.clipboard.writeText(value);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
+    try {
+      await copyText(value);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch (error) {
+      console.error("Copy to clipboard failed", error);
+    }
   };
 
   return (
@@ -56,22 +101,29 @@ export function Sidebar({ instance, onUpdate, onRelaunch, onDeleteRequest }: Sid
     setEffortDraft(instance.effort ?? "");
   }, [instance.id, instance.command, instance.model, instance.effort]);
 
-  const launchCommandPreview = buildLaunchCommandPreview({
+  const launchCommandInput = {
     command: commandDraft,
     label: instance.label,
     model: modelDraft.trim() === "" ? null : modelDraft.trim(),
     effort: effortDraft.trim() === "" ? null : effortDraft.trim(),
-  });
+  };
+  const launchCommandLines = buildLaunchCommandLines(launchCommandInput);
+  const launchCommandPreview = buildLaunchCommandPreview(launchCommandInput);
 
   return (
     <aside className="flex w-[300px] flex-none flex-col gap-[16px] overflow-y-auto border-l border-border bg-app p-[20px_18px]">
-      <div className="text-[11px] font-bold text-txt-secondary">Instance notes</div>
+      <div className="border-b border-border pb-[10px] text-center text-[15px] font-extrabold text-txt-secondary">
+        Instance notes
+      </div>
 
       <div>
-        <FieldLabel>Location</FieldLabel>
-        <div className="flex items-center gap-[8px]">
-          <div className="break-all font-mono text-[12px] text-txt-secondary">{instance.locationPath}</div>
-          <CopyButton value={instance.locationPath} title="Copy location path" />
+        <FieldLabel action={<CopyButton value={instance.locationPath} title="Copy location path" />}>Location</FieldLabel>
+        <div className="font-mono text-[12px] text-txt-secondary">
+          {pathToTreeLines(instance.locationPath).map((line, index) => (
+            <div key={index} className="break-all" style={{ paddingLeft: line.depth * 10 }}>
+              {line.text}
+            </div>
+          ))}
         </div>
       </div>
 
@@ -109,10 +161,13 @@ export function Sidebar({ instance, onUpdate, onRelaunch, onDeleteRequest }: Sid
       </div>
 
       <div>
-        <FieldLabel>Command</FieldLabel>
-        <div className="flex items-center gap-[8px]">
-          <div className="break-all font-mono text-[12px] text-txt-secondary">{launchCommandPreview}</div>
-          <CopyButton value={launchCommandPreview} title="Copy full command" />
+        <FieldLabel action={<CopyButton value={launchCommandPreview} title="Copy full command" />}>Command</FieldLabel>
+        <div className="font-mono text-[12px] text-txt-secondary">
+          {launchCommandLines.map((line, index) => (
+            <div key={index} className="break-all" style={{ paddingLeft: index === 0 ? 0 : 10 }}>
+              {line}
+            </div>
+          ))}
         </div>
       </div>
 

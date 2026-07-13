@@ -18,14 +18,20 @@ interface LaunchCommandInput {
   effort: string | null;
 }
 
-export function buildLaunchCommandPreview({ command, label, model, effort }: LaunchCommandInput): string {
-  const commandParts: string[] = [command.trim() || "claude"];
+// Groups the command into display lines (flag + its value share a line), for UIs that
+// render the command vertically instead of as one long wrapping string.
+export function buildLaunchCommandLines({ command, label, model, effort }: LaunchCommandInput): string[] {
+  const lines: string[] = [command.trim() || "claude"];
   if (model) {
-    commandParts.push("--model", quoteForShell(model));
+    lines.push(`--model ${quoteForShell(model)}`);
   }
   if (effort) {
-    commandParts.push("--effort", quoteForShell(effort));
+    lines.push(`--effort ${quoteForShell(effort)}`);
   }
-  commandParts.push("-n", quoteForShell(slugifyLabel(label)));
-  return commandParts.join(" ");
+  lines.push(`-n ${quoteForShell(slugifyLabel(label))}`);
+  return lines;
+}
+
+export function buildLaunchCommandPreview(input: LaunchCommandInput): string {
+  return buildLaunchCommandLines(input).join(" ");
 }
