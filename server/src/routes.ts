@@ -1,10 +1,12 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { promisify } from "node:util";
 import express, { type Request, type Response, type NextFunction, type Router } from "express";
 import { buildLaunchCommand } from "./launch";
 import { loadState, saveState } from "./store";
-import { createSession, hasSession, killSession, sendCommandToSession } from "./tmux";
+import { createSession, getPaneCurrentPath, hasSession, killSession, sendCommandToSession } from "./tmux";
 import { checkAndApplyUpdate, getUpdateStatus } from "./updater";
 import type {
   CreateInstancePayload,
@@ -31,6 +33,18 @@ async function pathExists(candidatePath: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+const execFileAsync = promisify(execFile);
+
+async function currentBranch(cwd: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync("git", ["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"]);
+    return stdout.trim();
+  } catch {
+    // Not a git repo, git not installed, or the folder does not exist anymore
+    return null;
   }
 }
 
@@ -226,6 +240,25 @@ apiRouter.patch(
     }
     await saveState(state);
     response.json(instance);
+  })
+);
+
+apiRouter.get(
+  "/instances/:id/git",
+  wrapAsync(async (request, response) => {
+    const state: DashboardState = await loadState();
+    const instance = state.instances.find((candidate) => candidate.id === request.params.id);
+    if (instance === undefined) {
+      response.status(404).json({ error: "Instance not found." });
+      return;
+    }
+
+    // Prefer the pane's live directory (reflects `cd`s made inside the terminal);
+    // fall back to the stored starting path if the tmux session is gone.
+    const cwd: string = await getPaneCurrentPath(instance.tmuxSession).catch(() => instance.locationPath);
+    const branch: string | null = await currentBranch(cwd);
+
+    response.json(branch === null ? { cwd } : { cwd, branch });
   })
 );
 

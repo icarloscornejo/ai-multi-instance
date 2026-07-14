@@ -69,3 +69,9 @@ export async function sendCommandToSession(sessionName: string, command: string)
 export async function killSession(sessionName: string): Promise<void> {
   await runTmux(["kill-session", "-t", sessionName]);
 }
+
+// The instance's cwd can drift from its stored locationPath if the user `cd`s inside
+// the terminal; this reads the pane's live directory instead of the one it started in.
+export async function getPaneCurrentPath(sessionName: string): Promise<string> {
+  return runTmux(["display-message", "-p", "-t", sessionName, "#{pane_current_path}"]);
+}

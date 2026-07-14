@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { api } from "../api";
 import type { Instance, UpdateInstancePayload } from "../types";
 import { buildLaunchCommandLines, buildLaunchCommandPreview } from "../launchCommand";
 
@@ -93,6 +94,7 @@ export function Sidebar({ instance, onUpdate, onRelaunch, onDeleteRequest }: Sid
   const [commandDraft, setCommandDraft] = useState<string>(instance.command);
   const [modelDraft, setModelDraft] = useState<string>(instance.model ?? "");
   const [effortDraft, setEffortDraft] = useState<string>(instance.effort ?? "");
+  const [gitBranch, setGitBranch] = useState<string | null>(null);
 
   // When switching tabs the sidebar shows a different instance: resync the drafts
   useEffect(() => {
@@ -100,6 +102,28 @@ export function Sidebar({ instance, onUpdate, onRelaunch, onDeleteRequest }: Sid
     setModelDraft(instance.model ?? "");
     setEffortDraft(instance.effort ?? "");
   }, [instance.id, instance.command, instance.model, instance.effort]);
+
+  // Mirrors the statusline's behavior: show the branch only when the instance's
+  // live directory is actually a git repo, stay silent otherwise.
+  useEffect(() => {
+    let cancelled = false;
+    setGitBranch(null);
+    api
+      .getInstanceGit(instance.id)
+      .then((result) => {
+        if (!cancelled) {
+          setGitBranch(result.branch ?? null);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setGitBranch(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [instance.id]);
 
   const launchCommandInput = {
     command: commandDraft,
@@ -126,6 +150,13 @@ export function Sidebar({ instance, onUpdate, onRelaunch, onDeleteRequest }: Sid
           ))}
         </div>
       </div>
+
+      {gitBranch !== null && (
+        <div>
+          <FieldLabel>Branch</FieldLabel>
+          <div className="font-mono text-[12.5px] text-txt-body">{gitBranch}</div>
+        </div>
+      )}
 
       <div>
         <FieldLabel>Claude</FieldLabel>

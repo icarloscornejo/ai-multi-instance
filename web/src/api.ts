@@ -43,6 +43,9 @@ export const api = {
 
   listInstances: (): Promise<Instance[]> => requestJson("/api/instances"),
 
+  getInstanceGit: (instanceId: string): Promise<{ cwd: string; branch?: string }> =>
+    requestJson(`/api/instances/${instanceId}/git`),
+
   listLocations: (): Promise<LocationInfo[]> => requestJson("/api/locations"),
 
   createInstance: (payload: CreateInstancePayload): Promise<Instance> =>
