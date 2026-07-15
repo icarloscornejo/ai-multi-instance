@@ -153,7 +153,7 @@ export function Sidebar({ instance, onUpdate, onRelaunch, onDeleteRequest }: Sid
 
       {gitBranch !== null && (
         <div>
-          <FieldLabel>Branch</FieldLabel>
+          <FieldLabel action={<CopyButton value={gitBranch} title="Copy branch name" />}>Branch</FieldLabel>
           <div className="font-mono text-[12.5px] text-txt-body">{gitBranch}</div>
         </div>
       )}
