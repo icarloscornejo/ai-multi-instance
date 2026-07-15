@@ -70,3 +70,19 @@ textarea::placeholder {
   width: 100%;
   resize: none;
 }
+
+/* Franja de tabs: scrollbar fina, visible solo al hover para no comer los 46px del header */
+.tab-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border-strong) transparent;
+}
+.tab-scroll::-webkit-scrollbar {
+  height: 4px;
+}
+.tab-scroll::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 2px;
+}
+.tab-scroll:hover::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+}
