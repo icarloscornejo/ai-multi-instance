@@ -1,5 +1,7 @@
 # claude-multi-instance
 
+**Version:** 1.0.2
+
 Local dashboard to run N Claude Code sessions in parallel, each one in its own folder. A real terminal per instance (tmux underneath, so sessions survive browser restarts), tabs to switch between instances, and a config sidebar per instance (command, model, effort).
 
 ## Installation (clean machine)

@@ -122,7 +122,7 @@ export function NewInstanceModal({ instances, onCreate, onClose }: NewInstanceMo
 
   return (
     <>
-      <Modal title="New instance" onClose={onClose}>
+      <Modal title="New instance" onClose={onClose} widthClassName="w-[560px]">
         <div>
           <label className={fieldLabelClassName}>Location</label>
           <select
