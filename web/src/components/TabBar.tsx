@@ -22,7 +22,6 @@ interface TabBarProps {
   instances: Instance[];
   activeInstanceId: string | null;
   updateStatus: UpdateStatus | null;
-  updating: boolean;
   onSelect: (instanceId: string) => void;
   onRename: (instanceId: string, newLabel: string) => void;
   onReorder: (orderedIds: string[]) => void;
@@ -32,47 +31,6 @@ interface TabBarProps {
   onCloseRequest: (instance: Instance) => void;
   theme: Theme;
   onToggleTheme: () => void;
-}
-
-function UpdateResultNotice({ updateStatus }: { updateStatus: UpdateStatus | null }) {
-  if (updateStatus === null || updateStatus.lastCheckAt === null) {
-    return null;
-  }
-  if (updateStatus.pendingRestart && updateStatus.restartKind === "manual") {
-    return (
-      <span
-        className="mr-[10px] text-[11px] font-semibold text-accent"
-        title="Dashboard updated on disk. Stop npm run dev with Ctrl+C and run it again to apply the new version. Sessions live in tmux, nothing is lost."
-      >
-        Updated · restart dashboard
-      </span>
-    );
-  }
-  if (updateStatus.pendingRestart && updateStatus.restartKind === "auto") {
-    return (
-      <span
-        className="mr-[10px] text-[11px] font-semibold text-accent"
-        title="The change only touched server/web code: tsx watch and vite already hot-reloaded it, no restart needed."
-      >
-        Updated · hot-reloaded
-      </span>
-    );
-  }
-  if (updateStatus.lastError !== null) {
-    return (
-      <span className="mr-[10px] text-[11px] text-txt-dim" title={updateStatus.lastError}>
-        Update failed
-      </span>
-    );
-  }
-  if (updateStatus.blockedReason !== null) {
-    return (
-      <span className="mr-[10px] text-[11px] text-txt-dim" title={updateStatus.blockedReason}>
-        Update blocked
-      </span>
-    );
-  }
-  return <span className="mr-[10px] text-[11px] text-txt-dim">Up to date</span>;
 }
 
 interface SortableTabProps {
@@ -115,10 +73,10 @@ function SortableTab({
       {...(isEditing ? {} : listeners)}
       onClick={() => onSelect(instance.id)}
       onDoubleClick={() => onStartEditing(instance)}
-      className={`group relative mr-[4px] flex h-[30px] shrink-0 items-center gap-[8px] whitespace-nowrap rounded-[6px] border px-[12px] text-[13px] ${
+      className={`group relative mr-[6px] flex h-[32px] shrink-0 items-center gap-[7px] whitespace-nowrap rounded-full border-none px-[12px] text-[12.5px] font-medium ${
         isActive
-          ? "border-border-strong border-b-2 border-b-accent bg-raised font-semibold text-txt-primary"
-          : "border-border bg-transparent font-medium text-txt-secondary hover:border-border-strong hover:text-txt-body"
+          ? "bg-surface font-semibold text-txt-bright shadow-[0_1px_2px_rgba(0,0,0,.06),0_0_0_1px_var(--color-border)]"
+          : "bg-transparent text-txt-secondary hover:bg-raised hover:text-txt-body"
       } ${isDragging ? "z-10 opacity-80" : ""}`}
     >
       {isEditing ? (
@@ -134,7 +92,7 @@ function SortableTab({
               onCancelEditing();
             }
           }}
-          className="w-[110px] bg-transparent text-[13px] outline-none"
+          className="w-[110px] bg-transparent text-[12.5px] outline-none"
         />
       ) : (
         <span className="cursor-text select-none" title="Double-click to rename">
@@ -149,9 +107,9 @@ function SortableTab({
             onCloseRequest(instance);
           }}
           title="Close instance"
-          className="rounded-[4px] px-[4px] text-[13px] leading-none text-txt-dim opacity-0 hover:text-diff-removed group-hover:opacity-100"
+          className="w-0 overflow-hidden text-[12px] leading-none text-txt-dim opacity-0 transition-[width,opacity] hover:text-diff-removed group-hover:w-[12px] group-hover:opacity-100"
         >
-          ×
+          ✕
         </button>
       )}
     </div>
@@ -162,7 +120,6 @@ export function TabBar({
   instances,
   activeInstanceId,
   updateStatus,
-  updating,
   onSelect,
   onRename,
   onReorder,
@@ -212,67 +169,95 @@ export function TabBar({
     <header className="flex h-[46px] shrink-0 items-center border-b border-border bg-app px-[10px]">
       <img src="/claude-ai-icon.svg" alt="" className="mr-[8px] h-[20px] w-[20px] shrink-0" />
       <span className="mr-[14px] shrink-0 text-[13px] font-semibold text-txt-primary">Claude Multi-Instance</span>
-      <div className="tab-scroll mr-[10px] flex min-w-0 flex-1 flex-nowrap items-center overflow-x-auto">
-        <DndContext
-          sensors={sensors}
-          collisionDetection={closestCenter}
-          modifiers={[restrictToHorizontalAxis]}
-          onDragEnd={handleDragEnd}
-        >
-          <SortableContext items={instances.map((instance) => instance.id)} strategy={horizontalListSortingStrategy}>
-            {instances.map((instance) => (
-              <SortableTab
-                key={instance.id}
-                instance={instance}
-                isActive={instance.id === activeInstanceId}
-                isEditing={editingInstanceId === instance.id}
-                draftLabel={draftLabel}
-                editInputRef={editInputRef}
-                onSelect={onSelect}
-                onStartEditing={startEditing}
-                onDraftLabelChange={setDraftLabel}
-                onCommitEditing={commitEditing}
-                onCancelEditing={() => setEditingInstanceId(null)}
-                onCloseRequest={onCloseRequest}
-              />
-            ))}
-          </SortableContext>
-        </DndContext>
+      <div className="relative mr-[10px] min-w-0 flex-1">
+        <div className="tab-scroll flex flex-nowrap items-center overflow-x-auto">
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            modifiers={[restrictToHorizontalAxis]}
+            onDragEnd={handleDragEnd}
+          >
+            <SortableContext
+              items={instances.map((instance) => instance.id)}
+              strategy={horizontalListSortingStrategy}
+            >
+              {instances.map((instance) => (
+                <SortableTab
+                  key={instance.id}
+                  instance={instance}
+                  isActive={instance.id === activeInstanceId}
+                  isEditing={editingInstanceId === instance.id}
+                  draftLabel={draftLabel}
+                  editInputRef={editInputRef}
+                  onSelect={onSelect}
+                  onStartEditing={startEditing}
+                  onDraftLabelChange={setDraftLabel}
+                  onCommitEditing={commitEditing}
+                  onCancelEditing={() => setEditingInstanceId(null)}
+                  onCloseRequest={onCloseRequest}
+                />
+              ))}
+            </SortableContext>
+          </DndContext>
+        </div>
+        {/* Signals horizontal overflow without stealing space from the fixed toolbar */}
+        <div className="pointer-events-none absolute right-0 top-0 h-full w-[24px] bg-gradient-to-r from-transparent to-app" />
+      </div>
+      <button
+        type="button"
+        onClick={onAddClick}
+        title="New instance"
+        className="mr-[10px] flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-full bg-raised text-[16px] leading-none text-txt-secondary hover:bg-border-strong hover:text-txt-bright"
+      >
+        +
+      </button>
+      <div className="flex shrink-0 items-center gap-[2px] border-l border-border pl-[10px]">
         <button
           type="button"
-          onClick={onAddClick}
-          title="New instance"
-          className="ml-[6px] h-[28px] w-[28px] shrink-0 rounded-[6px] border border-border text-[15px] leading-none text-txt-secondary hover:text-txt-body"
+          onClick={onUpdateClick}
+          title={
+            updateStatus?.pendingRestart === true
+              ? "Restart pending: open the update screen for details"
+              : updateStatus?.updateAvailable === true
+                ? "Update available: open the update screen for details"
+                : "Check for dashboard updates"
+          }
+          className="relative h-[28px] rounded-sm px-[10px] text-[11px] font-semibold text-txt-secondary hover:bg-raised hover:text-txt-body"
         >
-          +
+          Update
+          {(updateStatus?.updateAvailable === true || updateStatus?.pendingRestart === true) && (
+            <span className="absolute -right-[2px] -top-[2px] h-[6px] w-[6px] rounded-full bg-accent" />
+          )}
+        </button>
+        <button
+          type="button"
+          onClick={onToggleTheme}
+          title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+          className="flex h-[30px] w-[30px] items-center justify-center rounded-sm text-txt-secondary hover:bg-raised hover:text-txt-body"
+        >
+          {theme === "dark" ? (
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="4" />
+              <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+            </svg>
+          ) : (
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+            </svg>
+          )}
+        </button>
+        <button
+          type="button"
+          onClick={onSettingsClick}
+          title="Configure locations"
+          className="flex h-[30px] w-[30px] items-center justify-center rounded-sm text-txt-secondary hover:bg-raised hover:text-txt-body"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="12" r="3" />
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+          </svg>
         </button>
       </div>
-      <UpdateResultNotice updateStatus={updateStatus} />
-      <button
-        type="button"
-        onClick={onUpdateClick}
-        disabled={updating}
-        title="Checks for the latest version of the dashboard on GitHub and applies it if there are no local changes"
-        className="mr-[8px] h-[28px] rounded-[6px] border border-border px-[10px] text-[11px] font-semibold text-txt-secondary hover:text-txt-body disabled:opacity-50"
-      >
-        {updating ? "Checking..." : "Update"}
-      </button>
-      <button
-        type="button"
-        onClick={onToggleTheme}
-        title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
-        className="mr-[8px] h-[28px] rounded-[6px] border border-border px-[10px] text-[11px] font-semibold text-txt-secondary hover:text-txt-body"
-      >
-        {theme === "dark" ? "Light" : "Dark"}
-      </button>
-      <button
-        type="button"
-        onClick={onSettingsClick}
-        title="Configure locations"
-        className="h-[28px] rounded-[6px] border border-border px-[10px] text-[11px] font-semibold text-txt-secondary hover:text-txt-body"
-      >
-        Settings
-      </button>
     </header>
   );
 }

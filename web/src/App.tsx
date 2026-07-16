@@ -7,6 +7,7 @@ import { SetupScreen } from "./components/SetupScreen";
 import { Sidebar } from "./components/Sidebar";
 import { TabBar } from "./components/TabBar";
 import { TerminalView } from "./components/TerminalView";
+import { UpdateScreen } from "./components/UpdateScreen";
 import { applyTheme, getInitialTheme, type Theme } from "./theme";
 import type {
   CreateInstancePayload,
@@ -22,10 +23,10 @@ export function App() {
   const [activeInstanceId, setActiveInstanceId] = useState<string | null>(null);
   const [isNewInstanceModalOpen, setIsNewInstanceModalOpen] = useState<boolean>(false);
   const [settingsOpen, setSettingsOpen] = useState<boolean>(false);
+  const [updateViewOpen, setUpdateViewOpen] = useState<boolean>(false);
   const [deleteRequest, setDeleteRequest] = useState<Instance | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
-  const [updating, setUpdating] = useState<boolean>(false);
   const [theme, setTheme] = useState<Theme>(getInitialTheme);
 
   useEffect(() => {
@@ -56,18 +57,6 @@ export function App() {
       })
       .catch(() => undefined);
   }, []);
-
-  const runUpdate = (): void => {
-    if (updating) {
-      return;
-    }
-    setUpdating(true);
-    api
-      .runUpdate()
-      .then(setUpdateStatus)
-      .catch((error: Error) => console.error("Could not check for updates:", error.message))
-      .finally(() => setUpdating(false));
-  };
 
   useEffect(() => {
     if (activeInstanceId !== null) {
@@ -161,6 +150,15 @@ export function App() {
       />
     );
   }
+  if (updateViewOpen) {
+    return (
+      <UpdateScreen
+        initialStatus={updateStatus}
+        onStatusChange={setUpdateStatus}
+        onClose={() => setUpdateViewOpen(false)}
+      />
+    );
+  }
 
   const activeInstance: Instance | undefined = instances.find(
     (candidate) => candidate.id === activeInstanceId
@@ -172,12 +170,11 @@ export function App() {
         instances={instances}
         activeInstanceId={activeInstanceId}
         updateStatus={updateStatus}
-        updating={updating}
         onSelect={setActiveInstanceId}
         onRename={(instanceId, newLabel) => updateInstance(instanceId, { label: newLabel })}
         onReorder={reorderInstances}
         onAddClick={() => setIsNewInstanceModalOpen(true)}
-        onUpdateClick={runUpdate}
+        onUpdateClick={() => setUpdateViewOpen(true)}
         onSettingsClick={() => setSettingsOpen(true)}
         onCloseRequest={setDeleteRequest}
         theme={theme}
@@ -212,7 +209,7 @@ export function App() {
       </div>
 
       {isNewInstanceModalOpen && (
-        <NewInstanceModal onCreate={createInstance} onClose={() => setIsNewInstanceModalOpen(false)} />
+        <NewInstanceModal instances={instances} onCreate={createInstance} onClose={() => setIsNewInstanceModalOpen(false)} />
       )}
 
       {deleteRequest !== null && (

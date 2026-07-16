@@ -2,6 +2,7 @@ import type {
   CreateInstancePayload,
   DashboardConfig,
   Instance,
+  LocationBranches,
   LocationInfo,
   UpdateInstancePayload,
   UpdateStatus,
@@ -36,7 +37,9 @@ export const api = {
 
   getUpdateStatus: (): Promise<UpdateStatus> => requestJson("/api/update-status"),
 
-  runUpdate: (): Promise<UpdateStatus> => requestJson("/api/update", { method: "POST" }),
+  checkForUpdate: (): Promise<UpdateStatus> => requestJson("/api/update/check", { method: "POST" }),
+
+  applyUpdate: (): Promise<UpdateStatus> => requestJson("/api/update/apply", { method: "POST" }),
 
   saveConfig: (payload: { locations: string[] }): Promise<DashboardConfig> =>
     requestJson("/api/config", { method: "PUT", body: JSON.stringify(payload) }),
@@ -46,7 +49,16 @@ export const api = {
   getInstanceGit: (instanceId: string): Promise<{ cwd: string; branch?: string }> =>
     requestJson(`/api/instances/${instanceId}/git`),
 
+  getInstanceStatus: (instanceId: string): Promise<{ alive: boolean }> =>
+    requestJson(`/api/instances/${instanceId}/status`),
+
   listLocations: (): Promise<LocationInfo[]> => requestJson("/api/locations"),
+
+  getLocationBranches: (locationPath: string): Promise<LocationBranches> =>
+    requestJson(`/api/locations/branches?path=${encodeURIComponent(locationPath)}`),
+
+  getLocationExists: (locationPath: string): Promise<{ exists: boolean }> =>
+    requestJson(`/api/locations/exists?path=${encodeURIComponent(locationPath)}`),
 
   createInstance: (payload: CreateInstancePayload): Promise<Instance> =>
     requestJson("/api/instances", { method: "POST", body: JSON.stringify(payload) }),

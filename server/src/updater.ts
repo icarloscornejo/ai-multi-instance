@@ -9,10 +9,20 @@ const dashboardRepoRoot: string = path.resolve(import.meta.dirname, "../..");
 
 export type RestartKind = "none" | "auto" | "manual";
 
+export interface ChangelogEntry {
+  hash: string;
+  shortHash: string;
+  date: string;
+  subject: string;
+}
+
 export interface UpdateStatus {
   startedAtCommit: string | null;
   currentCommit: string | null;
   remoteCommit: string | null;
+  currentSubject: string | null;
+  remoteSubject: string | null;
+  changelog: ChangelogEntry[];
   updateAvailable: boolean;
   pendingRestart: boolean;
   restartKind: RestartKind;
@@ -25,6 +35,9 @@ const status: UpdateStatus = {
   startedAtCommit: null,
   currentCommit: null,
   remoteCommit: null,
+  currentSubject: null,
+  remoteSubject: null,
+  changelog: [],
   updateAvailable: false,
   pendingRestart: false,
   restartKind: "none",
@@ -34,7 +47,7 @@ const status: UpdateStatus = {
 };
 
 // tsx watch restarts the server automatically for changes under server/src, and vite
-// hot-reloads web/src in the browser — those paths need no manual relaunch from the user.
+// hot-reloads web/src in the browser: those paths need no manual relaunch from the user.
 // Any other path (package.json, root configs, vite.config, etc.) does require one.
 function classifyRestartKind(changedPaths: string[]): RestartKind {
   if (changedPaths.length === 0) {
@@ -62,13 +75,46 @@ async function isBehindRemote(): Promise<boolean> {
   }
 }
 
+async function getSubject(ref: string): Promise<string> {
+  return runGit(["log", "-1", "--format=%s", ref]);
+}
+
+async function getChangelog(fromRef: string, toRef: string): Promise<ChangelogEntry[]> {
+  const log: string = await runGit(["log", "--format=%H%x09%h%x09%ad%x09%s", "--date=short", `${fromRef}..${toRef}`]);
+  return log
+    .split("\n")
+    .filter((line) => line !== "")
+    .map((line) => {
+      const parts: string[] = line.split("\t");
+      return {
+        hash: parts[0],
+        shortHash: parts[1],
+        date: parts[2],
+        // %s could itself contain a tab; keep everything past the third field
+        subject: parts.slice(3).join("\t"),
+      };
+    });
+}
+
+async function refreshRestartStatus(currentCommit: string): Promise<void> {
+  // The running process is behind the code on disk: a relaunch is needed
+  status.pendingRestart = status.startedAtCommit !== null && currentCommit !== status.startedAtCommit;
+  status.restartKind = status.pendingRestart
+    ? classifyRestartKind(
+        (await runGit(["diff", "--name-only", status.startedAtCommit as string, currentCommit]))
+          .split("\n")
+          .filter((changedPath) => changedPath !== "")
+      )
+    : "none";
+}
+
 export function getUpdateStatus(): UpdateStatus {
   return { ...status };
 }
 
-// Triggered on demand from the UI: fetches origin/main and, if the repo is behind
-// and has no local changes, applies the fast-forward and syncs dependencies
-export async function checkAndApplyUpdate(): Promise<UpdateStatus> {
+// Triggered on demand from the UI: fetches origin/main, compares against HEAD, and
+// reports the incoming changelog without applying anything
+export async function checkForUpdate(): Promise<UpdateStatus> {
   if (updateInProgress) {
     return getUpdateStatus();
   }
@@ -77,6 +123,44 @@ export async function checkAndApplyUpdate(): Promise<UpdateStatus> {
     if (status.startedAtCommit === null) {
       status.startedAtCommit = await runGit(["rev-parse", "HEAD"]);
     }
+    await runGit(["fetch", "--quiet", "origin", "main"]);
+    const remoteCommit: string = await runGit(["rev-parse", "origin/main"]);
+    const currentCommit: string = await runGit(["rev-parse", "HEAD"]);
+    status.currentCommit = currentCommit;
+    status.remoteCommit = remoteCommit;
+    status.currentSubject = await getSubject(currentCommit);
+    status.remoteSubject = await getSubject(remoteCommit);
+
+    if (currentCommit !== remoteCommit) {
+      const behindRemote: boolean = await isBehindRemote();
+      status.updateAvailable = behindRemote;
+      status.blockedReason = behindRemote ? null : "Local history diverges from origin/main. Update manually.";
+      status.changelog = behindRemote ? await getChangelog(currentCommit, remoteCommit) : [];
+    } else {
+      status.updateAvailable = false;
+      status.blockedReason = null;
+      status.changelog = [];
+    }
+
+    await refreshRestartStatus(currentCommit);
+    status.lastError = null;
+  } catch (error) {
+    status.lastError = (error as Error).message;
+  } finally {
+    status.lastCheckAt = new Date().toISOString();
+    updateInProgress = false;
+  }
+  return getUpdateStatus();
+}
+
+// Applies an update previously reported by checkForUpdate: fast-forwards onto
+// origin/main and syncs dependencies, but only if the repo is behind and clean
+export async function applyUpdate(): Promise<UpdateStatus> {
+  if (updateInProgress) {
+    return getUpdateStatus();
+  }
+  updateInProgress = true;
+  try {
     await runGit(["fetch", "--quiet", "origin", "main"]);
     const remoteCommit: string = await runGit(["rev-parse", "origin/main"]);
     let currentCommit: string = await runGit(["rev-parse", "HEAD"]);
@@ -97,6 +181,7 @@ export async function checkAndApplyUpdate(): Promise<UpdateStatus> {
         await runGit(["checkout", "--", "package-lock.json"]).catch(() => undefined);
         currentCommit = remoteCommit;
         status.blockedReason = null;
+        status.changelog = [];
       } else {
         status.blockedReason = workingTreeClean
           ? "Local history diverges from origin/main. Update manually."
@@ -107,16 +192,9 @@ export async function checkAndApplyUpdate(): Promise<UpdateStatus> {
     }
 
     status.currentCommit = currentCommit;
+    status.currentSubject = await getSubject(currentCommit);
     status.updateAvailable = currentCommit !== remoteCommit;
-    // The running process is behind the code on disk: a relaunch is needed
-    status.pendingRestart = status.startedAtCommit !== null && currentCommit !== status.startedAtCommit;
-    status.restartKind = status.pendingRestart
-      ? classifyRestartKind(
-          (await runGit(["diff", "--name-only", status.startedAtCommit as string, currentCommit]))
-            .split("\n")
-            .filter((changedPath) => changedPath !== "")
-        )
-      : "none";
+    await refreshRestartStatus(currentCommit);
     status.lastError = null;
   } catch (error) {
     status.lastError = (error as Error).message;

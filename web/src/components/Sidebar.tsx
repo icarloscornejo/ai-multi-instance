@@ -1,7 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { api } from "../api";
 import type { Instance, UpdateInstancePayload } from "../types";
-import { buildLaunchCommandLines, buildLaunchCommandPreview } from "../launchCommand";
 
 // Splits an absolute path into indented tree lines so long paths read top-to-bottom
 // instead of wrapping mid-word in the narrow sidebar.
@@ -23,14 +22,14 @@ interface SidebarProps {
 function FieldLabel({ children, action }: { children: string; action?: ReactNode }) {
   return (
     <div className="mb-[4px] flex items-center gap-[6px]">
-      <div className="text-[12px] font-extrabold text-txt-bright">{children}</div>
+      <div className="text-[11px] font-semibold uppercase tracking-[.02em] text-txt-bright">{children}</div>
       {action}
     </div>
   );
 }
 
 // navigator.clipboard requires a secure context (https, or the special-cased
-// "localhost"/127.0.0.1 hosts) — it silently throws on plain http://claude.local even
+// "localhost"/127.0.0.1 hosts): it silently throws on plain http://claude.local even
 // though that resolves to loopback, so fall back to the legacy execCommand copy there.
 async function copyText(value: string): Promise<void> {
   if (window.isSecureContext) {
@@ -95,6 +94,7 @@ export function Sidebar({ instance, onUpdate, onRelaunch, onDeleteRequest }: Sid
   const [modelDraft, setModelDraft] = useState<string>(instance.model ?? "");
   const [effortDraft, setEffortDraft] = useState<string>(instance.effort ?? "");
   const [gitBranch, setGitBranch] = useState<string | null>(null);
+  const [alive, setAlive] = useState<boolean | null>(null);
 
   // When switching tabs the sidebar shows a different instance: resync the drafts
   useEffect(() => {
@@ -125,24 +125,43 @@ export function Sidebar({ instance, onUpdate, onRelaunch, onDeleteRequest }: Sid
     };
   }, [instance.id]);
 
-  const launchCommandInput = {
-    command: commandDraft,
-    label: instance.label,
-    model: modelDraft.trim() === "" ? null : modelDraft.trim(),
-    effort: effortDraft.trim() === "" ? null : effortDraft.trim(),
-  };
-  const launchCommandLines = buildLaunchCommandLines(launchCommandInput);
-  const launchCommandPreview = buildLaunchCommandPreview(launchCommandInput);
+  // Liveness is based only on whether the tmux session still exists, not on whether
+  // the claude process inside it is still running: keeps the check cheap and reliable.
+  useEffect(() => {
+    let cancelled = false;
+    setAlive(null);
+    api
+      .getInstanceStatus(instance.id)
+      .then((result) => {
+        if (!cancelled) {
+          setAlive(result.alive);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setAlive(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [instance.id]);
 
   return (
-    <aside className="flex w-[300px] flex-none flex-col gap-[16px] overflow-y-auto border-l border-border bg-app p-[20px_18px]">
-      <div className="border-b border-border pb-[10px] text-center text-[15px] font-extrabold text-txt-secondary">
-        Instance notes
+    <aside className="flex w-[300px] flex-none flex-col gap-[18px] overflow-y-auto border-l border-border bg-surface p-[20px_18px]">
+      <div className="flex flex-col gap-[8px] border-b border-border pb-[14px]">
+        <div className="text-[13.5px] font-bold text-txt-bright">{instance.label}</div>
+        {alive !== null && (
+          <div className={`flex items-center gap-[6px] text-[11px] font-semibold ${alive ? "text-diff-added" : "text-txt-dim"}`}>
+            <span className={`h-[6px] w-[6px] rounded-full ${alive ? "bg-diff-added" : "bg-txt-dim"}`} />
+            {alive ? "Running" : "Stopped"}
+          </div>
+        )}
       </div>
 
       <div>
         <FieldLabel action={<CopyButton value={instance.locationPath} title="Copy location path" />}>Location</FieldLabel>
-        <div className="font-mono text-[12px] text-txt-secondary">
+        <div className="rounded-sm bg-raised px-[12px] py-[10px] font-mono text-[11.5px] text-txt-secondary">
           {pathToTreeLines(instance.locationPath).map((line, index) => (
             <div key={index} className="break-all" style={{ paddingLeft: line.depth * 10 }}>
               {line.text}
@@ -191,32 +210,21 @@ export function Sidebar({ instance, onUpdate, onRelaunch, onDeleteRequest }: Sid
         />
       </div>
 
-      <div>
-        <FieldLabel action={<CopyButton value={launchCommandPreview} title="Copy full command" />}>Command</FieldLabel>
-        <div className="font-mono text-[12px] text-txt-secondary">
-          {launchCommandLines.map((line, index) => (
-            <div key={index} className="break-all" style={{ paddingLeft: index === 0 ? 0 : 10 }}>
-              {line}
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <div className="mt-auto flex flex-col gap-[8px] pt-[16px]">
+      <div className="mt-auto flex flex-col gap-[2px] border-t border-border pt-[14px]">
         <button
           type="button"
           onClick={() => onRelaunch(instance.id)}
           title="Resends the saved launch command to the session"
-          className="self-start text-[11px] font-semibold text-txt-dim hover:text-txt-secondary"
+          className="self-start rounded-sm px-[6px] py-[8px] text-[12px] font-semibold text-txt-bright hover:bg-raised"
         >
-          Restart instance
+          ↻ Restart instance
         </button>
         <button
           type="button"
           onClick={() => onDeleteRequest(instance)}
-          className="self-start text-[11px] font-semibold text-txt-dim hover:text-diff-removed"
+          className="self-start rounded-sm px-[6px] py-[8px] text-[12px] font-semibold text-diff-removed hover:bg-diff-removed-dim"
         >
-          Delete instance
+          ✕ Delete instance
         </button>
       </div>
     </aside>

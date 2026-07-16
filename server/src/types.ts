@@ -12,6 +12,7 @@ export interface InstanceRecord {
   effort: string | null;
   fontSize: number;
   createdAt: string;
+  shellOnly?: boolean;
 }
 
 export interface DashboardState {
@@ -19,17 +20,29 @@ export interface DashboardState {
   instances: InstanceRecord[];
 }
 
+export type BranchAction =
+  | { type: "checkout"; branch: string }
+  | { type: "create"; branch: string; baseBranch: string };
+
 export interface CreateInstancePayload {
   locationPath: string;
   label?: string;
   command?: string;
   model?: string;
   effort?: string;
+  branchAction?: BranchAction;
+  shellOnly?: boolean;
 }
 
 export interface LocationInfo {
   path: string;
   folderName: string;
+}
+
+export interface LocationBranches {
+  isGitRepo: boolean;
+  branches: string[];
+  currentBranch: string | null;
 }
 
 export interface UpdateInstancePayload {

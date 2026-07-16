@@ -7,8 +7,9 @@ import express, { type Request, type Response, type NextFunction, type Router } 
 import { buildLaunchCommand } from "./launch";
 import { loadState, saveState } from "./store";
 import { createSession, getPaneCurrentPath, hasSession, killSession, sendCommandToSession } from "./tmux";
-import { checkAndApplyUpdate, getUpdateStatus } from "./updater";
+import { applyUpdate, checkForUpdate, getUpdateStatus } from "./updater";
 import type {
+  BranchAction,
   CreateInstancePayload,
   DashboardState,
   InstanceRecord,
@@ -46,6 +47,14 @@ async function currentBranch(cwd: string): Promise<string | null> {
     // Not a git repo, git not installed, or the folder does not exist anymore
     return null;
   }
+}
+
+async function localBranches(cwd: string): Promise<string[]> {
+  const { stdout } = await execFileAsync("git", ["-C", cwd, "for-each-ref", "--format=%(refname:short)", "refs/heads"]);
+  return stdout
+    .split("\n")
+    .map((branch) => branch.trim())
+    .filter((branch) => branch !== "");
 }
 
 export const apiRouter: Router = express.Router();
@@ -97,6 +106,18 @@ apiRouter.put(
 );
 
 apiRouter.get(
+  "/locations/exists",
+  wrapAsync(async (request, response) => {
+    const locationPath: string = typeof request.query.path === "string" ? request.query.path.trim() : "";
+    if (locationPath === "") {
+      response.status(400).json({ error: "Provide the location." });
+      return;
+    }
+    response.json({ exists: await pathExists(locationPath) });
+  })
+);
+
+apiRouter.get(
   "/locations",
   wrapAsync(async (_request, response) => {
     const state: DashboardState = await loadState();
@@ -108,14 +129,49 @@ apiRouter.get(
   })
 );
 
+apiRouter.get(
+  "/locations/branches",
+  wrapAsync(async (request, response) => {
+    const state: DashboardState = await loadState();
+    const locationPath: string = typeof request.query.path === "string" ? request.query.path.trim() : "";
+    if (locationPath === "") {
+      response.status(400).json({ error: "Provide the location." });
+      return;
+    }
+    if (!state.config.locations.includes(locationPath)) {
+      response.status(400).json({ error: `Location ${locationPath} is not configured.` });
+      return;
+    }
+    if (!(await pathExists(locationPath))) {
+      response.status(404).json({ error: `Folder does not exist: ${locationPath}` });
+      return;
+    }
+
+    try {
+      const branches: string[] = await localBranches(locationPath);
+      response.json({ isGitRepo: true, branches, currentBranch: await currentBranch(locationPath) });
+    } catch {
+      // Not a git repo, or git not installed
+      response.json({ isGitRepo: false, branches: [], currentBranch: null });
+    }
+  })
+);
+
 apiRouter.get("/update-status", (_request, response) => {
   response.json(getUpdateStatus());
 });
 
 apiRouter.post(
-  "/update",
+  "/update/check",
   wrapAsync(async (_request, response) => {
-    response.json(await checkAndApplyUpdate());
+    response.json(await checkForUpdate());
+  })
+);
+
+apiRouter.post(
+  "/update/apply",
+  wrapAsync(async (_request, response) => {
+    response.json(await applyUpdate());
   })
 );
 
@@ -153,13 +209,44 @@ apiRouter.post(
       return;
     }
 
+    const requestedLabel: string =
+      typeof payload.label === "string" && payload.label.trim() !== "" ? payload.label.trim() : path.basename(locationPath);
+    const nameTaken: boolean = state.instances.some(
+      (existing) => existing.locationPath === locationPath && existing.label === requestedLabel
+    );
+    if (nameTaken) {
+      response.status(409).json({ error: `An instance named '${requestedLabel}' is already running here` });
+      return;
+    }
+
+    const branchAction: BranchAction | undefined = payload.branchAction;
+    if (branchAction !== undefined) {
+      const branch: string = typeof branchAction.branch === "string" ? branchAction.branch.trim() : "";
+      if (branch === "" || (branchAction.type !== "checkout" && branchAction.type !== "create")) {
+        response.status(400).json({ error: "Provide a valid branch action." });
+        return;
+      }
+      if (branchAction.type === "create" && (typeof branchAction.baseBranch !== "string" || branchAction.baseBranch.trim() === "")) {
+        response.status(400).json({ error: "Provide the base branch to create from." });
+        return;
+      }
+      try {
+        if (branchAction.type === "checkout") {
+          await execFileAsync("git", ["-C", locationPath, "checkout", branch]);
+        } else {
+          await execFileAsync("git", ["-C", locationPath, "checkout", "-b", branch, branchAction.baseBranch.trim()]);
+        }
+      } catch (error) {
+        response.status(409).json({ error: `Could not switch branches: ${(error as Error).message}` });
+        return;
+      }
+    }
+
+    const shellOnly: boolean = payload.shellOnly === true;
     const instanceId: string = randomUUID().slice(0, 8);
     const instance: InstanceRecord = {
       id: instanceId,
-      label:
-        typeof payload.label === "string" && payload.label.trim() !== ""
-          ? payload.label.trim()
-          : path.basename(locationPath),
+      label: requestedLabel,
       locationPath,
       tmuxSession: `ccdash-${instanceId}`,
       command:
@@ -170,11 +257,14 @@ apiRouter.post(
       effort: typeof payload.effort === "string" && payload.effort.trim() !== "" ? payload.effort.trim() : null,
       fontSize: DEFAULT_FONT_SIZE,
       createdAt: new Date().toISOString(),
+      ...(shellOnly ? { shellOnly: true } : {}),
     };
 
     try {
       await createSession(instance.tmuxSession, instance.locationPath);
-      await sendCommandToSession(instance.tmuxSession, buildLaunchCommand(instance));
+      if (!shellOnly) {
+        await sendCommandToSession(instance.tmuxSession, buildLaunchCommand(instance));
+      }
     } catch (error) {
       // The location is a permanent user folder: only the session is cleaned up, not the disk
       await killSession(instance.tmuxSession).catch(() => undefined);
@@ -209,6 +299,19 @@ apiRouter.put(
     state.instances = (order as string[]).map((id) => instanceById.get(id) as InstanceRecord);
     await saveState(state);
     response.json(state.instances);
+  })
+);
+
+apiRouter.get(
+  "/instances/:id/status",
+  wrapAsync(async (request, response) => {
+    const state: DashboardState = await loadState();
+    const instance = state.instances.find((candidate) => candidate.id === request.params.id);
+    if (instance === undefined) {
+      response.status(404).json({ error: "Instance not found." });
+      return;
+    }
+    response.json({ alive: await hasSession(instance.tmuxSession) });
   })
 );
 
@@ -298,7 +401,9 @@ apiRouter.post(
     if (!(await hasSession(instance.tmuxSession))) {
       await createSession(instance.tmuxSession, instance.locationPath);
     }
-    await sendCommandToSession(instance.tmuxSession, buildLaunchCommand(instance));
+    if (!instance.shellOnly) {
+      await sendCommandToSession(instance.tmuxSession, buildLaunchCommand(instance));
+    }
     response.status(204).end();
   })
 );
