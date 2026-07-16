@@ -47,7 +47,7 @@ export function BranchPickerModal({ branchInfo, onConfirm, onClose }: BranchPick
         : `Use '${selection.branch}'`;
 
   return (
-    <Modal title="Choose branch" onClose={onClose}>
+    <Modal title="Choose branch" onClose={onClose} widthClassName="w-[560px]">
       <input
         className={inputClassName}
         value={search}
