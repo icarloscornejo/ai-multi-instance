@@ -234,7 +234,18 @@ apiRouter.post(
         if (branchAction.type === "checkout") {
           await execFileAsync("git", ["-C", locationPath, "checkout", branch]);
         } else {
-          await execFileAsync("git", ["-C", locationPath, "checkout", "-b", branch, branchAction.baseBranch.trim()]);
+          const baseBranch: string = branchAction.baseBranch.trim();
+          await execFileAsync("git", ["-C", locationPath, "fetch", "origin", baseBranch]);
+          const activeBranch: string | null = await currentBranch(locationPath);
+          if (activeBranch === baseBranch) {
+            // The base branch is checked out here: fast-forward it in place, never overwrite local commits
+            await execFileAsync("git", ["-C", locationPath, "merge", "--ff-only", `origin/${baseBranch}`]);
+          } else {
+            // Not checked out: update its ref directly. A plain (non "+") refspec is fast-forward-only,
+            // git refuses on its own if the local base branch has diverged from origin
+            await execFileAsync("git", ["-C", locationPath, "fetch", "origin", `${baseBranch}:${baseBranch}`]);
+          }
+          await execFileAsync("git", ["-C", locationPath, "checkout", "-b", branch, baseBranch]);
         }
       } catch (error) {
         response.status(409).json({ error: `Could not switch branches: ${(error as Error).message}` });

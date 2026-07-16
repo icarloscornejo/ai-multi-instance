@@ -1,6 +1,5 @@
 @import "tailwindcss";
 @import "@xterm/xterm/css/xterm.css";
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap");
 
 @theme {
   --color-app: oklch(21% 0.004 50);
