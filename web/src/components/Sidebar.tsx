@@ -1,6 +1,43 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { api } from "../api";
-import type { Instance, UpdateInstancePayload } from "../types";
+import type { Instance, LiveStatus, UpdateInstancePayload } from "../types";
+
+const LIVE_STATUS_POLL_MS = 1000;
+
+const compactNumberFormatter = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 });
+
+function formatCompactNumber(value: number): string {
+  return compactNumberFormatter.format(value).toLowerCase();
+}
+
+function formatShortResetTime(epochSeconds: number): string {
+  return new Date(epochSeconds * 1000).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+function formatLongResetTime(epochSeconds: number): string {
+  return new Date(epochSeconds * 1000).toLocaleString(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
+// 4-band usage severity, roughly matching common dashboard conventions
+// (green below 60%, red at 90%+), with an extra orange band between yellow and red.
+function usagePctColorClass(pct: number): string {
+  if (pct >= 90) return "text-diff-removed";
+  if (pct >= 80) return "text-status-orange";
+  if (pct >= 60) return "text-status-yellow";
+  return "text-diff-added";
+}
+
+function formatAge(isoTimestamp: string): string {
+  const ageSeconds: number = Math.max(0, Math.round((Date.now() - new Date(isoTimestamp).getTime()) / 1000));
+  return ageSeconds < 60 ? `${ageSeconds}s ago` : `${Math.round(ageSeconds / 60)}m ago`;
+}
 
 // Splits an absolute path into indented tree lines so long paths read top-to-bottom
 // instead of wrapping mid-word in the narrow sidebar.
@@ -15,7 +52,6 @@ function pathToTreeLines(path: string): { text: string; depth: number }[] {
 interface SidebarProps {
   instance: Instance;
   onUpdate: (instanceId: string, payload: UpdateInstancePayload) => void;
-  onRelaunch: (instanceId: string) => void;
   onDeleteRequest: (instance: Instance) => void;
 }
 
@@ -89,22 +125,18 @@ function CopyButton({ value, title }: { value: string; title: string }) {
   );
 }
 
-export function Sidebar({ instance, onUpdate, onRelaunch, onDeleteRequest }: SidebarProps) {
+export function Sidebar({ instance, onUpdate, onDeleteRequest }: SidebarProps) {
   const [commandDraft, setCommandDraft] = useState<string>(instance.command);
-  const [modelDraft, setModelDraft] = useState<string>(instance.model ?? "");
-  const [effortDraft, setEffortDraft] = useState<string>(instance.effort ?? "");
   const [gitBranch, setGitBranch] = useState<string | null>(null);
-  const [alive, setAlive] = useState<boolean | null>(null);
+  const [liveStatus, setLiveStatus] = useState<LiveStatus | null>(null);
 
-  // When switching tabs the sidebar shows a different instance: resync the drafts
+  // When switching tabs the sidebar shows a different instance: resync the draft
   useEffect(() => {
     setCommandDraft(instance.command);
-    setModelDraft(instance.model ?? "");
-    setEffortDraft(instance.effort ?? "");
-  }, [instance.id, instance.command, instance.model, instance.effort]);
+  }, [instance.id, instance.command]);
 
-  // Mirrors the statusline's behavior: show the branch only when the instance's
-  // live directory is actually a git repo, stay silent otherwise.
+  // Fallback branch lookup: used only while the live statusLine snapshot isn't
+  // available (not configured yet, or Claude hasn't redrawn its statusline here).
   useEffect(() => {
     let cancelled = false;
     setGitBranch(null);
@@ -125,39 +157,39 @@ export function Sidebar({ instance, onUpdate, onRelaunch, onDeleteRequest }: Sid
     };
   }, [instance.id]);
 
-  // Liveness is based only on whether the tmux session still exists, not on whether
-  // the claude process inside it is still running: keeps the check cheap and reliable.
+  // Polls the statusLine snapshot the dashboard-statusline.sh wrapper writes, so the
+  // sidebar mirrors the same live model/effort/branch/context/cost data Claude Code's
+  // own statusline shows, without waiting for a manual refresh.
   useEffect(() => {
     let cancelled = false;
-    setAlive(null);
-    api
-      .getInstanceStatus(instance.id)
-      .then((result) => {
-        if (!cancelled) {
-          setAlive(result.alive);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setAlive(null);
-        }
-      });
+    setLiveStatus(null);
+    const poll = (): void => {
+      api
+        .getInstanceLiveStatus(instance.id)
+        .then((result) => {
+          if (!cancelled) {
+            setLiveStatus(result);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setLiveStatus(null);
+          }
+        });
+    };
+    poll();
+    const intervalId: ReturnType<typeof setInterval> = setInterval(poll, LIVE_STATUS_POLL_MS);
     return () => {
       cancelled = true;
+      clearInterval(intervalId);
     };
   }, [instance.id]);
 
+  const liveBranch: string | undefined = liveStatus?.available === true ? liveStatus.branch ?? undefined : undefined;
+
   return (
     <aside className="flex w-[300px] flex-none flex-col gap-[18px] overflow-y-auto border-l border-border bg-surface p-[20px_18px]">
-      <div className="flex flex-col gap-[8px] border-b border-border pb-[14px]">
-        <div className="text-[13.5px] font-bold text-txt-bright">{instance.label}</div>
-        {alive !== null && (
-          <div className={`flex items-center gap-[6px] text-[11px] font-semibold ${alive ? "text-diff-added" : "text-txt-dim"}`}>
-            <span className={`h-[6px] w-[6px] rounded-full ${alive ? "bg-diff-added" : "bg-txt-dim"}`} />
-            {alive ? "Running" : "Stopped"}
-          </div>
-        )}
-      </div>
+      <div className="border-b border-border pb-[14px] text-[13.5px] font-bold text-txt-bright">{instance.label}</div>
 
       <div>
         <FieldLabel action={<CopyButton value={instance.locationPath} title="Copy location path" />}>Location</FieldLabel>
@@ -170,13 +202,6 @@ export function Sidebar({ instance, onUpdate, onRelaunch, onDeleteRequest }: Sid
         </div>
       </div>
 
-      {gitBranch !== null && (
-        <div>
-          <FieldLabel action={<CopyButton value={gitBranch} title="Copy branch name" />}>Branch</FieldLabel>
-          <div className="font-mono text-[12.5px] text-txt-body">{gitBranch}</div>
-        </div>
-      )}
-
       <div>
         <FieldLabel>Claude</FieldLabel>
         <input
@@ -188,37 +213,121 @@ export function Sidebar({ instance, onUpdate, onRelaunch, onDeleteRequest }: Sid
         />
       </div>
 
-      <div>
-        <FieldLabel>Model</FieldLabel>
-        <input
-          className="note-field font-mono text-[12.5px] text-txt-body"
-          value={modelDraft}
-          placeholder="default"
-          onChange={(event) => setModelDraft(event.target.value)}
-          onBlur={() => onUpdate(instance.id, { model: modelDraft.trim() === "" ? null : modelDraft.trim() })}
-        />
-      </div>
+      {liveStatus === null && (
+        <div className="text-[11px] text-txt-dimmer">Loading...</div>
+      )}
+      {liveStatus !== null && !liveStatus.available && (
+        <div className="text-[11px] leading-[1.5] text-txt-dimmer">
+          No live data yet. It appears once Claude Code redraws its statusline in this
+          instance.
+        </div>
+      )}
 
-      <div>
-        <FieldLabel>Effort</FieldLabel>
-        <input
-          className="note-field font-mono text-[12.5px] text-txt-body"
-          value={effortDraft}
-          placeholder="default"
-          onChange={(event) => setEffortDraft(event.target.value)}
-          onBlur={() => onUpdate(instance.id, { effort: effortDraft.trim() === "" ? null : effortDraft.trim() })}
-        />
-      </div>
+      {liveStatus !== null && liveStatus.available && (
+        <>
+          {liveStatus.model !== undefined && (
+            <div>
+              <FieldLabel>Model</FieldLabel>
+              <div className="font-mono text-[12.5px] text-txt-body">{liveStatus.model}</div>
+            </div>
+          )}
+
+          {liveStatus.effort !== undefined && (
+            <div>
+              <FieldLabel>Effort</FieldLabel>
+              <div className="font-mono text-[12.5px] text-txt-body">{liveStatus.effort}</div>
+            </div>
+          )}
+
+          {(liveBranch !== undefined || gitBranch !== null) && (
+            <div>
+              <FieldLabel
+                action={<CopyButton value={(liveBranch ?? gitBranch) as string} title="Copy branch name" />}
+              >
+                Branch
+              </FieldLabel>
+              <div className="font-mono text-[12.5px] text-txt-body">
+                {liveBranch ?? gitBranch}
+                {(liveStatus.gitAdded ?? 0) + (liveStatus.gitRemoved ?? 0) > 0 && (
+                  <span>
+                    {" "}
+                    (+{liveStatus.gitAdded ?? 0} -{liveStatus.gitRemoved ?? 0})
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+
+          {liveStatus.contextUsed !== undefined && liveStatus.contextSize !== undefined && (
+            <div>
+              <FieldLabel>Context</FieldLabel>
+              <div className={`font-mono text-[12.5px] ${usagePctColorClass(liveStatus.contextPct ?? 0)}`}>
+                {formatCompactNumber(liveStatus.contextUsed)}/{formatCompactNumber(liveStatus.contextSize)} ({Math.round(liveStatus.contextPct ?? 0)}%)
+              </div>
+            </div>
+          )}
+
+          {liveStatus.sessionCostUsd !== undefined && (
+            <div>
+              <FieldLabel>Session cost</FieldLabel>
+              <div className="font-mono text-[12.5px] text-txt-body">${liveStatus.sessionCostUsd.toFixed(2)}</div>
+            </div>
+          )}
+
+          {liveStatus.fiveHourPct != null && (
+            <div>
+              <FieldLabel>5H LIMIT</FieldLabel>
+              <div className="font-mono text-[12.5px] text-txt-body">
+                <span className={usagePctColorClass(liveStatus.fiveHourPct)}>{Math.round(liveStatus.fiveHourPct)}%</span>
+                {liveStatus.fiveHourResetsAt != null && <span> → {formatShortResetTime(liveStatus.fiveHourResetsAt)}</span>}
+              </div>
+            </div>
+          )}
+
+          {liveStatus.sevenDayPct != null && (
+            <div>
+              <FieldLabel>7D LIMIT</FieldLabel>
+              <div className="font-mono text-[12.5px] text-txt-body">
+                <span className={usagePctColorClass(liveStatus.sevenDayPct)}>{Math.round(liveStatus.sevenDayPct)}%</span>
+                {liveStatus.sevenDayResetsAt != null && <span> → {formatLongResetTime(liveStatus.sevenDayResetsAt)}</span>}
+              </div>
+            </div>
+          )}
+
+          {liveStatus.extraUsd != null && liveStatus.extraLimitUsd != null && (
+            <div>
+              <FieldLabel>Extra usage</FieldLabel>
+              <div
+                className={`font-mono text-[12.5px] ${usagePctColorClass(
+                  liveStatus.extraLimitUsd > 0 ? (liveStatus.extraUsd / liveStatus.extraLimitUsd) * 100 : 0,
+                )}`}
+              >
+                ${liveStatus.extraUsd.toFixed(2)}/${liveStatus.extraLimitUsd.toFixed(2)}
+              </div>
+            </div>
+          )}
+
+          {liveStatus.burnPerHour != null && (
+            <div>
+              <FieldLabel>Burn</FieldLabel>
+              <div className="font-mono text-[12.5px] text-txt-body">${liveStatus.burnPerHour.toFixed(2)}/h</div>
+            </div>
+          )}
+
+          {liveStatus.dayTotalUsd != null && (
+            <div>
+              <FieldLabel>Today</FieldLabel>
+              <div className="font-mono text-[12.5px] text-txt-body">${liveStatus.dayTotalUsd.toFixed(2)}</div>
+            </div>
+          )}
+
+          {liveStatus.updatedAt !== undefined && (
+            <div className="text-[11px] text-txt-dimmer">Updated {formatAge(liveStatus.updatedAt)}</div>
+          )}
+        </>
+      )}
 
       <div className="mt-auto flex flex-col gap-[2px] border-t border-border pt-[14px]">
-        <button
-          type="button"
-          onClick={() => onRelaunch(instance.id)}
-          title="Resends the saved launch command to the session"
-          className="self-start rounded-sm px-[6px] py-[8px] text-[12px] font-semibold text-txt-bright hover:bg-raised"
-        >
-          ↻ Restart instance
-        </button>
         <button
           type="button"
           onClick={() => onDeleteRequest(instance)}

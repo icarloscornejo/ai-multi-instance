@@ -18,6 +18,10 @@ export interface InstanceRecord {
 export interface DashboardState {
   config: DashboardConfig;
   instances: InstanceRecord[];
+  // Last known Claude Code session id per "<locationPath>::<label>", captured when an
+  // instance is deleted so a future instance reusing the same location+label can
+  // resume that exact conversation instead of starting a new one.
+  sessionsByKey: Record<string, string>;
 }
 
 export type BranchAction =

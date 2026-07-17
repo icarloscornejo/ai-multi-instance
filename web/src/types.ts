@@ -72,3 +72,27 @@ export interface UpdateInstancePayload {
   effort?: string | null;
   fontSize?: number;
 }
+
+export interface LiveStatus {
+  available: boolean;
+  model?: string;
+  cwd?: string;
+  sessionId?: string | null;
+  effort?: string;
+  branch?: string | null;
+  gitAdded?: number;
+  gitRemoved?: number;
+  contextUsed?: number;
+  contextSize?: number;
+  contextPct?: number;
+  sessionCostUsd?: number;
+  fiveHourPct?: number | null;
+  fiveHourResetsAt?: number | null;
+  sevenDayPct?: number | null;
+  sevenDayResetsAt?: number | null;
+  extraUsd?: number | null;
+  extraLimitUsd?: number | null;
+  dayTotalUsd?: number | null;
+  burnPerHour?: number | null;
+  updatedAt?: string;
+}

@@ -8,7 +8,7 @@ const stateFilePath: string = path.join(dataDirectory, "instances.json");
 let cachedState: DashboardState | null = null;
 
 function emptyState(): DashboardState {
-  return { config: { locations: [] }, instances: [] };
+  return { config: { locations: [] }, instances: [], sessionsByKey: {} };
 }
 
 // Previous formats: worktrees per branch -> fixed slots -> plain folder locations
@@ -23,6 +23,7 @@ interface LegacyDashboardState {
       command?: string;
     }
   >;
+  sessionsByKey?: Record<string, string>;
 }
 
 // The old state referenced worktrees per branch, then fixed git slots; locations are
@@ -44,6 +45,7 @@ function migrateLegacyState(rawState: LegacyDashboardState): DashboardState {
         command: command ?? "claude",
       } as unknown as DashboardState["instances"][number];
     }),
+    sessionsByKey: rawState.sessionsByKey ?? {},
   };
 }
 

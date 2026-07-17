@@ -1,12 +1,13 @@
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import express, { type Request, type Response, type NextFunction, type Router } from "express";
 import { buildLaunchCommand } from "./launch";
 import { loadState, saveState } from "./store";
-import { createSession, getPaneCurrentPath, hasSession, killSession, sendCommandToSession } from "./tmux";
+import { createSession, getPaneCurrentPath, killSession, sendCommandToSession } from "./tmux";
 import { applyUpdate, checkForUpdate, getUpdateStatus } from "./updater";
 import type {
   BranchAction,
@@ -55,6 +56,32 @@ async function localBranches(cwd: string): Promise<string[]> {
     .split("\n")
     .map((branch) => branch.trim())
     .filter((branch) => branch !== "");
+}
+
+// Key under which the last known session id for a given location+label combo is
+// remembered, so recreating an instance with the same location and label can resume it.
+function sessionKeyFor(locationPath: string, label: string): string {
+  return `${locationPath}::${label}`;
+}
+
+async function resolveLiveStatusSnapshotPath(instance: InstanceRecord): Promise<string> {
+  // Prefer the pane's live directory (reflects `cd`s made inside the terminal);
+  // fall back to the stored starting path if the tmux session is gone.
+  const cwd: string = await getPaneCurrentPath(instance.tmuxSession).catch(() => instance.locationPath);
+  const cwdHash: string = createHash("sha256").update(cwd).digest("hex").slice(0, 16);
+  return path.join(os.homedir(), ".cache", "claude-dashboard-statusline", `${cwdHash}.json`);
+}
+
+async function readLiveSessionId(instance: InstanceRecord): Promise<string | null> {
+  try {
+    const snapshotPath: string = await resolveLiveStatusSnapshotPath(instance);
+    const snapshot = JSON.parse(await fs.readFile(snapshotPath, "utf8")) as { sessionId?: string | null };
+    return typeof snapshot.sessionId === "string" && snapshot.sessionId !== "" ? snapshot.sessionId : null;
+  } catch {
+    // No statusLine snapshot yet for this directory (not configured, or Claude Code
+    // hasn't redrawn its statusline here since this dashboard instance was launched)
+    return null;
+  }
 }
 
 export const apiRouter: Router = express.Router();
@@ -271,10 +298,12 @@ apiRouter.post(
       ...(shellOnly ? { shellOnly: true } : {}),
     };
 
+    const resumeSessionId: string | undefined = state.sessionsByKey[sessionKeyFor(locationPath, requestedLabel)];
+
     try {
       await createSession(instance.tmuxSession, instance.locationPath);
       if (!shellOnly) {
-        await sendCommandToSession(instance.tmuxSession, buildLaunchCommand(instance));
+        await sendCommandToSession(instance.tmuxSession, buildLaunchCommand(instance, { resumeSessionId }));
       }
     } catch (error) {
       // The location is a permanent user folder: only the session is cleaned up, not the disk
@@ -310,19 +339,6 @@ apiRouter.put(
     state.instances = (order as string[]).map((id) => instanceById.get(id) as InstanceRecord);
     await saveState(state);
     response.json(state.instances);
-  })
-);
-
-apiRouter.get(
-  "/instances/:id/status",
-  wrapAsync(async (request, response) => {
-    const state: DashboardState = await loadState();
-    const instance = state.instances.find((candidate) => candidate.id === request.params.id);
-    if (instance === undefined) {
-      response.status(404).json({ error: "Instance not found." });
-      return;
-    }
-    response.json({ alive: await hasSession(instance.tmuxSession) });
   })
 );
 
@@ -376,6 +392,29 @@ apiRouter.get(
   })
 );
 
+apiRouter.get(
+  "/instances/:id/live-status",
+  wrapAsync(async (request, response) => {
+    const state: DashboardState = await loadState();
+    const instance = state.instances.find((candidate) => candidate.id === request.params.id);
+    if (instance === undefined) {
+      response.status(404).json({ error: "Instance not found." });
+      return;
+    }
+
+    const snapshotPath: string = await resolveLiveStatusSnapshotPath(instance);
+
+    try {
+      const snapshot: unknown = JSON.parse(await fs.readFile(snapshotPath, "utf8"));
+      response.json({ available: true, ...(snapshot as object) });
+    } catch {
+      // No statusLine snapshot yet for this directory (not configured, or Claude Code
+      // hasn't redrawn its statusline here since this dashboard instance was launched)
+      response.json({ available: false });
+    }
+  })
+);
+
 apiRouter.delete(
   "/instances/:id",
   wrapAsync(async (request, response) => {
@@ -384,6 +423,13 @@ apiRouter.delete(
     if (instance === undefined) {
       response.status(404).json({ error: "Instance not found." });
       return;
+    }
+
+    // Read the pane's live session id before killing it, so a future instance reusing
+    // this exact location+label can pick up the conversation where it left off.
+    const liveSessionId: string | null = await readLiveSessionId(instance);
+    if (liveSessionId !== null) {
+      state.sessionsByKey[sessionKeyFor(instance.locationPath, instance.label)] = liveSessionId;
     }
 
     try {
@@ -400,21 +446,3 @@ apiRouter.delete(
   })
 );
 
-apiRouter.post(
-  "/instances/:id/relaunch",
-  wrapAsync(async (request, response) => {
-    const state: DashboardState = await loadState();
-    const instance = state.instances.find((candidate) => candidate.id === request.params.id);
-    if (instance === undefined) {
-      response.status(404).json({ error: "Instance not found." });
-      return;
-    }
-    if (!(await hasSession(instance.tmuxSession))) {
-      await createSession(instance.tmuxSession, instance.locationPath);
-    }
-    if (!instance.shellOnly) {
-      await sendCommandToSession(instance.tmuxSession, buildLaunchCommand(instance));
-    }
-    response.status(204).end();
-  })
-);

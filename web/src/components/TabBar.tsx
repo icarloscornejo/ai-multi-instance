@@ -64,6 +64,15 @@ function SortableTab({
     id: instance.id,
     disabled: isEditing,
   });
+  const labelSpanRef = useRef<HTMLSpanElement>(null);
+  const [lockedWidth, setLockedWidth] = useState<number | null>(null);
+
+  const startEditing = (): void => {
+    // Lock the input to the label's actual rendered width (proportional fonts make a
+    // character-count estimate unreliable) so the tab never resizes on double-click
+    setLockedWidth(labelSpanRef.current?.offsetWidth ?? null);
+    onStartEditing(instance);
+  };
 
   return (
     <div
@@ -72,7 +81,7 @@ function SortableTab({
       {...attributes}
       {...(isEditing ? {} : listeners)}
       onClick={() => onSelect(instance.id)}
-      onDoubleClick={() => onStartEditing(instance)}
+      onDoubleClick={startEditing}
       className={`group relative mr-[6px] flex h-[32px] shrink-0 items-center gap-[7px] whitespace-nowrap rounded-full border-none px-[12px] text-[12.5px] font-medium ${
         isActive
           ? "bg-surface font-semibold text-txt-bright shadow-[0_1px_2px_rgba(0,0,0,.06),0_0_0_1px_var(--color-border)]"
@@ -92,10 +101,11 @@ function SortableTab({
               onCancelEditing();
             }
           }}
-          className="w-[110px] bg-transparent text-[12.5px] outline-none"
+          style={lockedWidth !== null ? { width: `${lockedWidth}px` } : undefined}
+          className="bg-transparent text-[12.5px] outline-none"
         />
       ) : (
-        <span className="cursor-text select-none" title="Double-click to rename">
+        <span ref={labelSpanRef} className="cursor-text select-none" title="Double-click to rename">
           {instance.label}
         </span>
       )}
@@ -199,18 +209,19 @@ export function TabBar({
               ))}
             </SortableContext>
           </DndContext>
+          {/* Right next to the last tab, Chrome-style: scrolls out of view with many tabs */}
+          <button
+            type="button"
+            onClick={onAddClick}
+            title="New instance"
+            className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-full bg-raised text-[16px] leading-none text-txt-secondary hover:bg-border-strong hover:text-txt-bright"
+          >
+            +
+          </button>
         </div>
         {/* Signals horizontal overflow without stealing space from the fixed toolbar */}
         <div className="pointer-events-none absolute right-0 top-0 h-full w-[24px] bg-gradient-to-r from-transparent to-app" />
       </div>
-      <button
-        type="button"
-        onClick={onAddClick}
-        title="New instance"
-        className="mr-[10px] flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-full bg-raised text-[16px] leading-none text-txt-secondary hover:bg-border-strong hover:text-txt-bright"
-      >
-        +
-      </button>
       <div className="flex shrink-0 items-center gap-[2px] border-l border-border pl-[10px]">
         <button
           type="button"

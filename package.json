@@ -1,6 +1,6 @@
 {
   "name": "claude-multi-instance",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "private": true,
   "description": "Dashboard local para correr N sesiones de Claude Code en paralelo, cada una en un slot fijo (clon completo del repo), con persistencia via tmux",
   "workspaces": [

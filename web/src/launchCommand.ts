@@ -1,4 +1,6 @@
-// Mirror of server/src/launch.ts buildLaunchCommand: keep both in sync
+// Mirror of server/src/launch.ts buildLaunchCommand: keep both in sync, except the server
+// additionally injects a --settings statusline override, which is internal plumbing and
+// intentionally left out of this preview
 function quoteForShell(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }

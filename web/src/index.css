@@ -22,6 +22,8 @@
   --color-diff-removed: oklch(66% 0.17 24);
   --color-diff-removed-dim: oklch(66% 0.17 24 / 0.14);
   --color-diff-removed-border: oklch(66% 0.17 24 / 0.4);
+  --color-status-yellow: oklch(80% 0.16 95);
+  --color-status-orange: oklch(72% 0.17 55);
   --color-border: oklch(96% 0.005 50 / 0.08);
   --color-border-strong: oklch(96% 0.005 50 / 0.18);
   --radius-sm: 6px;
@@ -61,6 +63,8 @@
   --color-diff-removed: oklch(55% 0.18 24);
   --color-diff-removed-dim: oklch(55% 0.18 24 / 0.1);
   --color-diff-removed-border: oklch(55% 0.18 24 / 0.45);
+  --color-status-yellow: oklch(65% 0.16 95);
+  --color-status-orange: oklch(58% 0.17 55);
   --color-border: oklch(20% 0.006 50 / 0.1);
   --color-border-strong: oklch(20% 0.006 50 / 0.2);
   --shadow-modal: 0 1px 2px rgba(20, 16, 12, 0.06), 0 16px 40px rgba(20, 16, 12, 0.12);

@@ -2,6 +2,7 @@ import type {
   CreateInstancePayload,
   DashboardConfig,
   Instance,
+  LiveStatus,
   LocationBranches,
   LocationInfo,
   UpdateInstancePayload,
@@ -49,8 +50,8 @@ export const api = {
   getInstanceGit: (instanceId: string): Promise<{ cwd: string; branch?: string }> =>
     requestJson(`/api/instances/${instanceId}/git`),
 
-  getInstanceStatus: (instanceId: string): Promise<{ alive: boolean }> =>
-    requestJson(`/api/instances/${instanceId}/status`),
+  getInstanceLiveStatus: (instanceId: string): Promise<LiveStatus> =>
+    requestJson(`/api/instances/${instanceId}/live-status`),
 
   listLocations: (): Promise<LocationInfo[]> => requestJson("/api/locations"),
 
@@ -71,7 +72,4 @@ export const api = {
 
   deleteInstance: (instanceId: string): Promise<void> =>
     requestJson(`/api/instances/${instanceId}`, { method: "DELETE" }),
-
-  relaunchInstance: (instanceId: string): Promise<void> =>
-    requestJson(`/api/instances/${instanceId}/relaunch`, { method: "POST" }),
 };

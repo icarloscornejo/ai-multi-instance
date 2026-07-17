@@ -119,12 +119,6 @@ export function App() {
     });
   };
 
-  const relaunchInstance = (instanceId: string): void => {
-    api.relaunchInstance(instanceId).catch((error: Error) => {
-      console.error("Could not relaunch the command:", error.message);
-    });
-  };
-
   if (loadError !== null) {
     return (
       <div className="flex h-screen items-center justify-center text-[13px] text-diff-removed">
@@ -199,12 +193,7 @@ export function App() {
         </main>
 
         {activeInstance !== undefined && (
-          <Sidebar
-            instance={activeInstance}
-            onUpdate={updateInstance}
-            onRelaunch={relaunchInstance}
-            onDeleteRequest={setDeleteRequest}
-          />
+          <Sidebar instance={activeInstance} onUpdate={updateInstance} onDeleteRequest={setDeleteRequest} />
         )}
       </div>
 
