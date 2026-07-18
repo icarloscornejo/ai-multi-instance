@@ -1,10 +1,10 @@
 #!/bin/bash
-# claude-multi-instance injects this wrapper as the --settings statusLine override when
+# AI Multi-Instance injects this wrapper as the --settings statusLine override when
 # it launches an instance (see server/src/launch.ts), so no per-profile install step is
 # needed. It resolves whatever statusLine command the profile's own settings.json has
 # configured (a script path, an inline one-liner, or none) and runs that as-is, so the
 # terminal's visual output stays identical to what the user already had. On top of that
-# it writes a parsed JSON snapshot that the dashboard can read, keyed by the live cwd, so
+# it writes a parsed JSON snapshot keyed by the dashboard instance ID, so
 # its sidebar can show live data (model, effort, branch, context usage, cost, rate
 # limits, usage block) with its own logic and its own cache files, standalone: it does
 # not depend on any specific third-party statusline script, so the sidebar works the
@@ -75,7 +75,7 @@ extra_limit_usd=""
 day_total_usd=""
 burn_per_hour=""
 
-cache_dir="$HOME/.cache/claude-dashboard-statusline"
+cache_dir="$HOME/.cache/ai-multi-instance"
 mkdir -p "$cache_dir"
 
 get_oauth_token() {
@@ -159,10 +159,11 @@ else
   fi
 fi
 
-cwd_hash=$(echo -n "$cwd" | shasum -a 256 | cut -c1-16)
+snapshot_id="${AI_MULTI_INSTANCE_ID:-$(echo -n "$cwd" | shasum -a 256 | cut -c1-16)}"
 tmp_file=$(mktemp "${cache_dir}/.snapshot.XXXXXX")
 
 jq -n \
+  --arg provider "claude" \
   --arg model "$model_name" \
   --arg cwd "$cwd" \
   --arg sessionId "$session_id" \
@@ -189,6 +190,7 @@ jq -n \
   def optStr: if . == "" then null else . end;
   def optNum: if . == "" then null else tonumber end;
   {
+    provider: $provider,
     model: $model,
     cwd: $cwd,
     sessionId: ($sessionId | optStr),
@@ -209,6 +211,6 @@ jq -n \
     dayTotalUsd: ($dayTotalUsd | optNum),
     burnPerHour: ($burnPerHour | optNum),
     updatedAt: $updatedAt
-  }' > "$tmp_file" && mv "$tmp_file" "$cache_dir/${cwd_hash}.json"
+  }' > "$tmp_file" && mv "$tmp_file" "$cache_dir/${snapshot_id}.json"
 
 exit 0

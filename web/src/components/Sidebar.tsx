@@ -3,6 +3,13 @@ import { api } from "../api";
 import type { Instance, LiveStatus, UpdateInstancePayload } from "../types";
 
 const LIVE_STATUS_POLL_MS = 1000;
+const PROVIDER_LABELS = {
+  claude: "Claude Code",
+  codex: "Codex CLI",
+  cursor: "Cursor Agent",
+  custom: "Custom command",
+} as const;
+const PROVIDER_DEFAULT_COMMANDS = { claude: "claude", codex: "codex", cursor: "agent", custom: "" } as const;
 
 const compactNumberFormatter = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 });
 
@@ -65,7 +72,7 @@ function FieldLabel({ children, action }: { children: string; action?: ReactNode
 }
 
 // navigator.clipboard requires a secure context (https, or the special-cased
-// "localhost"/127.0.0.1 hosts): it silently throws on plain http://claude.local even
+// "localhost"/127.0.0.1 hosts): it silently throws on plain http://ai.local even
 // though that resolves to loopback, so fall back to the legacy execCommand copy there.
 async function copyText(value: string): Promise<void> {
   if (window.isSecureContext) {
@@ -203,13 +210,18 @@ export function Sidebar({ instance, onUpdate, onDeleteRequest }: SidebarProps) {
       </div>
 
       <div>
-        <FieldLabel>Claude</FieldLabel>
+        <FieldLabel>Provider</FieldLabel>
+        <div className="mb-[7px] text-[12px] font-semibold text-txt-body">{PROVIDER_LABELS[instance.provider]}</div>
         <input
           className="note-field font-mono text-[12.5px] text-txt-body"
           value={commandDraft}
-          placeholder="claude"
+          placeholder={PROVIDER_DEFAULT_COMMANDS[instance.provider]}
           onChange={(event) => setCommandDraft(event.target.value)}
-          onBlur={() => onUpdate(instance.id, { command: commandDraft.trim() === "" ? "claude" : commandDraft.trim() })}
+          onBlur={() =>
+            onUpdate(instance.id, {
+              command: commandDraft.trim() === "" ? PROVIDER_DEFAULT_COMMANDS[instance.provider] : commandDraft.trim(),
+            })
+          }
         />
       </div>
 
@@ -218,8 +230,24 @@ export function Sidebar({ instance, onUpdate, onDeleteRequest }: SidebarProps) {
       )}
       {liveStatus !== null && !liveStatus.available && (
         <div className="text-[11px] leading-[1.5] text-txt-dimmer">
-          No live data yet. It appears once Claude Code redraws its statusline in this
-          instance.
+          No live provider data yet. Session and git information will appear when {PROVIDER_LABELS[instance.provider]} exposes it.
+        </div>
+      )}
+
+      {(liveBranch !== undefined || gitBranch !== null) && (
+        <div>
+          <FieldLabel action={<CopyButton value={(liveBranch ?? gitBranch) as string} title="Copy branch name" />}>
+            Branch
+          </FieldLabel>
+          <div className="font-mono text-[12.5px] text-txt-body">
+            {liveBranch ?? gitBranch}
+            {(liveStatus?.gitAdded ?? 0) + (liveStatus?.gitRemoved ?? 0) > 0 && (
+              <span>
+                {" "}
+                (+{liveStatus?.gitAdded ?? 0} -{liveStatus?.gitRemoved ?? 0})
+              </span>
+            )}
+          </div>
         </div>
       )}
 
@@ -239,30 +267,22 @@ export function Sidebar({ instance, onUpdate, onDeleteRequest }: SidebarProps) {
             </div>
           )}
 
-          {(liveBranch !== undefined || gitBranch !== null) && (
-            <div>
-              <FieldLabel
-                action={<CopyButton value={(liveBranch ?? gitBranch) as string} title="Copy branch name" />}
-              >
-                Branch
-              </FieldLabel>
-              <div className="font-mono text-[12.5px] text-txt-body">
-                {liveBranch ?? gitBranch}
-                {(liveStatus.gitAdded ?? 0) + (liveStatus.gitRemoved ?? 0) > 0 && (
-                  <span>
-                    {" "}
-                    (+{liveStatus.gitAdded ?? 0} -{liveStatus.gitRemoved ?? 0})
-                  </span>
-                )}
-              </div>
-            </div>
-          )}
-
           {liveStatus.contextUsed !== undefined && liveStatus.contextSize !== undefined && (
             <div>
               <FieldLabel>Context</FieldLabel>
               <div className={`font-mono text-[12.5px] ${usagePctColorClass(liveStatus.contextPct ?? 0)}`}>
                 {formatCompactNumber(liveStatus.contextUsed)}/{formatCompactNumber(liveStatus.contextSize)} ({Math.round(liveStatus.contextPct ?? 0)}%)
+              </div>
+            </div>
+          )}
+
+          {(liveStatus.inputTokens !== undefined || liveStatus.outputTokens !== undefined) && (
+            <div>
+              <FieldLabel>Tokens</FieldLabel>
+              <div className="font-mono text-[12.5px] text-txt-body">
+                {liveStatus.inputTokens !== undefined && `↓${formatCompactNumber(liveStatus.inputTokens)}`}
+                {liveStatus.inputTokens !== undefined && liveStatus.outputTokens !== undefined && " "}
+                {liveStatus.outputTokens !== undefined && `↑${formatCompactNumber(liveStatus.outputTokens)}`}
               </div>
             </div>
           )}

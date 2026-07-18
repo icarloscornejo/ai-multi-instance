@@ -1,5 +1,5 @@
-// Shared className constants for the design-system reskin (see claude.ai/design
-// project "Claude Multi-Instance"). Centralized here so every modal/screen picks
+// Shared className constants for the AI Multi-Instance design system. Centralized
+// here so every modal/screen picks
 // up style changes from one place instead of redefining these strings per file.
 
 export const cardClassName: string =

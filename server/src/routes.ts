@@ -1,11 +1,12 @@
 import { execFile } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import express, { type Request, type Response, type NextFunction, type Router } from "express";
 import { buildLaunchCommand } from "./launch";
+import { isAgentProvider, PROVIDERS, sessionKeyFor } from "./providers";
 import { loadState, saveState } from "./store";
 import { createSession, getPaneCurrentPath, killSession, sendCommandToSession } from "./tmux";
 import { applyUpdate, checkForUpdate, getUpdateStatus } from "./updater";
@@ -18,7 +19,6 @@ import type {
 } from "./types";
 
 const DEFAULT_FONT_SIZE = 13;
-const DEFAULT_COMMAND = "claude";
 
 type AsyncHandler = (request: Request, response: Response) => Promise<void>;
 
@@ -58,29 +58,100 @@ async function localBranches(cwd: string): Promise<string[]> {
     .filter((branch) => branch !== "");
 }
 
-// Key under which the last known session id for a given location+label combo is
-// remembered, so recreating an instance with the same location and label can resume it.
-function sessionKeyFor(locationPath: string, label: string): string {
-  return `${locationPath}::${label}`;
-}
-
-async function resolveLiveStatusSnapshotPath(instance: InstanceRecord): Promise<string> {
-  // Prefer the pane's live directory (reflects `cd`s made inside the terminal);
-  // fall back to the stored starting path if the tmux session is gone.
-  const cwd: string = await getPaneCurrentPath(instance.tmuxSession).catch(() => instance.locationPath);
-  const cwdHash: string = createHash("sha256").update(cwd).digest("hex").slice(0, 16);
-  return path.join(os.homedir(), ".cache", "claude-dashboard-statusline", `${cwdHash}.json`);
+function resolveLiveStatusSnapshotPath(instance: InstanceRecord): string {
+  return path.join(os.homedir(), ".cache", "ai-multi-instance", `${instance.id}.json`);
 }
 
 async function readLiveSessionId(instance: InstanceRecord): Promise<string | null> {
   try {
-    const snapshotPath: string = await resolveLiveStatusSnapshotPath(instance);
+    const snapshotPath: string = resolveLiveStatusSnapshotPath(instance);
     const snapshot = JSON.parse(await fs.readFile(snapshotPath, "utf8")) as { sessionId?: string | null };
     return typeof snapshot.sessionId === "string" && snapshot.sessionId !== "" ? snapshot.sessionId : null;
   } catch {
     // No statusLine snapshot yet for this directory (not configured, or Claude Code
     // hasn't redrawn its statusline here since this dashboard instance was launched)
     return null;
+  }
+}
+
+async function writeSessionSnapshot(
+  instance: InstanceRecord,
+  sessionId: string,
+  extra: Record<string, unknown> = {}
+): Promise<void> {
+  const snapshotPath: string = resolveLiveStatusSnapshotPath(instance);
+  await fs.mkdir(path.dirname(snapshotPath), { recursive: true });
+  await fs.writeFile(
+    snapshotPath,
+    JSON.stringify({
+      provider: instance.provider,
+      sessionId,
+      cwd: instance.locationPath,
+      model: instance.model ?? undefined,
+      ...extra,
+      updatedAt: new Date().toISOString(),
+    }),
+    "utf8"
+  );
+}
+
+async function findCodexSessionFile(sessionId: string): Promise<string | undefined> {
+  const sessionsRoot: string = path.join(process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex"), "sessions");
+  try {
+    const entries = await fs.readdir(sessionsRoot, { recursive: true });
+    const relativePath: string | undefined = entries.find(
+      (entry) => typeof entry === "string" && entry.endsWith(`${sessionId}.jsonl`)
+    );
+    return relativePath === undefined ? undefined : path.join(sessionsRoot, relativePath);
+  } catch {
+    return undefined;
+  }
+}
+
+async function enrichCodexStatus(snapshot: Record<string, unknown>): Promise<Record<string, unknown>> {
+  if (typeof snapshot.sessionFile !== "string") return snapshot;
+  try {
+    const content: string = await fs.readFile(snapshot.sessionFile, "utf8");
+    let model: string | undefined;
+    let effort: string | undefined;
+    let tokenInfo: Record<string, unknown> | null = null;
+    let rateLimits: Record<string, unknown> | null = null;
+    for (const line of content.trim().split("\n")) {
+      const event = JSON.parse(line) as { type?: string; payload?: Record<string, unknown> };
+      if (event.type === "turn_context") {
+        if (typeof event.payload?.model === "string") model = event.payload.model;
+        const collaboration = event.payload?.collaboration_mode as { settings?: { reasoning_effort?: string } } | undefined;
+        if (typeof collaboration?.settings?.reasoning_effort === "string") effort = collaboration.settings.reasoning_effort;
+      }
+      if (event.type === "event_msg" && event.payload?.type === "token_count") {
+        tokenInfo = (event.payload.info as Record<string, unknown> | null) ?? null;
+        rateLimits = (event.payload.rate_limits as Record<string, unknown> | null) ?? null;
+      }
+    }
+    const totalUsage = tokenInfo?.total_token_usage as { total_tokens?: number } | undefined;
+    const contextSize = tokenInfo?.model_context_window;
+    const primary = rateLimits?.primary as { used_percent?: number; resets_at?: number } | undefined;
+    const secondary = rateLimits?.secondary as { used_percent?: number; resets_at?: number } | undefined;
+    const contextUsed: number | undefined = totalUsage?.total_tokens;
+    return {
+      ...snapshot,
+      ...(model ? { model } : {}),
+      ...(effort ? { effort } : {}),
+      ...(typeof contextUsed === "number" ? { contextUsed } : {}),
+      ...(typeof contextSize === "number"
+        ? {
+            contextSize,
+            contextPct: contextUsed === undefined ? 0 : (contextUsed / contextSize) * 100,
+          }
+        : {}),
+      ...(typeof primary?.used_percent === "number" ? { fiveHourPct: primary.used_percent } : {}),
+      ...(typeof primary?.resets_at === "number" ? { fiveHourResetsAt: primary.resets_at } : {}),
+      ...(typeof secondary?.used_percent === "number" ? { sevenDayPct: secondary.used_percent } : {}),
+      ...(typeof secondary?.resets_at === "number" ? { sevenDayResetsAt: secondary.resets_at } : {}),
+      updatedAt: new Date().toISOString(),
+    };
+  } catch {
+    return snapshot;
   }
 }
 
@@ -281,24 +352,52 @@ apiRouter.post(
     }
 
     const shellOnly: boolean = payload.shellOnly === true;
+    if (payload.provider !== undefined && !isAgentProvider(payload.provider)) {
+      response.status(400).json({ error: "Provide a valid agent provider." });
+      return;
+    }
+    const provider = isAgentProvider(payload.provider) ? payload.provider : "claude";
+    const providerDefinition = PROVIDERS[provider];
+    if (
+      !shellOnly &&
+      provider === "custom" &&
+      (typeof payload.command !== "string" || payload.command.trim() === "")
+    ) {
+      response.status(400).json({ error: "Provide a custom command." });
+      return;
+    }
     const instanceId: string = randomUUID().slice(0, 8);
     const instance: InstanceRecord = {
       id: instanceId,
       label: requestedLabel,
       locationPath,
       tmuxSession: `ccdash-${instanceId}`,
+      provider,
       command:
         typeof payload.command === "string" && payload.command.trim() !== ""
           ? payload.command.trim()
-          : DEFAULT_COMMAND,
-      model: typeof payload.model === "string" && payload.model.trim() !== "" ? payload.model.trim() : null,
-      effort: typeof payload.effort === "string" && payload.effort.trim() !== "" ? payload.effort.trim() : null,
+          : providerDefinition.defaultCommand,
+      model:
+        providerDefinition.capabilities.model && typeof payload.model === "string" && payload.model.trim() !== ""
+          ? payload.model.trim()
+          : null,
+      effort:
+        providerDefinition.capabilities.effort && typeof payload.effort === "string" && payload.effort.trim() !== ""
+          ? payload.effort.trim()
+          : null,
       fontSize: DEFAULT_FONT_SIZE,
       createdAt: new Date().toISOString(),
       ...(shellOnly ? { shellOnly: true } : {}),
     };
 
-    const resumeSessionId: string | undefined = state.sessionsByKey[sessionKeyFor(locationPath, requestedLabel)];
+    const resumeKey: string = sessionKeyFor(provider, locationPath, requestedLabel);
+    let resumeSessionId: string | undefined = state.sessionsByKey[resumeKey];
+    if (resumeSessionId !== undefined) {
+      instance.sessionId = resumeSessionId;
+      const sessionFile: string | undefined =
+        provider === "codex" ? await findCodexSessionFile(resumeSessionId) : undefined;
+      await writeSessionSnapshot(instance, resumeSessionId, sessionFile ? { sessionFile } : {});
+    }
 
     try {
       await createSession(instance.tmuxSession, instance.locationPath);
@@ -353,7 +452,18 @@ apiRouter.patch(
     }
     const payload = request.body as UpdateInstancePayload;
     if (typeof payload.label === "string" && payload.label.trim() !== "") {
-      instance.label = payload.label.trim();
+      const nextLabel: string = payload.label.trim();
+      const nameTaken: boolean = state.instances.some(
+        (candidate) =>
+          candidate.id !== instance.id &&
+          candidate.locationPath === instance.locationPath &&
+          candidate.label === nextLabel
+      );
+      if (nameTaken) {
+        response.status(409).json({ error: `An instance named '${nextLabel}' is already running here` });
+        return;
+      }
+      instance.label = nextLabel;
     }
     if (typeof payload.command === "string" && payload.command.trim() !== "") {
       instance.command = payload.command.trim();
@@ -402,11 +512,20 @@ apiRouter.get(
       return;
     }
 
-    const snapshotPath: string = await resolveLiveStatusSnapshotPath(instance);
+    const snapshotPath: string = resolveLiveStatusSnapshotPath(instance);
 
     try {
-      const snapshot: unknown = JSON.parse(await fs.readFile(snapshotPath, "utf8"));
-      response.json({ available: true, ...(snapshot as object) });
+      let snapshot = JSON.parse(await fs.readFile(snapshotPath, "utf8")) as Record<string, unknown>;
+      if (instance.provider === "codex") {
+        snapshot = await enrichCodexStatus(snapshot);
+      }
+      const sessionId: unknown = snapshot.sessionId;
+      if (typeof sessionId === "string" && sessionId !== "" && instance.sessionId !== sessionId) {
+        instance.sessionId = sessionId;
+        state.sessionsByKey[sessionKeyFor(instance.provider, instance.locationPath, instance.label)] = sessionId;
+        await saveState(state);
+      }
+      response.json({ available: true, ...snapshot });
     } catch {
       // No statusLine snapshot yet for this directory (not configured, or Claude Code
       // hasn't redrawn its statusline here since this dashboard instance was launched)
@@ -429,7 +548,7 @@ apiRouter.delete(
     // this exact location+label can pick up the conversation where it left off.
     const liveSessionId: string | null = await readLiveSessionId(instance);
     if (liveSessionId !== null) {
-      state.sessionsByKey[sessionKeyFor(instance.locationPath, instance.label)] = liveSessionId;
+      state.sessionsByKey[sessionKeyFor(instance.provider, instance.locationPath, instance.label)] = liveSessionId;
     }
 
     try {

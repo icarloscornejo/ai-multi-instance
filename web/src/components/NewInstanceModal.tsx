@@ -1,18 +1,10 @@
 import { useEffect, useState } from "react";
 import { api, ApiError } from "../api";
-import type { BranchAction, CreateInstancePayload, Instance, LocationBranches, LocationInfo } from "../types";
+import type { AgentProvider, BranchAction, CreateInstancePayload, Instance, LocationBranches, LocationInfo } from "../types";
 import { Modal } from "./Modal";
 import { BranchPickerModal } from "./BranchPickerModal";
 import { btnGhost, btnPrimary, errorTextClassName, fieldLabelClassName, hintTextClassName, inputClassName, inputErrorClassName } from "../ui";
-
-const MODEL_OPTIONS: { value: string; label: string }[] = [
-  { value: "", label: "Inherit" },
-  { value: "fable", label: "fable" },
-  { value: "opus", label: "opus" },
-  { value: "opusplan", label: "opusplan" },
-  { value: "sonnet", label: "sonnet" },
-  { value: "haiku", label: "haiku" },
-];
+import { previewCommand, PROVIDER_OPTIONS } from "../providerOptions";
 
 const EFFORT_OPTIONS: { value: string; label: string }[] = [
   { value: "", label: "Default" },
@@ -22,8 +14,6 @@ const EFFORT_OPTIONS: { value: string; label: string }[] = [
   { value: "xhigh", label: "xhigh" },
   { value: "max", label: "max" },
 ];
-
-const DEFAULT_COMMAND = "claude";
 
 interface NewInstanceModalProps {
   instances: Instance[];
@@ -43,11 +33,12 @@ export function NewInstanceModal({ instances, onCreate, onClose }: NewInstanceMo
   const [locationPath, setLocationPath] = useState<string>("");
   const [label, setLabel] = useState<string>("");
   const [labelEditedManually, setLabelEditedManually] = useState<boolean>(false);
-  const [command, setCommand] = useState<string>(DEFAULT_COMMAND);
+  const [provider, setProvider] = useState<AgentProvider>("claude");
+  const [command, setCommand] = useState<string>("claude");
   const [model, setModel] = useState<string>("opusplan");
   const [effort, setEffort] = useState<string>("high");
   const [shellOnly, setShellOnly] = useState<boolean>(false);
-  const [advancedOpen, setAdvancedOpen] = useState<boolean>(true);
+  const [advancedOpen, setAdvancedOpen] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState<boolean>(false);
 
@@ -97,7 +88,13 @@ export function NewInstanceModal({ instances, onCreate, onClose }: NewInstanceMo
   );
 
   const handleSubmit = async (): Promise<void> => {
-    if (locationPath.trim() === "" || trimmedLabel === "" || nameTaken || submitting) {
+    if (
+      locationPath.trim() === "" ||
+      trimmedLabel === "" ||
+      nameTaken ||
+      submitting ||
+      (!shellOnly && command.trim() === "")
+    ) {
       return;
     }
     setSubmitting(true);
@@ -106,6 +103,7 @@ export function NewInstanceModal({ instances, onCreate, onClose }: NewInstanceMo
       await onCreate({
         locationPath: locationPath.trim(),
         label: trimmedLabel,
+        provider,
         command: shellOnly ? undefined : command.trim() === "" ? undefined : command.trim(),
         model: shellOnly ? undefined : model === "" ? undefined : model,
         effort: shellOnly ? undefined : effort === "" ? undefined : effort,
@@ -119,6 +117,8 @@ export function NewInstanceModal({ instances, onCreate, onClose }: NewInstanceMo
   };
 
   const noLocations: boolean = locations !== null && locations.length === 0;
+  const providerLabel: string = PROVIDER_OPTIONS.find((option) => option.value === provider)?.label ?? provider;
+  const launchPreview: string = shellOnly ? "(shell only)" : previewCommand(provider, command, model, effort);
 
   return (
     <>
@@ -177,9 +177,35 @@ export function NewInstanceModal({ instances, onCreate, onClose }: NewInstanceMo
           {nameTaken && <div className={errorTextClassName}>An instance named '{trimmedLabel}' is already running here</div>}
         </div>
 
+        <div>
+          <label className={fieldLabelClassName}>Agent</label>
+          <div className="grid grid-cols-2 gap-[8px]">
+            {PROVIDER_OPTIONS.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                disabled={shellOnly}
+                onClick={() => {
+                  setProvider(option.value);
+                  setCommand(option.command);
+                  setModel(option.value === "claude" ? "opusplan" : "");
+                  setEffort(option.value === "claude" ? "high" : "");
+                }}
+                className={`rounded-sm border px-[10px] py-[9px] text-left text-[12px] ${
+                  provider === option.value
+                    ? "border-accent bg-accent/10 font-semibold text-txt-bright"
+                    : "border-border-strong bg-app text-txt-secondary hover:bg-raised"
+                } disabled:opacity-40`}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
         <label className="flex items-center gap-[8px] text-[12px] text-txt-body">
           <input type="checkbox" checked={shellOnly} onChange={(event) => setShellOnly(event.target.checked)} />
-          Shell only, don't launch Claude
+          Open shell only
         </label>
 
         <div className="border-t border-border pt-[14px]">
@@ -194,11 +220,11 @@ export function NewInstanceModal({ instances, onCreate, onClose }: NewInstanceMo
           {advancedOpen && (
             <div className="mt-[12px] flex flex-col gap-[12px]">
               <div>
-                <label className={fieldLabelClassName}>Claude binary</label>
+                <label className={fieldLabelClassName}>{provider === "custom" ? "Command" : `${providerLabel} executable`}</label>
                 <input
                   className={inputClassName}
                   value={command}
-                  placeholder={DEFAULT_COMMAND}
+                  placeholder={provider === "custom" ? "your-cli --interactive" : PROVIDER_OPTIONS.find((option) => option.value === provider)?.command}
                   disabled={shellOnly}
                   onChange={(event) => setCommand(event.target.value)}
                   onKeyDown={(event) => {
@@ -208,27 +234,23 @@ export function NewInstanceModal({ instances, onCreate, onClose }: NewInstanceMo
                   }}
                 />
                 <div className={hintTextClassName}>
-                  Defaults to <span className="font-mono">claude</span>. Enter another binary name if you have one on
-                  your PATH.
+                  {provider === "custom"
+                    ? "Executed exactly as entered; AI Multi-Instance will not add flags."
+                    : "Use an executable name from PATH or an absolute path."}
                 </div>
               </div>
-              <div className="flex gap-[10px]">
+              {provider !== "custom" && <div className="flex gap-[10px]">
                 <div className="flex-1">
                   <label className={fieldLabelClassName}>Model</label>
-                  <select
+                  <input
                     className={inputClassName}
                     value={model}
                     disabled={shellOnly}
+                    placeholder="Inherit from CLI config"
                     onChange={(event) => setModel(event.target.value)}
-                  >
-                    {MODEL_OPTIONS.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
+                  />
                 </div>
-                <div className="flex-1">
+                {provider === "claude" && <div className="flex-1">
                   <label className={fieldLabelClassName}>Effort</label>
                   <select
                     className={inputClassName}
@@ -242,6 +264,12 @@ export function NewInstanceModal({ instances, onCreate, onClose }: NewInstanceMo
                       </option>
                     ))}
                   </select>
+                </div>}
+              </div>}
+              <div>
+                <label className={fieldLabelClassName}>Launch preview</label>
+                <div className="break-all rounded-sm bg-raised px-[10px] py-[8px] font-mono text-[11px] text-txt-secondary">
+                  {launchPreview}
                 </div>
               </div>
             </div>
@@ -257,7 +285,14 @@ export function NewInstanceModal({ instances, onCreate, onClose }: NewInstanceMo
           <button
             type="button"
             onClick={() => void handleSubmit()}
-            disabled={locationPath.trim() === "" || trimmedLabel === "" || nameTaken || submitting || noLocations}
+            disabled={
+              locationPath.trim() === "" ||
+              trimmedLabel === "" ||
+              nameTaken ||
+              submitting ||
+              noLocations ||
+              (!shellOnly && command.trim() === "")
+            }
             title={noLocations ? "No locations configured" : undefined}
             className={btnPrimary}
           >

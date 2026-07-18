@@ -177,8 +177,8 @@ export function TabBar({
 
   return (
     <header className="flex h-[46px] shrink-0 items-center border-b border-border bg-app px-[10px]">
-      <img src="/claude-ai-icon.svg" alt="" className="mr-[8px] h-[20px] w-[20px] shrink-0" />
-      <span className="mr-[14px] shrink-0 text-[13px] font-semibold text-txt-primary">Claude Multi-Instance</span>
+      <img src="/ai-multi-instance.svg" alt="" className="mr-[8px] h-[20px] w-[20px] shrink-0" />
+      <span className="mr-[14px] shrink-0 text-[13px] font-semibold text-txt-primary">AI Multi-Instance</span>
       <div className="relative mr-[10px] min-w-0 flex-1">
         <div className="tab-scroll flex flex-nowrap items-center overflow-x-auto">
           <DndContext
