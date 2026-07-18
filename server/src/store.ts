@@ -6,13 +6,15 @@ const dataDirectory: string = path.resolve(import.meta.dirname, "../../data");
 const stateFilePath: string = path.join(dataDirectory, "instances.json");
 
 let cachedState: DashboardState | null = null;
+let saveQueue: Promise<void> = Promise.resolve();
 
 function emptyState(): DashboardState {
-  return { config: { locations: [] }, instances: [], sessionsByKey: {} };
+  return { schemaVersion: 2, config: { locations: [] }, instances: [], sessionsByKey: {} };
 }
 
 // Previous formats: worktrees per branch -> fixed slots -> plain folder locations
 interface LegacyDashboardState {
+  schemaVersion?: number;
   config: { repoPath?: string | null; worktreesDir?: string | null; slots?: string[]; locations?: string[] };
   instances: Array<
     Record<string, unknown> & {
@@ -29,23 +31,32 @@ interface LegacyDashboardState {
 // The old state referenced worktrees per branch, then fixed git slots; locations are
 // plain folders so there is no way to migrate the config automatically.
 // Only the instance list is preserved (renaming/dropping fields) to avoid losing live tmux sessions.
-function migrateLegacyState(rawState: LegacyDashboardState): DashboardState {
+export function migrateLegacyState(rawState: LegacyDashboardState): DashboardState {
   const migratedLocations: string[] = Array.isArray(rawState.config.locations)
     ? rawState.config.locations
     : Array.isArray(rawState.config.slots)
       ? rawState.config.slots
       : [];
   return {
+    schemaVersion: 2,
     config: { locations: migratedLocations },
     instances: rawState.instances.map((instance) => {
       const { worktreePath, slotPath, branch, command, ...rest } = instance;
       return {
         ...rest,
         locationPath: instance.locationPath ?? slotPath ?? worktreePath ?? "",
+        provider: instance.provider ?? "claude",
         command: command ?? "claude",
       } as unknown as DashboardState["instances"][number];
     }),
-    sessionsByKey: rawState.sessionsByKey ?? {},
+    sessionsByKey: Object.fromEntries(
+      Object.entries(rawState.sessionsByKey ?? {}).map(([key, value]) => [
+        key.startsWith("claude::") || key.startsWith("codex::") || key.startsWith("cursor::") || key.startsWith("custom::")
+          ? key
+          : `claude::${key}`,
+        value,
+      ])
+    ),
   };
 }
 
@@ -70,9 +81,13 @@ export async function loadState(): Promise<DashboardState> {
 
 export async function saveState(state: DashboardState): Promise<void> {
   cachedState = state;
-  await fs.mkdir(dataDirectory, { recursive: true });
-  // Atomic write (tmp + rename) to avoid corrupting the registry if the process dies mid-write
-  const temporaryFilePath: string = `${stateFilePath}.tmp`;
-  await fs.writeFile(temporaryFilePath, JSON.stringify(state, null, 2), "utf8");
-  await fs.rename(temporaryFilePath, stateFilePath);
+  const serializedState: string = JSON.stringify(state, null, 2);
+  saveQueue = saveQueue.catch(() => undefined).then(async () => {
+    await fs.mkdir(dataDirectory, { recursive: true });
+    // Atomic write (tmp + rename) to avoid corrupting the registry if the process dies mid-write.
+    const temporaryFilePath: string = `${stateFilePath}.${process.pid}.${Date.now()}.tmp`;
+    await fs.writeFile(temporaryFilePath, serializedState, "utf8");
+    await fs.rename(temporaryFilePath, stateFilePath);
+  });
+  await saveQueue;
 }

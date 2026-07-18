@@ -1,6 +1,7 @@
 import * as nodePty from "@lydell/node-pty";
 import type { WebSocket, RawData } from "ws";
-import { createSession, enableMouseMode, hasSession } from "./tmux";
+import { buildLaunchCommand } from "./launch";
+import { createSession, enableMouseMode, hasSession, sendCommandToSession } from "./tmux";
 import type { InstanceRecord } from "./types";
 
 interface ClientControlMessage {
@@ -25,11 +26,16 @@ export async function bridgeTerminal(
   pendingMessages: RawData[],
   stopBuffering: () => void
 ): Promise<void> {
-  // The session may have died (machine reboot): recreating it leaves a fresh shell
-  // sitting in the folder, ready to relaunch claude
+  // Recreate a lost tmux session and restore the provider conversation when possible.
   const sessionAlive: boolean = await hasSession(instance.tmuxSession);
   if (!sessionAlive) {
     await createSession(instance.tmuxSession, instance.locationPath);
+    if (instance.shellOnly !== true) {
+      await sendCommandToSession(
+        instance.tmuxSession,
+        buildLaunchCommand(instance, { resumeSessionId: instance.sessionId ?? undefined })
+      );
+    }
   } else {
     // Migrate sessions that were alive before this change (createSession already
     // enables it for new ones); set-option is idempotent, no cost in repeating it

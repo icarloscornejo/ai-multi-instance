@@ -2,25 +2,28 @@ export interface DashboardConfig {
   locations: string[];
 }
 
+export type AgentProvider = "claude" | "codex" | "cursor" | "custom";
+
 export interface InstanceRecord {
   id: string;
   label: string;
   locationPath: string;
   tmuxSession: string;
+  provider: AgentProvider;
   command: string;
   model: string | null;
   effort: string | null;
+  sessionId?: string | null;
   fontSize: number;
   createdAt: string;
   shellOnly?: boolean;
 }
 
 export interface DashboardState {
+  schemaVersion: 2;
   config: DashboardConfig;
   instances: InstanceRecord[];
-  // Last known Claude Code session id per "<locationPath>::<label>", captured when an
-  // instance is deleted so a future instance reusing the same location+label can
-  // resume that exact conversation instead of starting a new one.
+  // Last known provider session id per "<provider>::<locationPath>::<label>".
   sessionsByKey: Record<string, string>;
 }
 
@@ -31,6 +34,7 @@ export type BranchAction =
 export interface CreateInstancePayload {
   locationPath: string;
   label?: string;
+  provider?: AgentProvider;
   command?: string;
   model?: string;
   effort?: string;

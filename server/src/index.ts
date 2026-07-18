@@ -8,6 +8,7 @@ import { bridgeTerminal } from "./terminal";
 import type { DashboardState } from "./types";
 
 const serverPort: number = Number(process.env.PORT ?? 3001);
+const serverHost: string = process.env.HOST ?? "127.0.0.1";
 
 const app = express();
 app.use(express.json());
@@ -72,6 +73,6 @@ httpServer.on("upgrade", (request, socket, head) => {
   });
 });
 
-httpServer.listen(serverPort, () => {
-  console.log(`[server] listening on http://localhost:${serverPort}`);
+httpServer.listen(serverPort, serverHost, () => {
+  console.log(`[server] listening on http://${serverHost}:${serverPort}`);
 });

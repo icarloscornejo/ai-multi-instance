@@ -1,3 +1,3 @@
-http://claude.local {
+http://ai.local, http://claude.local {
 	reverse_proxy 127.0.0.1:5173
 }

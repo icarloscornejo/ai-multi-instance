@@ -6,6 +6,12 @@ import type { Theme } from "../theme";
 
 const MIN_FONT_SIZE = 10;
 const MAX_FONT_SIZE = 18;
+const PROVIDER_LABELS = {
+  claude: "Claude",
+  codex: "Codex",
+  cursor: "Cursor",
+  custom: "Custom",
+} as const;
 
 // ANSI palette aligned to the design tokens (xterm's defaults are too saturated)
 const terminalThemeDark: ITheme = {
@@ -305,7 +311,8 @@ export function TerminalView({ instance, visible, onPersistFontSize, theme }: Te
           {">"}
         </div>
         <div className="mt-[6px] font-mono text-[10.5px] text-txt-dim">
-          {instance.label} · {instance.model ?? "default model"}
+          {instance.label} · {PROVIDER_LABELS[instance.provider]}
+          {instance.model !== null ? ` · ${instance.model}` : ""}
           {instance.effort !== null ? ` · effort ${instance.effort}` : ""}
         </div>
       </div>

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Automated setup for claude-multi-instance on macOS.
-# Installs everything that can be automated (Homebrew, git, tmux, node, Claude Code),
+# Automated setup for AI Multi-Instance on macOS.
+# Installs dashboard dependencies and detects supported agent CLIs,
 # clones the repo, and leaves the dashboard ready to start.
 # What must be done manually is listed in the final checklist.
 #
@@ -11,7 +11,7 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/icarloscornejo/claude-multi-instance.git"
-INSTALL_DIR="${CLAUDE_DASHBOARD_DIR:-${HOME}/claude-multi-instance}"
+INSTALL_DIR="${AI_MULTI_INSTANCE_DIR:-${CLAUDE_DASHBOARD_DIR:-${HOME}/claude-multi-instance}}"
 
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$1"; }
 ok()   { printf '\033[1;32m    ✓ %s\033[0m\n' "$1"; }
@@ -56,13 +56,13 @@ elif [[ -x /usr/local/bin/brew ]]; then
 fi
 
 # 2. System dependencies
-step "git, tmux y node"
+step "git, tmux, jq and node"
 version_of() {
   # tmux only understands -V; everything else uses --version
   { "$1" --version 2>/dev/null || "$1" -V 2>/dev/null; } | head -1
 }
 
-for formula in git tmux; do
+for formula in git tmux jq; do
   if command -v "$formula" >/dev/null 2>&1; then
     ok "$formula already installed ($(version_of "$formula"))"
   else
@@ -87,17 +87,19 @@ else
   fi
 fi
 
-# 3. Claude Code (official native installer). Authentication is NOT touched:
-#    the dashboard inherits the shell environment exactly as it is configured.
-step "Claude Code"
-if command -v claude >/dev/null 2>&1; then
-  ok "claude already installed ($(claude --version 2>/dev/null | head -1))"
-else
-  curl -fsSL https://claude.ai/install.sh | bash
-  # The installer puts the binary in ~/.local/bin and updates the shell rc file,
-  # but this script is already running: add it to PATH for this run
-  export PATH="${HOME}/.local/bin:${PATH}"
-  ok "claude installed ($(claude --version 2>/dev/null | head -1))"
+# 3. Agent CLIs are optional and authentication is never modified.
+step "Agent CLIs"
+agents_found=0
+for agent_cli in claude codex agent; do
+  if command -v "${agent_cli}" >/dev/null 2>&1; then
+    ok "${agent_cli} detected ($(version_of "${agent_cli}"))"
+    agents_found=$((agents_found + 1))
+  else
+    warn "${agent_cli} not found (optional; install it separately to use that provider)"
+  fi
+done
+if [[ "${agents_found}" -eq 0 ]]; then
+  warn "No supported AI CLI was detected. Custom commands and shell-only sessions still work."
 fi
 
 # 4. Dashboard repo + npm dependencies
@@ -159,13 +161,66 @@ else
   exit 1
 fi
 
-# 5. claude.local: hostname + reverse proxy, so the dashboard is reachable at
-#    http://claude.local with no port suffix, while Vite keeps listening on its
+# 5. Cursor status line: preserve any configured status line while adding the
+# dashboard's snapshot writer. Cursor invokes this command with live structured
+# context data, which cannot be recovered reliably from terminal escape output.
+step "Cursor live metrics"
+CURSOR_STATUSLINE_SCRIPT="${INSTALL_DIR}/server/scripts/dashboard-cursor-statusline.mjs"
+CURSOR_CONFIG_DIR="${HOME}/.cursor"
+CURSOR_CLI_CONFIG="${CURSOR_CONFIG_DIR}/cli-config.json"
+CURSOR_STATUSLINE_SIDECAR="${CURSOR_CONFIG_DIR}/ai-multi-instance-statusline.json"
+if command -v agent >/dev/null 2>&1; then
+  CURSOR_STATUSLINE_SCRIPT="${CURSOR_STATUSLINE_SCRIPT}" \
+  CURSOR_CLI_CONFIG="${CURSOR_CLI_CONFIG}" \
+  CURSOR_STATUSLINE_SIDECAR="${CURSOR_STATUSLINE_SIDECAR}" \
+  python3 - <<'PY'
+import json
+import os
+import shlex
+import tempfile
+from pathlib import Path
+
+config_path = Path(os.environ["CURSOR_CLI_CONFIG"])
+sidecar_path = Path(os.environ["CURSOR_STATUSLINE_SIDECAR"])
+script_path = Path(os.environ["CURSOR_STATUSLINE_SCRIPT"])
+
+try:
+    config = json.loads(config_path.read_text()) if config_path.exists() else {"version": 1}
+except json.JSONDecodeError:
+    raise SystemExit(f"Cursor CLI config is not valid JSON: {config_path}")
+
+current = config.get("statusLine")
+current_command = current.get("command") if isinstance(current, dict) else None
+if isinstance(current, dict) and "dashboard-cursor-statusline.mjs" not in str(current_command):
+    sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+    sidecar_path.write_text(json.dumps({"statusLine": current}, indent=2) + "\n")
+
+status_line = dict(current) if isinstance(current, dict) else {}
+status_line.update({
+    "type": "command",
+    "command": f"node {shlex.quote(str(script_path))}",
+})
+config["statusLine"] = status_line
+
+config_path.parent.mkdir(parents=True, exist_ok=True)
+with tempfile.NamedTemporaryFile("w", dir=config_path.parent, delete=False) as temporary:
+    json.dump(config, temporary, indent=2)
+    temporary.write("\n")
+    temp_path = Path(temporary.name)
+temp_path.replace(config_path)
+PY
+  ok "Cursor status line configured (existing custom line preserved)"
+else
+  warn "Cursor Agent is not installed; live Cursor metrics will be configured when setup is rerun after installation."
+fi
+
+# 6. ai.local: hostname + reverse proxy, so the dashboard is reachable at
+#    http://ai.local with no port suffix, while Vite keeps listening on its
 #    normal unprivileged port 5173 (macOS refuses to bind :80 without root).
 #    Caddy is installed as a brew service (a LaunchDaemon running as root, brew's
 #    standard way to let a service bind privileged ports) and proxies 80 -> 5173
 #    using the repo's Caddyfile.
-step "claude.local"
+step "ai.local"
 
 # Needs a controlling terminal for sudo to prompt for the password (sudo talks to
 # /dev/tty directly, not stdin, so this works even when stdin is itself a pipe).
@@ -176,24 +231,24 @@ run_as_root() { sudo "$@"; }
 # Both an A and an AAAA record: hostname resolvers that try IPv6 first (curl,
 # browsers) can otherwise stall for several seconds waiting on a network AAAA
 # lookup before falling back to the A record from this file.
-hosts_v4_line='127.0.0.1  claude.local'
-hosts_v6_line='::1  claude.local'
+hosts_v4_line='127.0.0.1  ai.local claude.local'
+hosts_v6_line='::1  ai.local claude.local'
 hosts_v4_done=1
 hosts_v6_done=1
-grep -qE '^[[:space:]]*127\.0\.0\.1[[:space:]]+claude\.local([[:space:]]|$)' /etc/hosts 2>/dev/null || hosts_v4_done=0
-grep -qE '^[[:space:]]*::1[[:space:]]+claude\.local([[:space:]]|$)' /etc/hosts 2>/dev/null || hosts_v6_done=0
+grep -qE '^[[:space:]]*127\.0\.0\.1[[:space:]].*ai\.local([[:space:]]|$)' /etc/hosts 2>/dev/null || hosts_v4_done=0
+grep -qE '^[[:space:]]*::1[[:space:]].*ai\.local([[:space:]]|$)' /etc/hosts 2>/dev/null || hosts_v6_done=0
 missing_hosts_lines=()
 [[ "${hosts_v4_done}" -eq 0 ]] && missing_hosts_lines+=("${hosts_v4_line}")
 [[ "${hosts_v6_done}" -eq 0 ]] && missing_hosts_lines+=("${hosts_v6_line}")
 
 if [[ "${#missing_hosts_lines[@]}" -eq 0 ]]; then
-  ok "claude.local already in /etc/hosts"
+  ok "ai.local already in /etc/hosts"
 elif ! have_sudo_tty; then
   warn "No terminal available to prompt for sudo. Add these lines to /etc/hosts manually:"
   for line in "${missing_hosts_lines[@]}"; do echo "        ${line}"; done
 else
   printf '%s\n' "${missing_hosts_lines[@]}" | run_as_root tee -a /etc/hosts >/dev/null
-  ok "claude.local added to /etc/hosts"
+  ok "ai.local added to /etc/hosts (claude.local kept as an alias)"
 fi
 
 if command -v caddy >/dev/null 2>&1; then
@@ -212,14 +267,18 @@ else
 fi
 
 if [[ "${caddy_config_done}" -eq 1 ]]; then
-  ok "Caddy already configured to proxy claude.local -> 5173"
+  ok "Caddy already configured to proxy ai.local -> 5173"
+  if have_sudo_tty && run_as_root brew services list 2>/dev/null | grep -qE '^caddy\s+started'; then
+    run_as_root brew services restart caddy >/dev/null
+    ok "Caddy reloaded with the current dashboard config"
+  fi
 elif ! have_sudo_tty; then
-  warn "No terminal available to prompt for sudo. To finish claude.local setup manually:"
+  warn "No terminal available to prompt for sudo. To finish ai.local setup manually:"
   echo   "        echo '${caddyfile_import}' >> $(brew --prefix)/etc/Caddyfile"
   echo   "        sudo brew services start caddy"
 else
   echo "${caddyfile_import}" >> "${brew_caddyfile}"
-  ok "Caddy configured to proxy claude.local -> 5173"
+  ok "Caddy configured to proxy ai.local -> 5173"
   # brew services runs Caddy as a root LaunchDaemon (sudo needed once here, not for
   # "npm run dev"), so it can bind port 80 and keeps running across reboots.
   if run_as_root brew services list 2>/dev/null | grep -qE '^caddy\s+started'; then
@@ -243,7 +302,7 @@ cat <<EOF
 
   1. Start the dashboard:
        cd ${INSTALL_DIR} && npm run dev
-     then open http://claude.local
+     then open http://ai.local
 
   2. On the initial screen, add the folder paths where terminals will open.
      You can open multiple instances in the same folder at once.

@@ -1,11 +1,15 @@
+export type AgentProvider = "claude" | "codex" | "cursor" | "custom";
+
 export interface Instance {
   id: string;
   label: string;
   locationPath: string;
   tmuxSession: string;
+  provider: AgentProvider;
   command: string;
   model: string | null;
   effort: string | null;
+  sessionId?: string | null;
   fontSize: number;
   createdAt: string;
   shellOnly?: boolean;
@@ -23,6 +27,7 @@ export type BranchAction =
 export interface CreateInstancePayload {
   locationPath: string;
   label?: string;
+  provider?: AgentProvider;
   command?: string;
   model?: string;
   effort?: string;
@@ -75,6 +80,7 @@ export interface UpdateInstancePayload {
 
 export interface LiveStatus {
   available: boolean;
+  provider?: AgentProvider;
   model?: string;
   cwd?: string;
   sessionId?: string | null;
@@ -85,6 +91,8 @@ export interface LiveStatus {
   contextUsed?: number;
   contextSize?: number;
   contextPct?: number;
+  inputTokens?: number;
+  outputTokens?: number;
   sessionCostUsd?: number;
   fiveHourPct?: number | null;
   fiveHourResetsAt?: number | null;
