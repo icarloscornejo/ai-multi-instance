@@ -1,8 +1,9 @@
+export type AgentProvider = "claude" | "codex" | "cursor" | "custom";
+
 export interface DashboardConfig {
   locations: string[];
+  enabledProviders: AgentProvider[];
 }
-
-export type AgentProvider = "claude" | "codex" | "cursor" | "custom";
 
 export interface InstanceRecord {
   id: string;
@@ -40,6 +41,7 @@ export interface CreateInstancePayload {
   effort?: string;
   branchAction?: BranchAction;
   shellOnly?: boolean;
+  resumeSession?: boolean;
 }
 
 export interface LocationInfo {

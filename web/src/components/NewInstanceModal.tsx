@@ -3,6 +3,7 @@ import { api, ApiError } from "../api";
 import type { AgentProvider, BranchAction, CreateInstancePayload, Instance, LocationBranches, LocationInfo } from "../types";
 import { Modal } from "./Modal";
 import { BranchPickerModal } from "./BranchPickerModal";
+import { ResumeSessionModal } from "./ResumeSessionModal";
 import { btnGhost, btnPrimary, errorTextClassName, fieldLabelClassName, hintTextClassName, inputClassName, inputErrorClassName } from "../ui";
 import { previewCommand, PROVIDER_OPTIONS } from "../providerOptions";
 
@@ -17,6 +18,7 @@ const EFFORT_OPTIONS: { value: string; label: string }[] = [
 
 interface NewInstanceModalProps {
   instances: Instance[];
+  enabledProviders: AgentProvider[];
   onCreate: (payload: CreateInstancePayload) => Promise<void>;
   onClose: () => void;
 }
@@ -28,23 +30,28 @@ function describeBranch(branchInfo: LocationBranches, branchAction: BranchAction
   return branchInfo.currentBranch ?? "";
 }
 
-export function NewInstanceModal({ instances, onCreate, onClose }: NewInstanceModalProps) {
+export function NewInstanceModal({ instances, enabledProviders, onCreate, onClose }: NewInstanceModalProps) {
+  const visibleProviders = PROVIDER_OPTIONS.filter((option) => enabledProviders.includes(option.value));
+  const initialProvider: AgentProvider = enabledProviders[0] ?? "claude";
+
   const [locations, setLocations] = useState<LocationInfo[] | null>(null);
   const [locationPath, setLocationPath] = useState<string>("");
   const [label, setLabel] = useState<string>("");
   const [labelEditedManually, setLabelEditedManually] = useState<boolean>(false);
-  const [provider, setProvider] = useState<AgentProvider>("claude");
-  const [command, setCommand] = useState<string>("claude");
-  const [model, setModel] = useState<string>("opusplan");
-  const [effort, setEffort] = useState<string>("high");
+  const [provider, setProvider] = useState<AgentProvider>(initialProvider);
+  const [command, setCommand] = useState<string>(
+    PROVIDER_OPTIONS.find((option) => option.value === initialProvider)?.command ?? ""
+  );
+  const [model, setModel] = useState<string>(initialProvider === "claude" ? "opusplan" : "");
+  const [effort, setEffort] = useState<string>(initialProvider === "claude" ? "high" : "");
   const [shellOnly, setShellOnly] = useState<boolean>(false);
-  const [advancedOpen, setAdvancedOpen] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState<boolean>(false);
 
   const [branchInfo, setBranchInfo] = useState<LocationBranches | null>(null);
   const [branchAction, setBranchAction] = useState<BranchAction | null>(null);
   const [branchPickerOpen, setBranchPickerOpen] = useState<boolean>(false);
+  const [resumePromptOpen, setResumePromptOpen] = useState<boolean>(false);
 
   useEffect(() => {
     api
@@ -87,16 +94,7 @@ export function NewInstanceModal({ instances, onCreate, onClose }: NewInstanceMo
     (existing) => existing.locationPath === locationPath && existing.label === trimmedLabel
   );
 
-  const handleSubmit = async (): Promise<void> => {
-    if (
-      locationPath.trim() === "" ||
-      trimmedLabel === "" ||
-      nameTaken ||
-      submitting ||
-      (!shellOnly && command.trim() === "")
-    ) {
-      return;
-    }
+  const launchInstance = async (resumeSession?: boolean): Promise<void> => {
     setSubmitting(true);
     setErrorMessage(null);
     try {
@@ -109,11 +107,45 @@ export function NewInstanceModal({ instances, onCreate, onClose }: NewInstanceMo
         effort: shellOnly ? undefined : effort === "" ? undefined : effort,
         branchAction: branchAction ?? undefined,
         shellOnly: shellOnly || undefined,
+        resumeSession,
       });
     } catch (error) {
       setErrorMessage(error instanceof ApiError ? error.message : "Unexpected error creating the instance.");
       setSubmitting(false);
     }
+  };
+
+  const handleResumeChoice = (resumeSession: boolean): void => {
+    setResumePromptOpen(false);
+    void launchInstance(resumeSession);
+  };
+
+  const handleSubmit = async (): Promise<void> => {
+    if (
+      locationPath.trim() === "" ||
+      trimmedLabel === "" ||
+      nameTaken ||
+      submitting ||
+      (!shellOnly && command.trim() === "")
+    ) {
+      return;
+    }
+    if (shellOnly) {
+      await launchInstance();
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const { hasSession } = await api.getResumableSession(provider, locationPath.trim(), trimmedLabel);
+      if (hasSession) {
+        setSubmitting(false);
+        setResumePromptOpen(true);
+        return;
+      }
+    } catch {
+      // Couldn't check for a resumable session; fall through and launch fresh as usual
+    }
+    await launchInstance();
   };
 
   const noLocations: boolean = locations !== null && locations.length === 0;
@@ -177,47 +209,42 @@ export function NewInstanceModal({ instances, onCreate, onClose }: NewInstanceMo
           {nameTaken && <div className={errorTextClassName}>An instance named '{trimmedLabel}' is already running here</div>}
         </div>
 
-        <div>
-          <label className={fieldLabelClassName}>Agent</label>
-          <div className="grid grid-cols-2 gap-[8px]">
-            {PROVIDER_OPTIONS.map((option) => (
-              <button
-                key={option.value}
-                type="button"
-                disabled={shellOnly}
-                onClick={() => {
-                  setProvider(option.value);
-                  setCommand(option.command);
-                  setModel(option.value === "claude" ? "opusplan" : "");
-                  setEffort(option.value === "claude" ? "high" : "");
-                }}
-                className={`rounded-sm border px-[10px] py-[9px] text-left text-[12px] ${
-                  provider === option.value
-                    ? "border-accent bg-accent/10 font-semibold text-txt-bright"
-                    : "border-border-strong bg-app text-txt-secondary hover:bg-raised"
-                } disabled:opacity-40`}
-              >
-                {option.label}
-              </button>
-            ))}
+        {visibleProviders.length > 1 && (
+          <div>
+            <label className={fieldLabelClassName}>Agent</label>
+            <div className="grid grid-cols-2 gap-[8px]">
+              {visibleProviders.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  disabled={shellOnly}
+                  onClick={() => {
+                    setProvider(option.value);
+                    setCommand(option.command);
+                    setModel(option.value === "claude" ? "opusplan" : "");
+                    setEffort(option.value === "claude" ? "high" : "");
+                  }}
+                  className={`rounded-sm border px-[10px] py-[9px] text-left text-[12px] ${
+                    provider === option.value
+                      ? "border-accent bg-accent/10 font-semibold text-txt-bright"
+                      : "border-border-strong bg-app text-txt-secondary hover:bg-raised"
+                  } disabled:opacity-40`}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
           </div>
-        </div>
+        )}
 
         <label className="flex items-center gap-[8px] text-[12px] text-txt-body">
           <input type="checkbox" checked={shellOnly} onChange={(event) => setShellOnly(event.target.checked)} />
           Open shell only
         </label>
 
-        <div className="border-t border-border pt-[14px]">
-          <button
-            type="button"
-            onClick={() => setAdvancedOpen((previous) => !previous)}
-            className="flex w-full items-center justify-between text-[11.5px] font-semibold text-txt-secondary"
-          >
-            <span>Advanced launch options</span>
-            <span className="text-txt-dim">{advancedOpen ? "⌃" : "⌄"}</span>
-          </button>
-          {advancedOpen && (
+        {!shellOnly && (
+          <div className="border-t border-border pt-[14px]">
+            <div className="text-[11.5px] font-semibold text-txt-secondary">Advanced launch options</div>
             <div className="mt-[12px] flex flex-col gap-[12px]">
               <div>
                 <label className={fieldLabelClassName}>{provider === "custom" ? "Command" : `${providerLabel} executable`}</label>
@@ -225,7 +252,6 @@ export function NewInstanceModal({ instances, onCreate, onClose }: NewInstanceMo
                   className={inputClassName}
                   value={command}
                   placeholder={provider === "custom" ? "your-cli --interactive" : PROVIDER_OPTIONS.find((option) => option.value === provider)?.command}
-                  disabled={shellOnly}
                   onChange={(event) => setCommand(event.target.value)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter") {
@@ -245,7 +271,6 @@ export function NewInstanceModal({ instances, onCreate, onClose }: NewInstanceMo
                   <input
                     className={inputClassName}
                     value={model}
-                    disabled={shellOnly}
                     placeholder="Inherit from CLI config"
                     onChange={(event) => setModel(event.target.value)}
                   />
@@ -255,7 +280,6 @@ export function NewInstanceModal({ instances, onCreate, onClose }: NewInstanceMo
                   <select
                     className={inputClassName}
                     value={effort}
-                    disabled={shellOnly}
                     onChange={(event) => setEffort(event.target.value)}
                   >
                     {EFFORT_OPTIONS.map((option) => (
@@ -273,8 +297,8 @@ export function NewInstanceModal({ instances, onCreate, onClose }: NewInstanceMo
                 </div>
               </div>
             </div>
-          )}
-        </div>
+          </div>
+        )}
 
         {errorMessage !== null && <div className={errorTextClassName}>{errorMessage}</div>}
 
@@ -306,6 +330,14 @@ export function NewInstanceModal({ instances, onCreate, onClose }: NewInstanceMo
           branchInfo={branchInfo}
           onConfirm={setBranchAction}
           onClose={() => setBranchPickerOpen(false)}
+        />
+      )}
+
+      {resumePromptOpen && (
+        <ResumeSessionModal
+          label={trimmedLabel}
+          onChoose={handleResumeChoice}
+          onClose={() => setResumePromptOpen(false)}
         />
       )}
     </>

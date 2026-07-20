@@ -16,11 +16,13 @@ import {
 import { restrictToVerticalAxis } from "@dnd-kit/modifiers";
 import { CSS } from "@dnd-kit/utilities";
 import { api, ApiError } from "../api";
-import type { DashboardConfig } from "../types";
+import { PROVIDER_OPTIONS } from "../providerOptions";
+import type { AgentProvider, DashboardConfig } from "../types";
 import { btnGhost, btnOutline, btnPrimary, cardClassName, errorTextClassName, inputClassName, inputErrorClassName } from "../ui";
 
 interface SetupScreenProps {
   initialLocations?: string[];
+  initialEnabledProviders?: AgentProvider[];
   onConfigured: (config: DashboardConfig) => void;
   onClose?: () => void;
 }
@@ -89,12 +91,24 @@ function SortableRow({ row, errorText, onChange, onRemove, onEnter, autoFocus }:
   );
 }
 
-export function SetupScreen({ initialLocations, onConfigured, onClose }: SetupScreenProps) {
+export function SetupScreen({ initialLocations, initialEnabledProviders, onConfigured, onClose }: SetupScreenProps) {
   const [locations, setLocations] = useState<LocationRow[]>(() => rowsFromInitial(initialLocations));
   const [existsMap, setExistsMap] = useState<Record<string, boolean>>({});
+  const [enabledProviders, setEnabledProviders] = useState<AgentProvider[]>(
+    initialEnabledProviders ?? PROVIDER_OPTIONS.map((option) => option.value)
+  );
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [saving, setSaving] = useState<boolean>(false);
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
+
+  const toggleProvider = (value: AgentProvider): void => {
+    setEnabledProviders((previous) => {
+      if (previous.includes(value)) {
+        return previous.length === 1 ? previous : previous.filter((provider) => provider !== value);
+      }
+      return [...previous, value];
+    });
+  };
 
   // Debounced folder-existence check: only asks about paths we haven't already resolved,
   // so typing across several rows doesn't spam the server on every keystroke.
@@ -163,7 +177,7 @@ export function SetupScreen({ initialLocations, onConfigured, onClose }: SetupSc
     setSaving(true);
     setErrorMessage(null);
     try {
-      const savedConfig: DashboardConfig = await api.saveConfig({ locations: trimmedLocations });
+      const savedConfig: DashboardConfig = await api.saveConfig({ locations: trimmedLocations, enabledProviders });
       onConfigured(savedConfig);
     } catch (error) {
       setErrorMessage(error instanceof ApiError ? error.message : "Unexpected error saving.");
@@ -226,6 +240,33 @@ export function SetupScreen({ initialLocations, onConfigured, onClose }: SetupSc
         >
           + Add location
         </button>
+
+        <div className="flex flex-col gap-[4px] border-t border-border pt-[14px]">
+          <h2 className="text-[12.5px] font-semibold text-txt-bright">Agents</h2>
+          <p className="text-[11.5px] leading-[1.5] text-txt-secondary">
+            Agents shown when launching a new instance. At least one must stay enabled.
+          </p>
+        </div>
+        <div className="flex flex-col gap-[8px]">
+          {PROVIDER_OPTIONS.map((option) => {
+            const checked: boolean = enabledProviders.includes(option.value);
+            const isLastEnabled: boolean = checked && enabledProviders.length === 1;
+            return (
+              <label
+                key={option.value}
+                className={`flex items-center gap-[8px] text-[12px] text-txt-body ${isLastEnabled ? "opacity-50" : ""}`}
+              >
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  disabled={isLastEnabled}
+                  onChange={() => toggleProvider(option.value)}
+                />
+                {option.label}
+              </label>
+            );
+          })}
+        </div>
 
         {errorMessage !== null && <div className={errorTextClassName}>{errorMessage}</div>}
 
