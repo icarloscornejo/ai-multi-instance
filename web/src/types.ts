@@ -17,6 +17,7 @@ export interface Instance {
 
 export interface DashboardConfig {
   locations: string[];
+  enabledProviders: AgentProvider[];
   configured: boolean;
 }
 
@@ -33,6 +34,7 @@ export interface CreateInstancePayload {
   effort?: string;
   branchAction?: BranchAction;
   shellOnly?: boolean;
+  resumeSession?: boolean;
 }
 
 export interface LocationBranches {

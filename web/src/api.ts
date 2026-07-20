@@ -1,4 +1,5 @@
 import type {
+  AgentProvider,
   CreateInstancePayload,
   DashboardConfig,
   Instance,
@@ -42,7 +43,7 @@ export const api = {
 
   applyUpdate: (): Promise<UpdateStatus> => requestJson("/api/update/apply", { method: "POST" }),
 
-  saveConfig: (payload: { locations: string[] }): Promise<DashboardConfig> =>
+  saveConfig: (payload: { locations: string[]; enabledProviders: AgentProvider[] }): Promise<DashboardConfig> =>
     requestJson("/api/config", { method: "PUT", body: JSON.stringify(payload) }),
 
   listInstances: (): Promise<Instance[]> => requestJson("/api/instances"),
@@ -60,6 +61,11 @@ export const api = {
 
   getLocationExists: (locationPath: string): Promise<{ exists: boolean }> =>
     requestJson(`/api/locations/exists?path=${encodeURIComponent(locationPath)}`),
+
+  getResumableSession: (provider: AgentProvider, locationPath: string, label: string): Promise<{ hasSession: boolean }> =>
+    requestJson(
+      `/api/instances/resumable?provider=${encodeURIComponent(provider)}&path=${encodeURIComponent(locationPath)}&label=${encodeURIComponent(label)}`
+    ),
 
   createInstance: (payload: CreateInstancePayload): Promise<Instance> =>
     requestJson("/api/instances", { method: "POST", body: JSON.stringify(payload) }),

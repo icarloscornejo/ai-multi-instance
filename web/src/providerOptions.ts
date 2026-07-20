@@ -4,7 +4,7 @@ export const PROVIDER_OPTIONS: { value: AgentProvider; label: string; command: s
   { value: "claude", label: "Claude Code", command: "claude" },
   { value: "codex", label: "Codex CLI", command: "codex" },
   { value: "cursor", label: "Cursor Agent", command: "agent" },
-  { value: "custom", label: "Custom command", command: "" },
+  { value: "custom", label: "Other agent", command: "" },
 ];
 
 export function previewCommand(provider: AgentProvider, command: string, model: string, effort: string): string {

@@ -1,21 +1,38 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { DashboardState } from "./types";
+import { isAgentProvider } from "./providers";
+import type { AgentProvider, DashboardState } from "./types";
 
 const dataDirectory: string = path.resolve(import.meta.dirname, "../../data");
 const stateFilePath: string = path.join(dataDirectory, "instances.json");
+
+const ALL_PROVIDERS: AgentProvider[] = ["claude", "codex", "cursor", "custom"];
+
+function normalizeEnabledProviders(value: unknown): AgentProvider[] {
+  if (!Array.isArray(value)) {
+    return ALL_PROVIDERS;
+  }
+  const validProviders: AgentProvider[] = value.filter(isAgentProvider);
+  return validProviders.length > 0 ? validProviders : ALL_PROVIDERS;
+}
 
 let cachedState: DashboardState | null = null;
 let saveQueue: Promise<void> = Promise.resolve();
 
 function emptyState(): DashboardState {
-  return { schemaVersion: 2, config: { locations: [] }, instances: [], sessionsByKey: {} };
+  return { schemaVersion: 2, config: { locations: [], enabledProviders: ALL_PROVIDERS }, instances: [], sessionsByKey: {} };
 }
 
 // Previous formats: worktrees per branch -> fixed slots -> plain folder locations
 interface LegacyDashboardState {
   schemaVersion?: number;
-  config: { repoPath?: string | null; worktreesDir?: string | null; slots?: string[]; locations?: string[] };
+  config: {
+    repoPath?: string | null;
+    worktreesDir?: string | null;
+    slots?: string[];
+    locations?: string[];
+    enabledProviders?: string[];
+  };
   instances: Array<
     Record<string, unknown> & {
       worktreePath?: string;
@@ -39,7 +56,10 @@ export function migrateLegacyState(rawState: LegacyDashboardState): DashboardSta
       : [];
   return {
     schemaVersion: 2,
-    config: { locations: migratedLocations },
+    config: {
+      locations: migratedLocations,
+      enabledProviders: normalizeEnabledProviders(rawState.config.enabledProviders),
+    },
     instances: rawState.instances.map((instance) => {
       const { worktreePath, slotPath, branch, command, ...rest } = instance;
       return {

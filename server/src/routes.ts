@@ -172,7 +172,7 @@ apiRouter.get(
 apiRouter.put(
   "/config",
   wrapAsync(async (request, response) => {
-    const { locations } = request.body as { locations?: unknown };
+    const { locations, enabledProviders } = request.body as { locations?: unknown; enabledProviders?: unknown };
     if (!Array.isArray(locations) || locations.some((location) => typeof location !== "string")) {
       response.status(400).json({ error: "Provide the list of location paths." });
       return;
@@ -197,7 +197,15 @@ apiRouter.put(
     }
 
     const state: DashboardState = await loadState();
-    state.config = { locations: resolvedLocations };
+    let resolvedEnabledProviders = state.config.enabledProviders;
+    if (enabledProviders !== undefined) {
+      if (!Array.isArray(enabledProviders) || enabledProviders.length === 0 || !enabledProviders.every(isAgentProvider)) {
+        response.status(400).json({ error: "Provide at least one valid agent." });
+        return;
+      }
+      resolvedEnabledProviders = enabledProviders;
+    }
+    state.config = { locations: resolvedLocations, enabledProviders: resolvedEnabledProviders };
     await saveState(state);
     response.json({ ...state.config, configured: true });
   })
@@ -281,6 +289,24 @@ apiRouter.get(
   })
 );
 
+apiRouter.get(
+  "/instances/resumable",
+  wrapAsync(async (request, response) => {
+    const provider = request.query.provider;
+    const locationPath: string = typeof request.query.path === "string" ? request.query.path.trim() : "";
+    const label: string = typeof request.query.label === "string" ? request.query.label.trim() : "";
+    if (!isAgentProvider(provider) || locationPath === "" || label === "") {
+      response.status(400).json({ error: "Provide a valid provider, location and label." });
+      return;
+    }
+    const state: DashboardState = await loadState();
+    const hasSession: boolean =
+      PROVIDERS[provider].capabilities.resume &&
+      state.sessionsByKey[sessionKeyFor(provider, locationPath, label)] !== undefined;
+    response.json({ hasSession });
+  })
+);
+
 apiRouter.post(
   "/instances",
   wrapAsync(async (request, response) => {
@@ -357,6 +383,10 @@ apiRouter.post(
       return;
     }
     const provider = isAgentProvider(payload.provider) ? payload.provider : "claude";
+    if (!state.config.enabledProviders.includes(provider)) {
+      response.status(400).json({ error: "Agent not enabled. Enable it from Settings." });
+      return;
+    }
     const providerDefinition = PROVIDERS[provider];
     if (
       !shellOnly &&
@@ -391,7 +421,8 @@ apiRouter.post(
     };
 
     const resumeKey: string = sessionKeyFor(provider, locationPath, requestedLabel);
-    let resumeSessionId: string | undefined = state.sessionsByKey[resumeKey];
+    let resumeSessionId: string | undefined =
+      payload.resumeSession === false ? undefined : state.sessionsByKey[resumeKey];
     if (resumeSessionId !== undefined) {
       instance.sessionId = resumeSessionId;
       const sessionFile: string | undefined =

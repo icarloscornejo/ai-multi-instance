@@ -136,6 +136,7 @@ export function App() {
     return (
       <SetupScreen
         initialLocations={config.locations}
+        initialEnabledProviders={config.enabledProviders}
         onConfigured={(newConfig) => {
           setConfig(newConfig);
           setSettingsOpen(false);
@@ -198,7 +199,12 @@ export function App() {
       </div>
 
       {isNewInstanceModalOpen && (
-        <NewInstanceModal instances={instances} onCreate={createInstance} onClose={() => setIsNewInstanceModalOpen(false)} />
+        <NewInstanceModal
+          instances={instances}
+          enabledProviders={config.enabledProviders}
+          onCreate={createInstance}
+          onClose={() => setIsNewInstanceModalOpen(false)}
+        />
       )}
 
       {deleteRequest !== null && (
