@@ -1,3 +1,17 @@
 http://ai.local, http://claude.local {
 	reverse_proxy 127.0.0.1:5173
 }
+
+# Same-LAN access by raw IP (e.g. from a phone on home WiFi, without touching its DNS):
+# Vite only allows the ai.local/claude.local hostnames, so the Host header sent upstream
+# is rewritten regardless of what the client actually typed in the address bar.
+:80 {
+	reverse_proxy 127.0.0.1:5173 {
+		header_up Host ai.local
+	}
+}
+
+# HTTPS local (mkcert): setup.sh generates Caddyfile.https with the absolute paths to
+# the generated cert. The glob makes the import optional for clones where setup hasn't
+# run yet.
+import Caddyfile.https*

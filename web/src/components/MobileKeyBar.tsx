@@ -32,10 +32,9 @@ function KeyButton({ label, title, onPress }: KeyButtonProps) {
 interface MobileKeyBarProps {
   onSendKey: (data: string) => void;
   onHideKeyboard: () => void;
-  bottomOffsetPx: number;
 }
 
-export function MobileKeyBar({ onSendKey, onHideKeyboard, bottomOffsetPx }: MobileKeyBarProps) {
+export function MobileKeyBar({ onSendKey, onHideKeyboard }: MobileKeyBarProps) {
   const [pasteAvailable, setPasteAvailable] = useState<boolean>(false);
 
   // navigator.clipboard.readText requires a secure context; hide the button
@@ -56,10 +55,7 @@ export function MobileKeyBar({ onSendKey, onHideKeyboard, bottomOffsetPx }: Mobi
   };
 
   return (
-    <div
-      className="fixed left-0 right-0 z-20 flex h-[44px] items-center gap-[6px] overflow-x-auto border-t border-border bg-surface px-[8px] pb-safe"
-      style={{ bottom: `${bottomOffsetPx}px` }}
-    >
+    <div className="flex shrink-0 items-center justify-center gap-[6px] overflow-x-auto border-t border-border bg-surface px-[8px] py-[4px] pb-[calc(4px+var(--safe-bottom))]">
       <KeyButton label="Esc" title="Escape" onPress={() => onSendKey(ESC)} />
       <KeyButton label="^C" title="Interrupt (Ctrl+C)" onPress={() => onSendKey(CTRL_C)} />
       <KeyButton label="←" title="Left" onPress={() => onSendKey(ARROW_LEFT)} />

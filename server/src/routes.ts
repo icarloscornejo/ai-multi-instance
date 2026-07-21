@@ -5,11 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import express, { type Request, type Response, type NextFunction, type Router } from "express";
-import { AUTH_COOKIE_NAME, checkPassword, isAuthEnabled, issueToken, requireAuth } from "./auth";
+import { AUTH_COOKIE_NAME, checkPassword, isAuthEnabled, issueToken, readCookie, requireAuth, setStoredPassword, verifyToken } from "./auth";
 import { buildLaunchCommand } from "./launch";
 import { isAgentProvider, PROVIDERS, sessionKeyFor } from "./providers";
 import { loadState, saveState } from "./store";
 import { createSession, getPaneCurrentPath, killSession, sendCommandToSession } from "./tmux";
+import { getTunnelStatus, startTunnel, stopTunnel } from "./tunnel";
 import { applyUpdate, checkForUpdate, getUpdateStatus } from "./updater";
 import type {
   BranchAction,
@@ -28,6 +29,27 @@ function wrapAsync(handler: AsyncHandler) {
   return (request: Request, response: Response, next: NextFunction): void => {
     handler(request, response).catch(next);
   };
+}
+
+// Picks a private IPv4 address other devices on the same LAN can reach (e.g. Wi-Fi at
+// home): the first non-internal IPv4 in a standard private range, skipping VPN/virtual
+// interfaces that don't route to the physical LAN.
+function getLanUrl(): string | null {
+  const interfaces: NodeJS.Dict<os.NetworkInterfaceInfo[]> = os.networkInterfaces();
+  for (const addresses of Object.values(interfaces)) {
+    for (const address of addresses ?? []) {
+      if (
+        address.family === "IPv4" &&
+        !address.internal &&
+        (address.address.startsWith("192.168.") ||
+          address.address.startsWith("10.") ||
+          /^172\.(1[6-9]|2\d|3[01])\./.test(address.address))
+      ) {
+        return `https://${address.address}`;
+      }
+    }
+  }
+  return null;
 }
 
 async function pathExists(candidatePath: string): Promise<boolean> {
@@ -186,6 +208,53 @@ apiRouter.post(
   })
 );
 
+// Registered before requireAuth for the bootstrap case (no password set yet, e.g. from the
+// "Start tunnel" flow); if a password already exists, it requires the caller to already be
+// authenticated so a stranger cannot silently overwrite it.
+apiRouter.post(
+  "/auth/set-password",
+  wrapAsync(async (request, response) => {
+    const { password } = request.body as { password?: unknown };
+    const trimmedPassword: string = typeof password === "string" ? password.trim() : "";
+    if (trimmedPassword.length < 8) {
+      response.status(400).json({ error: "Password must be at least 8 characters." });
+      return;
+    }
+    if (isAuthEnabled()) {
+      const token: string | undefined = readCookie(request.headers.cookie, AUTH_COOKIE_NAME);
+      if (!(await verifyToken(token))) {
+        response.status(401).json({ error: "Unauthorized" });
+        return;
+      }
+    }
+    setStoredPassword(trimmedPassword);
+    const { value, maxAgeMs } = await issueToken();
+    response.cookie(AUTH_COOKIE_NAME, value, {
+      httpOnly: true,
+      sameSite: "lax",
+      maxAge: maxAgeMs,
+    });
+    response.json({ ok: true });
+  })
+);
+
+// Public on purpose: a phone needs this to trust the local mkcert CA before it can load
+// anything else over HTTPS, and the root cert only contains a public key (see setup.sh's
+// mkcert block, which writes it to certs/rootCA.pem).
+apiRouter.get(
+  "/ca.pem",
+  wrapAsync(async (_request, response) => {
+    const caPath: string = path.resolve(import.meta.dirname, "../../certs/rootCA.pem");
+    if (!(await pathExists(caPath))) {
+      response.status(404).json({ error: "No local certificate found. Run setup.sh to generate one." });
+      return;
+    }
+    response.set("Content-Type", "application/x-pem-file");
+    response.set("Content-Disposition", 'attachment; filename="rootCA.pem"');
+    response.sendFile(caPath);
+  })
+);
+
 apiRouter.use(requireAuth);
 
 apiRouter.get(
@@ -307,6 +376,33 @@ apiRouter.post(
     response.json(await applyUpdate());
   })
 );
+
+apiRouter.get("/tunnel", (_request, response) => {
+  response.json(getTunnelStatus());
+});
+
+apiRouter.post(
+  "/tunnel/start",
+  wrapAsync(async (_request, response) => {
+    if (!isAuthEnabled()) {
+      response.status(409).json({ error: "Set DASHBOARD_PASSWORD before exposing the dashboard to the internet." });
+      return;
+    }
+    const port: number = Number(process.env.PORT ?? 3001);
+    response.json(await startTunnel(port));
+  })
+);
+
+apiRouter.post("/tunnel/stop", (_request, response) => {
+  response.json(stopTunnel());
+});
+
+// Lets the phone scan a second QR for same-network access (no cloudflared/DNS involved),
+// separate from the tunnel: Caddy already rewrites the Host header for any LAN IP (see
+// Caddyfile), so this just needs to report an address that reaches this machine.
+apiRouter.get("/lan-address", (_request, response) => {
+  response.json({ url: getLanUrl() });
+});
 
 apiRouter.get(
   "/instances",
@@ -532,9 +628,6 @@ apiRouter.patch(
     if (payload.effort !== undefined) {
       instance.effort =
         typeof payload.effort === "string" && payload.effort.trim() !== "" ? payload.effort.trim() : null;
-    }
-    if (typeof payload.fontSize === "number" && payload.fontSize >= 10 && payload.fontSize <= 18) {
-      instance.fontSize = payload.fontSize;
     }
     await saveState(state);
     response.json(instance);

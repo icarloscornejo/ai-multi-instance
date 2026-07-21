@@ -15,10 +15,12 @@ import {
 } from "@dnd-kit/sortable";
 import { restrictToVerticalAxis } from "@dnd-kit/modifiers";
 import { CSS } from "@dnd-kit/utilities";
+import QRCode from "qrcode";
 import { api, ApiError } from "../api";
+import { useModalEscapeStack } from "./Modal";
 import { PROVIDER_OPTIONS } from "../providerOptions";
 import type { ThemePreference } from "../theme";
-import type { AgentProvider, DashboardConfig } from "../types";
+import type { AgentProvider, DashboardConfig, TunnelStatus } from "../types";
 import { btnGhost, btnOutline, btnPrimary, cardClassName, errorTextClassName, inputClassName, inputErrorClassName } from "../ui";
 
 const THEME_OPTIONS: { value: ThemePreference; label: string }[] = [
@@ -36,6 +38,8 @@ interface SetupScreenProps {
   showThemePicker?: boolean;
   themePreference?: ThemePreference;
   onThemePreferenceChange?: (preference: ThemePreference) => void;
+  // Gates the Remote access (tunnel) section: never on mobile, and desktop-only hostname below
+  isMobile?: boolean;
 }
 
 interface LocationRow {
@@ -102,6 +106,240 @@ function SortableRow({ row, errorText, onChange, onRemove, onEnter, autoFocus }:
   );
 }
 
+function TunnelQr({ url }: { url: string }) {
+  const [dataUrl, setDataUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    QRCode.toDataURL(url, { margin: 1, width: 180 })
+      .then((result) => {
+        if (!cancelled) setDataUrl(result);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [url]);
+
+  if (dataUrl === null) {
+    return null;
+  }
+  return (
+    <img
+      src={dataUrl}
+      alt="QR code for the public tunnel URL"
+      width={180}
+      height={180}
+      className="rounded-sm border border-border-strong bg-white p-[8px]"
+    />
+  );
+}
+
+// The tunnel controls must never be reachable from outside the local machine: showing them
+// through the public trycloudflare URL (or a plain LAN IP/localhost) would let anyone who
+// finds that URL also spin up/tear down tunnels. "ai.local" is the desktop-only hostname
+// Caddy proxies to the dev/prod server (see web/vite.config.ts), so it is the sole allowed host.
+const TUNNEL_SECTION_ALLOWED_HOSTNAME = "ai.local";
+
+// Separate from the tunnel: a phone already on the same Wi-Fi doesn't need cloudflared or
+// its trycloudflare.com DNS lookup at all, just the machine's LAN IP (Caddy rewrites the
+// Host header for any address, see Caddyfile), so this has no start/stop state of its own.
+function LanAccessSection() {
+  const isAllowedHost: boolean = window.location.hostname === TUNNEL_SECTION_ALLOWED_HOSTNAME;
+  const [url, setUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!isAllowedHost) {
+      return;
+    }
+    api
+      .getLanAddress()
+      .then((result) => setUrl(result.url))
+      .catch(() => undefined);
+  }, []);
+
+  if (!isAllowedHost || url === null) {
+    return null;
+  }
+
+  return (
+    <div className="flex flex-col gap-[8px] border-t border-border pt-[14px]">
+      <h2 className="text-[12.5px] font-semibold text-txt-bright">Same Wi-Fi network</h2>
+      <p className="text-[11.5px] leading-[1.5] text-txt-secondary">
+        On the same Wi-Fi as this machine, skip the tunnel and scan this instead.
+      </p>
+      <div className="flex flex-col items-start gap-[10px]">
+        <TunnelQr url={url} />
+        <a href={url} target="_blank" rel="noreferrer" className="break-all text-[12px] font-medium text-accent">
+          {url}
+        </a>
+      </div>
+      <p className="text-[11.5px] leading-[1.5] text-txt-secondary">
+        First time on this phone?{" "}
+        <a href="/api/ca.pem" className="font-medium text-accent">
+          Download the local certificate
+        </a>{" "}
+        and trust it (iOS: Settings &gt; General &gt; VPN &amp; Device Management, then General &gt; About &gt;
+        Certificate Trust Settings. Android: install as a CA certificate).
+      </p>
+    </div>
+  );
+}
+
+function TunnelSection() {
+  const isAllowedHost: boolean = window.location.hostname === TUNNEL_SECTION_ALLOWED_HOSTNAME;
+  const [status, setStatus] = useState<TunnelStatus | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [needsPassword, setNeedsPassword] = useState<boolean>(false);
+  const [passwordInput, setPasswordInput] = useState<string>("");
+  const [settingPassword, setSettingPassword] = useState<boolean>(false);
+  const [passwordError, setPasswordError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!isAllowedHost) {
+      return;
+    }
+    api
+      .getTunnel()
+      .then(setStatus)
+      .catch(() => undefined);
+  }, []);
+
+  const attemptStart = async (): Promise<void> => {
+    setErrorMessage(null);
+    setStatus((previous) => (previous === null ? null : { ...previous, state: "starting" }));
+    try {
+      setStatus(await api.startTunnel());
+    } catch (error) {
+      setStatus((previous) => (previous === null ? null : { ...previous, state: "stopped" }));
+      if (error instanceof ApiError && error.status === 409) {
+        setNeedsPassword(true);
+        return;
+      }
+      setErrorMessage(error instanceof ApiError ? error.message : "Unexpected error starting the tunnel.");
+    }
+  };
+
+  const handleStop = async (): Promise<void> => {
+    setErrorMessage(null);
+    try {
+      setStatus(await api.stopTunnel());
+    } catch (error) {
+      setErrorMessage(error instanceof ApiError ? error.message : "Unexpected error stopping the tunnel.");
+    }
+  };
+
+  const handleSetPasswordAndStart = async (): Promise<void> => {
+    const trimmedPassword: string = passwordInput.trim();
+    if (trimmedPassword.length < 8) {
+      setPasswordError("Password must be at least 8 characters.");
+      return;
+    }
+    setPasswordError(null);
+    setSettingPassword(true);
+    try {
+      await api.setPassword(trimmedPassword);
+      setNeedsPassword(false);
+      setPasswordInput("");
+      await attemptStart();
+    } catch (error) {
+      setPasswordError(error instanceof ApiError ? error.message : "Unexpected error setting the password.");
+    } finally {
+      setSettingPassword(false);
+    }
+  };
+
+  if (!isAllowedHost) {
+    return null;
+  }
+
+  return (
+    <div className="flex flex-col gap-[8px] border-t border-border pt-[14px]">
+      <h2 className="text-[12.5px] font-semibold text-txt-bright">Remote access</h2>
+      <p className="text-[11.5px] leading-[1.5] text-txt-secondary">
+        Expose this dashboard over a public HTTPS URL via Cloudflare, so you can open it from your phone off the LAN.
+        The URL is temporary and changes every time the tunnel restarts.
+      </p>
+
+      {needsPassword && (
+        <div className="flex flex-col gap-[8px] rounded-sm border border-border-strong bg-app p-[10px]">
+          <p className="text-[11.5px] leading-[1.5] text-txt-secondary">
+            Set a password first: once this dashboard is reachable from the internet, its terminals need to stay
+            behind a login.
+          </p>
+          <input
+            type="password"
+            value={passwordInput}
+            placeholder="At least 8 characters"
+            autoFocus
+            className={passwordError !== null ? inputErrorClassName : inputClassName}
+            onChange={(event) => setPasswordInput(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                void handleSetPasswordAndStart();
+              }
+            }}
+          />
+          {passwordError !== null && <div className={errorTextClassName}>{passwordError}</div>}
+          <div className="flex gap-[8px]">
+            <button
+              type="button"
+              onClick={() => void handleSetPasswordAndStart()}
+              disabled={settingPassword}
+              className={btnPrimary}
+            >
+              {settingPassword ? "Setting…" : "Set password and start"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setNeedsPassword(false);
+                setPasswordInput("");
+                setPasswordError(null);
+              }}
+              className={btnGhost}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {status?.state === "running" && status.url !== null && (
+        <div className="flex flex-col items-start gap-[10px]">
+          <TunnelQr url={status.url} />
+          <a href={status.url} target="_blank" rel="noreferrer" className="break-all text-[12px] font-medium text-accent">
+            {status.url}
+          </a>
+        </div>
+      )}
+
+      {!needsPassword && (status?.error ?? errorMessage) !== null && (
+        <div className={errorTextClassName}>{status?.error ?? errorMessage}</div>
+      )}
+
+      {!needsPassword && (
+        <div>
+          {status?.state === "running" ? (
+            <button type="button" onClick={() => void handleStop()} className={btnOutline}>
+              Stop tunnel
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => void attemptStart()}
+              disabled={status === null || status.state === "starting"}
+              className={btnOutline}
+            >
+              {status?.state === "starting" ? "Starting…" : "Start tunnel"}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function SetupScreen({
   initialLocations,
   initialEnabledProviders,
@@ -110,6 +348,7 @@ export function SetupScreen({
   showThemePicker = false,
   themePreference,
   onThemePreferenceChange,
+  isMobile = false,
 }: SetupScreenProps) {
   const [locations, setLocations] = useState<LocationRow[]>(() => rowsFromInitial(initialLocations));
   const [existsMap, setExistsMap] = useState<Record<string, boolean>>({});
@@ -119,6 +358,10 @@ export function SetupScreen({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [saving, setSaving] = useState<boolean>(false);
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
+
+  // No-op when onClose is absent (first-run setup, before any locations are configured):
+  // Escape still needs a handler on the stack so it does not fall through to whatever is behind it.
+  useModalEscapeStack(onClose ?? (() => undefined));
 
   const toggleProvider = (value: AgentProvider): void => {
     setEnabledProviders((previous) => {
@@ -308,6 +551,9 @@ export function SetupScreen({
             );
           })}
         </div>
+
+        {!isMobile && <LanAccessSection />}
+        {!isMobile && <TunnelSection />}
 
         {errorMessage !== null && <div className={errorTextClassName}>{errorMessage}</div>}
 

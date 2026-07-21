@@ -258,6 +258,77 @@ else
   ok "caddy installed"
 fi
 
+# cloudflared powers the "Remote access" tunnel in Settings (ai.local only): installed
+# here, not run as a service, since the tunnel itself is started/stopped from the UI.
+if command -v cloudflared >/dev/null 2>&1; then
+  ok "cloudflared already installed ($(cloudflared --version 2>/dev/null | head -1))"
+else
+  brew install cloudflared
+  ok "cloudflared installed"
+fi
+
+# mkcert: local CA + certificate so ai.local, claude.local and the LAN IP get real
+# HTTPS (self-signed but trusted on this machine), which is required for the PWA to
+# be installable. The CA only needs trusting once per device; phones trust it by
+# downloading certs/rootCA.pem from Settings (served at /api/ca.pem).
+if command -v mkcert >/dev/null 2>&1; then
+  ok "mkcert already installed ($(mkcert -version 2>/dev/null | head -1))"
+else
+  brew install mkcert
+  ok "mkcert installed"
+fi
+
+mkcert_caroot="$(mkcert -CAROOT 2>/dev/null || true)"
+if [[ -n "${mkcert_caroot}" && -f "${mkcert_caroot}/rootCA.pem" ]]; then
+  ok "mkcert local CA already trusted"
+elif ! have_sudo_tty; then
+  warn "No terminal available to prompt for the local CA trust. Run manually:"
+  echo   "        mkcert -install"
+else
+  mkcert -install
+  ok "mkcert local CA installed and trusted"
+fi
+
+lan_ip="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+certs_dir="${INSTALL_DIR}/certs"
+mkdir -p "${certs_dir}"
+
+cert_covers_lan_ip() {
+  [[ -f "${certs_dir}/cert.pem" ]] && \
+    openssl x509 -in "${certs_dir}/cert.pem" -noout -ext subjectAltName 2>/dev/null | grep -qF "${lan_ip}"
+}
+
+if [[ -z "${lan_ip}" ]]; then
+  warn "Could not detect a LAN IP (Wi-Fi off?); the local cert will only cover ai.local/claude.local."
+fi
+if [[ -f "${certs_dir}/cert.pem" && ( -z "${lan_ip}" || "$(cert_covers_lan_ip && echo yes)" == "yes" ) ]]; then
+  ok "Local certificate already covers this machine's addresses"
+else
+  mkcert_hosts=(ai.local claude.local localhost 127.0.0.1 ::1)
+  [[ -n "${lan_ip}" ]] && mkcert_hosts+=("${lan_ip}")
+  mkcert -cert-file "${certs_dir}/cert.pem" -key-file "${certs_dir}/key.pem" "${mkcert_hosts[@]}"
+  ok "Local certificate generated for: ${mkcert_hosts[*]}"
+fi
+
+if [[ -n "${mkcert_caroot}" && -f "${mkcert_caroot}/rootCA.pem" ]]; then
+  cp "${mkcert_caroot}/rootCA.pem" "${certs_dir}/rootCA.pem"
+fi
+
+cat > "${INSTALL_DIR}/Caddyfile.https" <<EOF
+ai.local:443, claude.local:443 {
+	tls ${certs_dir}/cert.pem ${certs_dir}/key.pem
+	reverse_proxy 127.0.0.1:5173
+}
+
+:443 {
+	tls ${certs_dir}/cert.pem ${certs_dir}/key.pem
+	reverse_proxy 127.0.0.1:5173 {
+		header_up Host ai.local
+	}
+}
+EOF
+ok "Caddyfile.https generated (HTTPS on :443 for ai.local, claude.local and this machine's LAN IP)"
+
 caddyfile_import="import ${INSTALL_DIR}/Caddyfile"
 brew_caddyfile="$(brew --prefix)/etc/Caddyfile"
 if [[ -f "${brew_caddyfile}" ]] && grep -qF "${caddyfile_import}" "${brew_caddyfile}"; then

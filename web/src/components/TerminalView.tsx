@@ -1,6 +1,7 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
+import { getHostFontSize, setHostFontSize } from "../hostPrefs";
 import { btnGhost } from "../ui";
 import type { Instance } from "../types";
 import type { Theme } from "../theme";
@@ -13,12 +14,6 @@ export interface TerminalViewHandle {
 
 const MIN_FONT_SIZE = 10;
 const MAX_FONT_SIZE = 18;
-const PROVIDER_LABELS = {
-  claude: "Claude",
-  codex: "Codex",
-  cursor: "Cursor",
-  custom: "Custom",
-} as const;
 
 // ANSI palette aligned to the design tokens (xterm's defaults are too saturated)
 const terminalThemeDark: ITheme = {
@@ -79,7 +74,6 @@ const terminalThemesByMode: Record<Theme, ITheme> = {
 interface TerminalViewProps {
   instance: Instance;
   visible: boolean;
-  onPersistFontSize: (instanceId: string, fontSize: number) => void;
   theme: Theme;
   // Mobile navigates into the terminal screen without the user having tapped inside
   // the terminal itself; auto-focusing there would pop the native keyboard unprompted
@@ -158,7 +152,7 @@ function DisconnectedOverlay({
 }
 
 export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(function TerminalView(
-  { instance, visible, onPersistFontSize, theme, focusOnVisible = true, onAtBottomChange },
+  { instance, visible, theme, focusOnVisible = true, onAtBottomChange },
   forwardedRef
 ) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -166,7 +160,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   const fitAddonRef = useRef<FitAddon | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const persistTimerRef = useRef<number | null>(null);
-  const [fontSize, setFontSize] = useState<number>(instance.fontSize);
+  const [fontSize, setFontSize] = useState<number>(() => getHostFontSize(instance.id, instance.fontSize));
   const [disconnected, setDisconnected] = useState<boolean>(false);
   const [reconnectMsRemaining, setReconnectMsRemaining] = useState<number>(RECONNECT_DELAY_MS);
   const [connectionEpoch, setConnectionEpoch] = useState<number>(0);
@@ -209,13 +203,13 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
             window.clearTimeout(persistTimerRef.current);
           }
           persistTimerRef.current = window.setTimeout(() => {
-            onPersistFontSize(instance.id, nextSize);
+            setHostFontSize(instance.id, nextSize);
           }, 600);
         }
         return nextSize;
       });
     },
-    [instance.id, onPersistFontSize, safeFit]
+    [instance.id, safeFit]
   );
 
   // Create the xterm terminal, once per instance
@@ -226,7 +220,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     }
     const terminal = new Terminal({
       fontFamily: '"JetBrains Mono", ui-monospace, monospace',
-      fontSize: instance.fontSize,
+      fontSize,
       theme: terminalThemesByMode[theme],
       cursorBlink: true,
       scrollback: 5000,
@@ -394,7 +388,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
 
   return (
     <div className={`flex-1 min-h-0 flex-col ${visible ? "flex" : "hidden"}`}>
-      <div className="relative flex-1 min-h-0 px-[22px] pt-[16px]">
+      <div className="relative flex-1 min-h-0 px-[6px] pt-[6px]">
         <div ref={containerRef} className="h-full w-full" />
         {disconnected && (
           <DisconnectedOverlay
@@ -403,7 +397,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
             onReconnect={reconnect}
           />
         )}
-        <div className="absolute bottom-[10px] right-[26px] flex gap-[6px]">
+        <div className="absolute bottom-[4px] right-[10px] flex gap-[6px]">
           <button
             type="button"
             onClick={() => applyZoom(-1)}
@@ -420,19 +414,6 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
           >
             A+
           </button>
-        </div>
-      </div>
-      <div
-        className="cursor-text border-t border-border px-[22px] py-[12px]"
-        onClick={() => terminalRef.current?.focus()}
-      >
-        <div className="font-mono text-txt-placeholder" style={{ fontSize: `${fontSize}px` }}>
-          {">"}
-        </div>
-        <div className="mt-[6px] font-mono text-[10.5px] text-txt-dim">
-          {instance.label} · {PROVIDER_LABELS[instance.provider]}
-          {instance.model !== null ? ` · ${instance.model}` : ""}
-          {instance.effort !== null ? ` · effort ${instance.effort}` : ""}
         </div>
       </div>
     </div>

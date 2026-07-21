@@ -1,5 +1,5 @@
-import { randomBytes, timingSafeEqual, createHmac } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { randomBytes, timingSafeEqual, createHmac, scryptSync } from "node:crypto";
+import { promises as fs, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import type { Request, Response, NextFunction } from "express";
 
@@ -7,16 +7,55 @@ import type { Request, Response, NextFunction } from "express";
 // secret's lifecycle to the instance registry file.
 const dataDirectory: string = path.resolve(import.meta.dirname, "../../data");
 const secretFilePath: string = path.join(dataDirectory, "auth-secret.txt");
+const passwordFilePath: string = path.join(dataDirectory, "auth-password.json");
 
 export const AUTH_COOKIE_NAME = "ccdash_auth";
 const TOKEN_TTL_MS: number = 180 * 24 * 60 * 60 * 1000; // ~180 days
+const SCRYPT_KEY_LENGTH = 64;
 
 let cachedSecret: Buffer | null = null;
 
-// The password gate is opt-in: with no DASHBOARD_PASSWORD set, every check below
-// is skipped and the dashboard behaves exactly as it did before auth existed.
+interface StoredPassword {
+  salt: string;
+  hash: string;
+}
+
+// undefined = not loaded from disk yet; null = loaded, nothing stored
+let cachedStoredPassword: StoredPassword | null | undefined = undefined;
+
+// A sync read, cached after the first call: isAuthEnabled/checkPassword are called from
+// synchronous middleware (requireAuth), so this avoids threading async through the whole chain.
+function loadStoredPassword(): StoredPassword | null {
+  if (cachedStoredPassword !== undefined) {
+    return cachedStoredPassword;
+  }
+  try {
+    cachedStoredPassword = JSON.parse(readFileSync(passwordFilePath, "utf8")) as StoredPassword;
+  } catch {
+    cachedStoredPassword = null;
+  }
+  return cachedStoredPassword;
+}
+
+// Persists a password set from the UI (e.g. the "Start tunnel" flow), hashed with a random
+// salt via scrypt so the plaintext password never sits on disk. DASHBOARD_PASSWORD, if set,
+// still takes priority in checkPassword below; this is only consulted when that env var is absent.
+export function setStoredPassword(password: string): void {
+  const salt: Buffer = randomBytes(16);
+  const hash: Buffer = scryptSync(password, salt, SCRYPT_KEY_LENGTH);
+  const stored: StoredPassword = { salt: salt.toString("hex"), hash: hash.toString("hex") };
+  mkdirSync(dataDirectory, { recursive: true });
+  writeFileSync(passwordFilePath, JSON.stringify(stored), "utf8");
+  cachedStoredPassword = stored;
+}
+
+// The password gate is opt-in: with neither DASHBOARD_PASSWORD nor a stored password set,
+// every check below is skipped and the dashboard behaves exactly as it did before auth existed.
 export function isAuthEnabled(): boolean {
-  return typeof process.env.DASHBOARD_PASSWORD === "string" && process.env.DASHBOARD_PASSWORD.length > 0;
+  return (
+    (typeof process.env.DASHBOARD_PASSWORD === "string" && process.env.DASHBOARD_PASSWORD.length > 0) ||
+    loadStoredPassword() !== null
+  );
 }
 
 async function getOrCreateSecret(): Promise<Buffer> {
@@ -41,12 +80,20 @@ function sign(secret: Buffer, expiresAt: number): string {
 }
 
 export function checkPassword(candidate: string): boolean {
-  const expected: string = process.env.DASHBOARD_PASSWORD ?? "";
-  const candidateBuffer: Buffer = Buffer.from(candidate);
-  const expectedBuffer: Buffer = Buffer.from(expected);
-  // Lengths must match before timingSafeEqual, but that comparison itself is not
-  // timing-safe: it is cheap and reveals only length, not content.
-  return candidateBuffer.length === expectedBuffer.length && timingSafeEqual(candidateBuffer, expectedBuffer);
+  if (typeof process.env.DASHBOARD_PASSWORD === "string" && process.env.DASHBOARD_PASSWORD.length > 0) {
+    const expectedBuffer: Buffer = Buffer.from(process.env.DASHBOARD_PASSWORD);
+    const candidateBuffer: Buffer = Buffer.from(candidate);
+    // Lengths must match before timingSafeEqual, but that comparison itself is not
+    // timing-safe: it is cheap and reveals only length, not content.
+    return candidateBuffer.length === expectedBuffer.length && timingSafeEqual(candidateBuffer, expectedBuffer);
+  }
+  const stored: StoredPassword | null = loadStoredPassword();
+  if (stored === null) {
+    return false;
+  }
+  const candidateHash: Buffer = scryptSync(candidate, Buffer.from(stored.salt, "hex"), SCRYPT_KEY_LENGTH);
+  const storedHashBuffer: Buffer = Buffer.from(stored.hash, "hex");
+  return candidateHash.length === storedHashBuffer.length && timingSafeEqual(candidateHash, storedHashBuffer);
 }
 
 export async function issueToken(): Promise<{ value: string; maxAgeMs: number }> {

@@ -60,5 +60,4 @@ export interface UpdateInstancePayload {
   command?: string;
   model?: string | null;
   effort?: string | null;
-  fontSize?: number;
 }

@@ -302,13 +302,6 @@ export function App() {
     });
   }, []);
 
-  const persistFontSize = useCallback(
-    (instanceId: string, fontSize: number): void => {
-      updateInstance(instanceId, { fontSize });
-    },
-    [updateInstance]
-  );
-
   const confirmDelete = async (): Promise<void> => {
     if (deleteRequest === null) {
       return;
@@ -346,10 +339,12 @@ export function App() {
     return <ConnectionLostScreen msRemaining={loadRetryMsRemaining} totalMs={LOAD_RETRY_DELAY_MS} />;
   }
   if (config === null) {
-    return <div className="flex h-screen items-center justify-center text-[13px] text-txt-dim">Loading...</div>;
+    return (
+      <div className="flex h-dvh-full items-center justify-center text-[13px] text-txt-dim">Loading...</div>
+    );
   }
   if (!config.configured) {
-    return <SetupScreen onConfigured={setConfig} />;
+    return <SetupScreen onConfigured={setConfig} isMobile={isMobile} />;
   }
   if (settingsOpen) {
     return (
@@ -361,6 +356,7 @@ export function App() {
           setSettingsOpen(false);
         }}
         onClose={() => setSettingsOpen(false)}
+        isMobile={isMobile}
         showThemePicker={isMobile}
         themePreference={themePreference}
         onThemePreferenceChange={setThemePreference}
@@ -386,7 +382,14 @@ export function App() {
   );
 
   return (
-    <div className="flex h-screen flex-col">
+    <div
+      className="flex h-dvh-full flex-col"
+      // dvh already tracks the native keyboard on Android (interactive-widget=resizes-content
+      // in index.html), but iOS Safari never shrinks dvh for the keyboard; pinning to the
+      // measured visualViewport height covers that case without needing a fixed/offset
+      // MobileKeyBar or any manual padding math.
+      style={isMobile && keyboardOpen ? { height: `${visualViewportHeight}px` } : undefined}
+    >
       {updateRequired && (
         <RequiredUpdateBanner
           countdownMs={countdownMs}
@@ -453,7 +456,6 @@ export function App() {
                 }}
                 instance={instance}
                 visible={instance.id === activeInstanceId}
-                onPersistFontSize={persistFontSize}
                 theme={theme}
                 focusOnVisible={!isMobile || mobileScreen === "terminal"}
                 onAtBottomChange={instance.id === activeInstanceId ? setActiveAtBottom : undefined}
@@ -502,27 +504,21 @@ export function App() {
             )}
           </div>
         )}
+
+        {isMobile && mobileScreen === "terminal" && activeInstance !== undefined && !activeAtBottom && (
+          <button
+            type="button"
+            onClick={scrollActiveTerminalToBottom}
+            className="absolute bottom-[8px] right-[14px] z-20 flex h-[36px] w-[36px] items-center justify-center rounded-full border border-border-strong bg-surface text-txt-secondary shadow-lg"
+            aria-label="Scroll to bottom"
+          >
+            ↓
+          </button>
+        )}
       </div>
 
       {isMobile && mobileScreen === "terminal" && activeInstance !== undefined && (
-        <>
-          {!activeAtBottom && (
-            <button
-              type="button"
-              onClick={scrollActiveTerminalToBottom}
-              className="fixed right-[14px] z-20 flex h-[36px] w-[36px] items-center justify-center rounded-full border border-border-strong bg-surface text-txt-secondary shadow-lg"
-              style={{ bottom: `${(keyboardOpen ? window.innerHeight - visualViewportHeight : 0) + 52}px` }}
-              aria-label="Scroll to bottom"
-            >
-              ↓
-            </button>
-          )}
-          <MobileKeyBar
-            onSendKey={sendKeyToActiveTerminal}
-            onHideKeyboard={blurActiveTerminal}
-            bottomOffsetPx={keyboardOpen ? window.innerHeight - visualViewportHeight : 0}
-          />
-        </>
+        <MobileKeyBar onSendKey={sendKeyToActiveTerminal} onHideKeyboard={blurActiveTerminal} />
       )}
 
       {isNewInstanceModalOpen && (
@@ -552,6 +548,5 @@ function normalizePayload(instance: Instance, payload: UpdateInstancePayload): P
   if (payload.command !== undefined) normalized.command = payload.command;
   if (payload.model !== undefined) normalized.model = payload.model;
   if (payload.effort !== undefined) normalized.effort = payload.effort;
-  if (payload.fontSize !== undefined) normalized.fontSize = payload.fontSize;
   return normalized;
 }

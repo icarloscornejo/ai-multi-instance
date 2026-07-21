@@ -75,12 +75,23 @@ export interface UpdateStatus {
   requiredUpdate: boolean;
 }
 
+export type TunnelState = "stopped" | "starting" | "running" | "error";
+
+export interface TunnelStatus {
+  state: TunnelState;
+  url: string | null;
+  error: string | null;
+}
+
+export interface LanAddress {
+  url: string | null;
+}
+
 export interface UpdateInstancePayload {
   label?: string;
   command?: string;
   model?: string | null;
   effort?: string | null;
-  fontSize?: number;
 }
 
 export interface LiveStatus {

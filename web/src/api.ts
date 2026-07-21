@@ -3,9 +3,11 @@ import type {
   CreateInstancePayload,
   DashboardConfig,
   Instance,
+  LanAddress,
   LiveStatus,
   LocationBranches,
   LocationInfo,
+  TunnelStatus,
   UpdateInstancePayload,
   UpdateStatus,
 } from "./types";
@@ -48,6 +50,9 @@ async function requestJson<T>(url: string, options: RequestInit = {}): Promise<T
 export const api = {
   login: (password: string): Promise<{ ok: boolean }> =>
     requestJson("/api/auth/login", { method: "POST", body: JSON.stringify({ password }) }),
+
+  setPassword: (password: string): Promise<{ ok: boolean }> =>
+    requestJson("/api/auth/set-password", { method: "POST", body: JSON.stringify({ password }) }),
 
   getConfig: (): Promise<DashboardConfig> => requestJson("/api/config"),
 
@@ -92,4 +97,12 @@ export const api = {
 
   deleteInstance: (instanceId: string): Promise<void> =>
     requestJson(`/api/instances/${instanceId}`, { method: "DELETE" }),
+
+  getTunnel: (): Promise<TunnelStatus> => requestJson("/api/tunnel"),
+
+  startTunnel: (): Promise<TunnelStatus> => requestJson("/api/tunnel/start", { method: "POST" }),
+
+  stopTunnel: (): Promise<TunnelStatus> => requestJson("/api/tunnel/stop", { method: "POST" }),
+
+  getLanAddress: (): Promise<LanAddress> => requestJson("/api/lan-address"),
 };
