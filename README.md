@@ -1,6 +1,6 @@
 # AI Multi-Instance
 
-**Version:** 1.9.0
+**Version:** 1.9.1
 
 Local dashboard for running Claude Code, Codex CLI, Cursor Agent, custom commands, and shell sessions in parallel. Every instance is a real tmux-backed terminal, so it survives browser and dashboard restarts. Installable as a mobile PWA too, with its own password-protected home, terminal, and settings screens.
 
