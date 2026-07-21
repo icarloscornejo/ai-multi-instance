@@ -50,14 +50,6 @@ export function quoteForShell(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-function slugifyLabel(label: string): string {
-  const slug: string = label
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  return slug === "" ? "instance" : slug;
-}
-
 function executable(instance: InstanceRecord): string {
   return instance.command.trim() || PROVIDERS[instance.provider].defaultCommand;
 }
@@ -74,7 +66,7 @@ function buildClaudeCommand(instance: InstanceRecord, sessionId?: string): strin
     statusLine: { type: "command", command: statuslineScriptPath },
   });
   parts.push("--settings", quoteForShell(settingsOverride));
-  parts.push("-n", quoteForShell(slugifyLabel(instance.label)));
+  parts.push("-n", quoteForShell(instance.label));
   return parts.join(" ");
 }
 

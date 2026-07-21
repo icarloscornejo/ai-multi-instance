@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { api, ApiError } from "../api";
 import type { AgentProvider, BranchAction, CreateInstancePayload, Instance, LocationBranches, LocationInfo } from "../types";
 import { Modal } from "./Modal";
-import { BranchPickerModal } from "./BranchPickerModal";
+import { BranchSearchModal, type SourceSelection } from "./BranchSearchModal";
 import { ResumeSessionModal } from "./ResumeSessionModal";
 import { btnGhost, btnPrimary, errorTextClassName, fieldLabelClassName, hintTextClassName, inputClassName, inputErrorClassName } from "../ui";
 import { previewCommand, PROVIDER_OPTIONS } from "../providerOptions";
@@ -50,7 +50,8 @@ export function NewInstanceModal({ instances, enabledProviders, onCreate, onClos
 
   const [branchInfo, setBranchInfo] = useState<LocationBranches | null>(null);
   const [branchAction, setBranchAction] = useState<BranchAction | null>(null);
-  const [branchPickerOpen, setBranchPickerOpen] = useState<boolean>(false);
+  const [sourcePickerOpen, setSourcePickerOpen] = useState<boolean>(false);
+  const [pendingBranch, setPendingBranch] = useState<string | null>(null);
   const [resumePromptOpen, setResumePromptOpen] = useState<boolean>(false);
 
   useEffect(() => {
@@ -75,8 +76,21 @@ export function NewInstanceModal({ instances, enabledProviders, onCreate, onClos
     }
     api
       .getLocationBranches(locationPath)
-      .then(setBranchInfo)
-      .catch(() => setBranchInfo(null));
+      .then((info) => {
+        setBranchInfo(info);
+        setPendingBranch((currentPendingBranch) => {
+          if (currentPendingBranch !== null) {
+            setBranchAction(
+              currentPendingBranch === info.currentBranch ? null : { type: "checkout", branch: currentPendingBranch }
+            );
+          }
+          return null;
+        });
+      })
+      .catch(() => {
+        setBranchInfo(null);
+        setPendingBranch(null);
+      });
   }, [locationPath]);
 
   const handleLocationChange = (newLocationPath: string): void => {
@@ -87,6 +101,20 @@ export function NewInstanceModal({ instances, enabledProviders, onCreate, onClos
       );
       setLabel(matchingLocation?.folderName ?? "");
     }
+  };
+
+  const handleSourceSelect = (selection: SourceSelection): void => {
+    if (selection.branch === null) {
+      setPendingBranch(null);
+      handleLocationChange(selection.location.path);
+      return;
+    }
+    if (selection.location.path === locationPath) {
+      setBranchAction(selection.branch === branchInfo?.currentBranch ? null : { type: "checkout", branch: selection.branch });
+      return;
+    }
+    setPendingBranch(selection.branch);
+    handleLocationChange(selection.location.path);
   };
 
   const trimmedLabel: string = label.trim();
@@ -151,43 +179,46 @@ export function NewInstanceModal({ instances, enabledProviders, onCreate, onClos
   const noLocations: boolean = locations !== null && locations.length === 0;
   const providerLabel: string = PROVIDER_OPTIONS.find((option) => option.value === provider)?.label ?? provider;
   const launchPreview: string = shellOnly ? "(shell only)" : previewCommand(provider, command, model, effort);
+  const currentLocation: LocationInfo | undefined = (locations ?? []).find(
+    (location) => location.path === locationPath
+  );
+  const sourceLabel: string =
+    branchInfo?.isGitRepo === true ? describeBranch(branchInfo, branchAction) : currentLocation?.folderName ?? "";
+  const sourceSublabel: string =
+    branchInfo?.isGitRepo === true ? currentLocation?.folderName ?? "" : "not a git repository";
 
   return (
     <>
       <Modal title="New instance" onClose={onClose} widthClassName="w-[560px]">
         <div>
-          <label className={fieldLabelClassName}>Location</label>
-          <select
-            className={inputClassName}
-            value={locationPath}
-            onChange={(event) => handleLocationChange(event.target.value)}
+          <label className={fieldLabelClassName}>Source</label>
+          <button
+            type="button"
+            onClick={() => setSourcePickerOpen(true)}
             disabled={locations === null || noLocations}
+            className="flex w-full flex-col gap-[2px] rounded-sm border border-border-strong bg-app px-[11px] py-[9px] text-left disabled:opacity-50"
           >
-            {(locations ?? []).map((location) => (
-              <option key={location.path} value={location.path}>
-                {location.folderName}
-              </option>
-            ))}
-          </select>
+            <span className="flex items-center justify-between">
+              <span className="font-mono text-[12.5px] font-semibold text-txt-bright">{sourceLabel}</span>
+              <span className="flex items-center gap-[3px] text-[11px] text-txt-dim">
+                Change
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="h-[10px] w-[10px]"
+                >
+                  <path d="m6 9 6 6 6-6" />
+                </svg>
+              </span>
+            </span>
+            <span className="text-[11px] text-txt-dim">{sourceSublabel}</span>
+          </button>
           {noLocations && <div className={hintTextClassName}>No locations configured. Add them from Settings.</div>}
         </div>
-
-        {branchInfo?.isGitRepo === true && (
-          <div>
-            <label className={fieldLabelClassName}>Branch</label>
-            <button
-              type="button"
-              onClick={() => setBranchPickerOpen(true)}
-              className="flex w-full items-center justify-between rounded-sm border border-border-strong bg-app px-[10px] py-[9px]"
-            >
-              <span className="font-mono text-[12.5px] text-txt-bright">{describeBranch(branchInfo, branchAction)}</span>
-              <span className="text-[11px] text-txt-dim">Change ⌄</span>
-            </button>
-          </div>
-        )}
-        {branchInfo?.isGitRepo === false && (
-          <div className={hintTextClassName}>Not a git repository. The instance will launch without branch checkout.</div>
-        )}
 
         <div>
           <label className={fieldLabelClassName}>Name</label>
@@ -318,18 +349,19 @@ export function NewInstanceModal({ instances, enabledProviders, onCreate, onClos
               (!shellOnly && command.trim() === "")
             }
             title={noLocations ? "No locations configured" : undefined}
-            className={btnPrimary}
+            className={`${btnPrimary} flex items-center gap-[7px]`}
           >
+            {submitting && <span className="spinner spinner-on-accent h-[12px] w-[12px]" />}
             {submitting ? "Launching..." : "Launch"}
           </button>
         </div>
       </Modal>
 
-      {branchPickerOpen && branchInfo !== null && (
-        <BranchPickerModal
-          branchInfo={branchInfo}
-          onConfirm={setBranchAction}
-          onClose={() => setBranchPickerOpen(false)}
+      {sourcePickerOpen && locations !== null && (
+        <BranchSearchModal
+          locations={locations}
+          onSelect={handleSourceSelect}
+          onClose={() => setSourcePickerOpen(false)}
         />
       )}
 

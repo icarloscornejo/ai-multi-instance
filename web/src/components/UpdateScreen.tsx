@@ -14,7 +14,61 @@ function shortHash(hash: string): string {
 }
 
 function SkeletonLine({ widthClassName }: { widthClassName: string }) {
-  return <div className={`h-[11px] animate-pulse rounded-[4px] bg-raised-2 ${widthClassName}`} />;
+  return <div className={`skel h-[11px] ${widthClassName}`} />;
+}
+
+function StatusLine({
+  checking,
+  couldNotCheck,
+  updateAvailable,
+  changelogCount,
+  currentVersion,
+  onRetry,
+}: {
+  checking: boolean;
+  couldNotCheck: boolean;
+  updateAvailable: boolean;
+  changelogCount: number;
+  currentVersion: string | null;
+  onRetry: () => void;
+}) {
+  if (checking) {
+    return (
+      <div className="flex items-center gap-[8px] text-[11.5px] text-txt-secondary">
+        <span className="spinner" />
+        Comparing your version against the latest release
+      </div>
+    );
+  }
+  if (couldNotCheck) {
+    return (
+      <div className="flex items-center gap-[8px] text-[11.5px] text-txt-body">
+        <span className="flex h-[16px] w-[16px] shrink-0 items-center justify-center rounded-full bg-diff-removed text-[10px] font-bold text-on-accent">
+          !
+        </span>
+        No connection.{" "}
+        <button type="button" onClick={onRetry} className="font-semibold text-accent">
+          Retry
+        </button>
+      </div>
+    );
+  }
+  if (!updateAvailable) {
+    return (
+      <div className="flex items-center gap-[8px] text-[11.5px] text-txt-body">
+        <span className="flex h-[16px] w-[16px] shrink-0 items-center justify-center rounded-full bg-diff-added text-[10px] font-bold text-on-accent">
+          ✓
+        </span>
+        You're on the latest version{currentVersion !== null ? ` (${shortHash(currentVersion)})` : ""}
+      </div>
+    );
+  }
+  return (
+    <div className="flex items-center gap-[6px] text-[11.5px] font-semibold text-accent">
+      <span className="h-[6px] w-[6px] shrink-0 rounded-full bg-accent" />
+      {changelogCount} {changelogCount === 1 ? "commit" : "commits"} behind
+    </div>
+  );
 }
 
 function CommitBlock({
@@ -111,6 +165,7 @@ export function UpdateScreen({ initialStatus, onStatusChange, onClose }: UpdateS
 
   const busy: boolean = phase === "checking" || phase === "applying";
   const checking: boolean = phase === "checking";
+  const couldNotCheck: boolean = !checking && errorMessage !== null;
 
   return (
     <div className="flex h-screen items-center justify-center">
@@ -138,11 +193,14 @@ export function UpdateScreen({ initialStatus, onStatusChange, onClose }: UpdateS
           />
         </div>
 
-        {errorMessage !== null && (
-          <div className="rounded-sm border border-diff-removed-border bg-diff-removed-dim px-[12px] py-[10px] text-[11.5px] text-txt-body">
-            ⚠ {errorMessage}
-          </div>
-        )}
+        <StatusLine
+          checking={checking}
+          couldNotCheck={couldNotCheck}
+          updateAvailable={status?.updateAvailable === true}
+          changelogCount={status?.changelog.length ?? 0}
+          currentVersion={status?.currentCommit ?? null}
+          onRetry={runCheck}
+        />
 
         {status !== null && !checking && status.lastError !== null && (
           <div className="rounded-sm border border-diff-removed-border bg-diff-removed-dim px-[12px] py-[10px] text-[11.5px] text-txt-body">

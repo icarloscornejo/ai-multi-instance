@@ -1,4 +1,7 @@
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
+
+// Tracks nested modals so Escape closes only the topmost one instead of the whole stack
+const openModalCloseHandlers: (() => void)[] = [];
 
 interface ModalProps {
   title: string;
@@ -8,6 +11,26 @@ interface ModalProps {
 }
 
 export function Modal({ title, onClose, children, widthClassName = "w-[420px]" }: ModalProps) {
+  useEffect(() => {
+    openModalCloseHandlers.push(onClose);
+    return () => {
+      const index: number = openModalCloseHandlers.lastIndexOf(onClose);
+      if (index !== -1) {
+        openModalCloseHandlers.splice(index, 1);
+      }
+    };
+  }, [onClose]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape" && openModalCloseHandlers[openModalCloseHandlers.length - 1] === onClose) {
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/55"

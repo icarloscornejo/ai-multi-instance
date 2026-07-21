@@ -23,7 +23,7 @@ describe("provider launch commands", () => {
     const command = buildProviderLaunchCommand(instance("claude"), "claude-session");
     expect(command).toContain("'claude' --resume 'claude-session'");
     expect(command).toContain("--settings");
-    expect(command).toContain("-n 'my-agent'");
+    expect(command).toContain("-n 'My Agent'");
     expect(command).toContain("--effort 'high'");
   });
 
