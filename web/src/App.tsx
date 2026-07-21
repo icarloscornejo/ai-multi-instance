@@ -273,13 +273,6 @@ export function App() {
     terminalHandlesRef.current.get(activeInstanceId)?.scrollToBottom();
   }, [activeInstanceId]);
 
-  const blurActiveTerminal = useCallback((): void => {
-    if (activeInstanceId === null) {
-      return;
-    }
-    terminalHandlesRef.current.get(activeInstanceId)?.blurTerminal();
-  }, [activeInstanceId]);
-
   const createInstance = async (payload: CreateInstancePayload): Promise<void> => {
     const createdInstance: Instance = await api.createInstance(payload);
     setInstances((previousInstances) => [...previousInstances, createdInstance]);
@@ -518,7 +511,7 @@ export function App() {
       </div>
 
       {isMobile && mobileScreen === "terminal" && activeInstance !== undefined && (
-        <MobileKeyBar onSendKey={sendKeyToActiveTerminal} onHideKeyboard={blurActiveTerminal} />
+        <MobileKeyBar onSendKey={sendKeyToActiveTerminal} />
       )}
 
       {isNewInstanceModalOpen && (

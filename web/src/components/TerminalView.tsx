@@ -9,7 +9,6 @@ import type { Theme } from "../theme";
 export interface TerminalViewHandle {
   sendInput: (data: string) => void;
   scrollToBottom: () => void;
-  blurTerminal: () => void;
 }
 
 const MIN_FONT_SIZE = 10;
@@ -177,7 +176,6 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
         }
       },
       scrollToBottom: () => terminalRef.current?.scrollToBottom(),
-      blurTerminal: () => terminalRef.current?.blur(),
     }),
     []
   );

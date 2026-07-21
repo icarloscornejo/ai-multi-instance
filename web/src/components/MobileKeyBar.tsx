@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 
 const ESC = "\x1b";
 const CTRL_C = "\x03";
+const ENTER = "\r";
 const ARROW_UP = "\x1b[A";
 const ARROW_DOWN = "\x1b[B";
 const ARROW_RIGHT = "\x1b[C";
@@ -31,10 +32,9 @@ function KeyButton({ label, title, onPress }: KeyButtonProps) {
 
 interface MobileKeyBarProps {
   onSendKey: (data: string) => void;
-  onHideKeyboard: () => void;
 }
 
-export function MobileKeyBar({ onSendKey, onHideKeyboard }: MobileKeyBarProps) {
+export function MobileKeyBar({ onSendKey }: MobileKeyBarProps) {
   const [pasteAvailable, setPasteAvailable] = useState<boolean>(false);
 
   // navigator.clipboard.readText requires a secure context; hide the button
@@ -62,8 +62,8 @@ export function MobileKeyBar({ onSendKey, onHideKeyboard }: MobileKeyBarProps) {
       <KeyButton label="↑" title="Up" onPress={() => onSendKey(ARROW_UP)} />
       <KeyButton label="↓" title="Down" onPress={() => onSendKey(ARROW_DOWN)} />
       <KeyButton label="→" title="Right" onPress={() => onSendKey(ARROW_RIGHT)} />
-      {pasteAvailable && <KeyButton label="Paste" title="Paste from clipboard" onPress={() => void paste()} />}
-      <KeyButton label="Hide" title="Hide keyboard" onPress={onHideKeyboard} />
+      {pasteAvailable && <KeyButton label="^V" title="Paste from clipboard" onPress={() => void paste()} />}
+      <KeyButton label="Enter" title="Enter" onPress={() => onSendKey(ENTER)} />
     </div>
   );
 }
