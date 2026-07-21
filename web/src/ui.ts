@@ -27,3 +27,10 @@ export const btnOutline: string = `${btnBase} border border-border-strong bg-tra
 export const btnPrimary: string = `${btnBase} border border-accent bg-accent text-on-accent hover:brightness-[1.06]`;
 
 export const btnDanger: string = `${btnBase} border border-diff-removed bg-diff-removed text-on-accent hover:brightness-[1.06]`;
+
+export function formatCountdown(ms: number): string {
+  const totalSeconds: number = Math.max(0, Math.ceil(ms / 1000));
+  const minutes: number = Math.floor(totalSeconds / 60);
+  const seconds: number = totalSeconds % 60;
+  return `${minutes}:${seconds < 10 ? "0" : ""}${seconds}`;
+}

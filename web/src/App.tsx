@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import { DeleteConfirmModal } from "./components/DeleteConfirmModal";
 import { EmptyState } from "./components/EmptyState";
 import { NewInstanceModal } from "./components/NewInstanceModal";
+import { RequiredUpdateBanner } from "./components/RequiredUpdateBanner";
 import { SetupScreen } from "./components/SetupScreen";
 import { Sidebar } from "./components/Sidebar";
 import { TabBar } from "./components/TabBar";
@@ -27,7 +28,14 @@ export function App() {
   const [deleteRequest, setDeleteRequest] = useState<Instance | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
+  const [applyDeadline, setApplyDeadline] = useState<number | null>(null);
+  const [countdownMs, setCountdownMs] = useState<number>(0);
+  const [applying, setApplying] = useState<boolean>(false);
+  const autoApplyFiredRef = useRef<boolean>(false);
   const [theme, setTheme] = useState<Theme>(getInitialTheme);
+
+  const updateRequired: boolean =
+    updateStatus?.requiredUpdate === true && updateStatus.updateAvailable === true;
 
   useEffect(() => {
     applyTheme(theme);
@@ -46,17 +54,77 @@ export function App() {
       .catch((error: Error) => setLoadError(error.message));
   }, []);
 
-  // Restore the "relaunch" banner if an update was already applied in this server run
+  // Keeps updateStatus fresh in the background so the toolbar indicator, popover, and
+  // mandatory-update banner reflect reality without the user opening the Update screen
   useEffect(() => {
-    api
-      .getUpdateStatus()
-      .then((restoredStatus) => {
-        if (restoredStatus.lastCheckAt !== null) {
-          setUpdateStatus(restoredStatus);
-        }
-      })
-      .catch(() => undefined);
+    let cancelled: boolean = false;
+    const poll = (): void => {
+      api
+        .checkForUpdate()
+        .then((freshStatus) => {
+          if (!cancelled) {
+            setUpdateStatus(freshStatus);
+          }
+        })
+        .catch(() => undefined);
+    };
+    poll();
+    const intervalId: number = window.setInterval(poll, 150_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
   }, []);
+
+  const applyUpdateNow = useCallback(async (): Promise<void> => {
+    if (applying) {
+      return;
+    }
+    setApplying(true);
+    autoApplyFiredRef.current = true;
+    setApplyDeadline(null);
+    try {
+      const resultStatus: UpdateStatus = await api.applyUpdate();
+      setUpdateStatus(resultStatus);
+      if (resultStatus.blockedReason !== null) {
+        setUpdateViewOpen(true);
+      }
+    } catch {
+      setUpdateViewOpen(true);
+    } finally {
+      setApplying(false);
+    }
+  }, [applying]);
+
+  // Arms a 5-minute deadline the first time a required update appears, and disarms it
+  // (re-allowing a future arm) once the requirement clears, e.g. after a successful apply
+  useEffect(() => {
+    if (updateRequired && applyDeadline === null && !autoApplyFiredRef.current) {
+      setApplyDeadline(Date.now() + 5 * 60 * 1000);
+    }
+    if (!updateRequired) {
+      setApplyDeadline(null);
+      autoApplyFiredRef.current = false;
+    }
+  }, [updateRequired, applyDeadline]);
+
+  // Ticks the live countdown and fires the forced install exactly once at zero
+  useEffect(() => {
+    if (applyDeadline === null) {
+      setCountdownMs(0);
+      return;
+    }
+    const tick = (): void => {
+      const remainingMs: number = Math.max(0, applyDeadline - Date.now());
+      setCountdownMs(remainingMs);
+      if (remainingMs === 0 && !autoApplyFiredRef.current) {
+        void applyUpdateNow();
+      }
+    };
+    tick();
+    const intervalId: number = window.setInterval(tick, 250);
+    return () => window.clearInterval(intervalId);
+  }, [applyDeadline, applyUpdateNow]);
 
   useEffect(() => {
     if (activeInstanceId !== null) {
@@ -161,15 +229,28 @@ export function App() {
 
   return (
     <div className="flex h-screen flex-col">
+      {updateRequired && (
+        <RequiredUpdateBanner
+          countdownMs={countdownMs}
+          blockedReason={updateStatus?.blockedReason ?? null}
+          applying={applying}
+          onUpdateNow={() => void applyUpdateNow()}
+          onOpenUpdateScreen={() => setUpdateViewOpen(true)}
+        />
+      )}
       <TabBar
         instances={instances}
         activeInstanceId={activeInstanceId}
         updateStatus={updateStatus}
+        updateRequired={updateRequired}
+        countdownMs={countdownMs}
+        applying={applying}
         onSelect={setActiveInstanceId}
         onRename={(instanceId, newLabel) => updateInstance(instanceId, { label: newLabel })}
         onReorder={reorderInstances}
         onAddClick={() => setIsNewInstanceModalOpen(true)}
         onUpdateClick={() => setUpdateViewOpen(true)}
+        onApplyNow={() => void applyUpdateNow()}
         onSettingsClick={() => setSettingsOpen(true)}
         onCloseRequest={setDeleteRequest}
         theme={theme}

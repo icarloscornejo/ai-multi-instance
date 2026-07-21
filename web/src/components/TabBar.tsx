@@ -17,16 +17,22 @@ import { restrictToHorizontalAxis } from "@dnd-kit/modifiers";
 import { CSS } from "@dnd-kit/utilities";
 import type { Instance, UpdateStatus } from "../types";
 import type { Theme } from "../theme";
+import { formatCountdown } from "../ui";
+import { UpdatePopover } from "./UpdatePopover";
 
 interface TabBarProps {
   instances: Instance[];
   activeInstanceId: string | null;
   updateStatus: UpdateStatus | null;
+  updateRequired: boolean;
+  countdownMs: number;
+  applying: boolean;
   onSelect: (instanceId: string) => void;
   onRename: (instanceId: string, newLabel: string) => void;
   onReorder: (orderedIds: string[]) => void;
   onAddClick: () => void;
   onUpdateClick: () => void;
+  onApplyNow: () => void;
   onSettingsClick: () => void;
   onCloseRequest: (instance: Instance) => void;
   theme: Theme;
@@ -130,11 +136,15 @@ export function TabBar({
   instances,
   activeInstanceId,
   updateStatus,
+  updateRequired,
+  countdownMs,
+  applying,
   onSelect,
   onRename,
   onReorder,
   onAddClick,
   onUpdateClick,
+  onApplyNow,
   onSettingsClick,
   onCloseRequest,
   theme,
@@ -142,8 +152,42 @@ export function TabBar({
 }: TabBarProps) {
   const [editingInstanceId, setEditingInstanceId] = useState<string | null>(null);
   const [draftLabel, setDraftLabel] = useState<string>("");
+  const [popoverOpen, setPopoverOpen] = useState<boolean>(false);
   const editInputRef = useRef<HTMLInputElement>(null);
+  const updateContainerRef = useRef<HTMLDivElement>(null);
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
+
+  useEffect(() => {
+    if (!popoverOpen) {
+      return;
+    }
+    const handlePointerDown = (event: PointerEvent): void => {
+      if (!updateContainerRef.current?.contains(event.target as Node)) {
+        setPopoverOpen(false);
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        setPopoverOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [popoverOpen]);
+
+  const handleUpdateButtonClick = (): void => {
+    if (updateRequired) {
+      onUpdateClick();
+    } else if (updateStatus?.updateAvailable === true) {
+      setPopoverOpen((previousOpen) => !previousOpen);
+    } else {
+      onUpdateClick();
+    }
+  };
 
   useEffect(() => {
     if (editingInstanceId !== null) {
@@ -223,23 +267,52 @@ export function TabBar({
         <div className="pointer-events-none absolute right-0 top-0 h-full w-[24px] bg-gradient-to-r from-transparent to-app" />
       </div>
       <div className="flex shrink-0 items-center gap-[2px] border-l border-border pl-[10px]">
-        <button
-          type="button"
-          onClick={onUpdateClick}
-          title={
-            updateStatus?.pendingRestart === true
-              ? "Restart pending: open the update screen for details"
-              : updateStatus?.updateAvailable === true
-                ? "Update available: open the update screen for details"
-                : "Check for dashboard updates"
-          }
-          className="relative h-[28px] rounded-sm px-[10px] text-[11px] font-semibold text-txt-secondary hover:bg-raised hover:text-txt-body"
-        >
-          Update
-          {(updateStatus?.updateAvailable === true || updateStatus?.pendingRestart === true) && (
-            <span className="absolute -right-[2px] -top-[2px] h-[6px] w-[6px] rounded-full bg-accent" />
+        <div ref={updateContainerRef} className="relative">
+          <button
+            type="button"
+            onClick={handleUpdateButtonClick}
+            title={
+              updateRequired
+                ? updateStatus?.blockedReason !== null && updateStatus?.blockedReason !== undefined
+                  ? "Required update blocked: open the update screen for details"
+                  : "Required update: open the update screen for details"
+                : updateStatus?.pendingRestart === true
+                  ? "Restart pending: open the update screen for details"
+                  : updateStatus?.updateAvailable === true
+                    ? "Update available: click for details"
+                    : "Check for dashboard updates"
+            }
+            className={
+              updateRequired
+                ? "flex h-[28px] items-center rounded-full bg-diff-removed px-[12px] text-[11px] font-semibold tabular-nums text-on-accent hover:brightness-[1.08]"
+                : "relative h-[28px] rounded-sm px-[10px] text-[11px] font-semibold text-txt-secondary hover:bg-raised hover:text-txt-body"
+            }
+          >
+            {updateRequired
+              ? updateStatus?.blockedReason !== null && updateStatus?.blockedReason !== undefined
+                ? "Update blocked"
+                : `Updating in ${formatCountdown(countdownMs)}`
+              : "Update"}
+            {!updateRequired && (updateStatus?.updateAvailable === true || updateStatus?.pendingRestart === true) && (
+              <span className="absolute -right-[2px] -top-[2px] h-[6px] w-[6px] rounded-full bg-accent" />
+            )}
+          </button>
+          {popoverOpen && updateStatus !== null && updateStatus.updateAvailable && (
+            <UpdatePopover
+              status={updateStatus}
+              applying={applying}
+              onSeeWhatsNew={() => {
+                setPopoverOpen(false);
+                onUpdateClick();
+              }}
+              onLater={() => setPopoverOpen(false)}
+              onUpdateNow={() => {
+                setPopoverOpen(false);
+                onApplyNow();
+              }}
+            />
           )}
-        </button>
+        </div>
         <button
           type="button"
           onClick={onToggleTheme}

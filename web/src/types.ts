@@ -70,6 +70,9 @@ export interface UpdateStatus {
   blockedReason: string | null;
   lastCheckAt: string | null;
   lastError: string | null;
+  currentVersion: string | null;
+  remoteVersion: string | null;
+  requiredUpdate: boolean;
 }
 
 export interface UpdateInstancePayload {

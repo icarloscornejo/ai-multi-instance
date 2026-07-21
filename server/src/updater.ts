@@ -29,6 +29,9 @@ export interface UpdateStatus {
   blockedReason: string | null;
   lastCheckAt: string | null;
   lastError: string | null;
+  currentVersion: string | null;
+  remoteVersion: string | null;
+  requiredUpdate: boolean;
 }
 
 const status: UpdateStatus = {
@@ -44,7 +47,24 @@ const status: UpdateStatus = {
   blockedReason: null,
   lastCheckAt: null,
   lastError: null,
+  currentVersion: null,
+  remoteVersion: null,
+  requiredUpdate: false,
 };
+
+// A required update forces auto-install on a countdown with no way to dismiss it, so it
+// must only trigger on an intentional major bump, never on a parse hiccup or missing field
+export function isMajorBump(localVersion: string | null, remoteVersion: string | null): boolean {
+  if (localVersion === null || remoteVersion === null) {
+    return false;
+  }
+  const localMajor: RegExpMatchArray | null = localVersion.match(/^(\d+)\./);
+  const remoteMajor: RegExpMatchArray | null = remoteVersion.match(/^(\d+)\./);
+  if (localMajor === null || remoteMajor === null) {
+    return false;
+  }
+  return parseInt(remoteMajor[1], 10) > parseInt(localMajor[1], 10);
+}
 
 // tsx watch restarts the server automatically for changes under server/src, and vite
 // hot-reloads web/src in the browser: those paths need no manual relaunch from the user.
@@ -96,6 +116,23 @@ async function getChangelog(fromRef: string, toRef: string): Promise<ChangelogEn
     });
 }
 
+async function getVersion(ref: "HEAD" | "origin/main"): Promise<string | null> {
+  try {
+    const packageJson: string = await runGit(["show", `${ref}:package.json`]);
+    const parsed: unknown = JSON.parse(packageJson);
+    const version: unknown = (parsed as { version?: unknown }).version;
+    return typeof version === "string" ? version : null;
+  } catch {
+    return null;
+  }
+}
+
+async function refreshVersionStatus(): Promise<void> {
+  status.currentVersion = await getVersion("HEAD");
+  status.remoteVersion = await getVersion("origin/main");
+  status.requiredUpdate = status.updateAvailable && isMajorBump(status.currentVersion, status.remoteVersion);
+}
+
 async function refreshRestartStatus(currentCommit: string): Promise<void> {
   // The running process is behind the code on disk: a relaunch is needed
   status.pendingRestart = status.startedAtCommit !== null && currentCommit !== status.startedAtCommit;
@@ -142,6 +179,7 @@ export async function checkForUpdate(): Promise<UpdateStatus> {
       status.changelog = [];
     }
 
+    await refreshVersionStatus();
     await refreshRestartStatus(currentCommit);
     status.lastError = null;
   } catch (error) {
@@ -194,6 +232,7 @@ export async function applyUpdate(): Promise<UpdateStatus> {
     status.currentCommit = currentCommit;
     status.currentSubject = await getSubject(currentCommit);
     status.updateAvailable = currentCommit !== remoteCommit;
+    await refreshVersionStatus();
     await refreshRestartStatus(currentCommit);
     status.lastError = null;
   } catch (error) {
