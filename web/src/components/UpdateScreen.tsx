@@ -5,6 +5,7 @@ import { btnGhost, btnPrimary, cardClassName, iconBtnClassName } from "../ui";
 
 interface UpdateScreenProps {
   initialStatus: UpdateStatus | null;
+  autoApply?: boolean;
   onStatusChange: (status: UpdateStatus) => void;
   onClose: () => void;
 }
@@ -110,9 +111,9 @@ function CommitBlock({
   );
 }
 
-export function UpdateScreen({ initialStatus, onStatusChange, onClose }: UpdateScreenProps) {
+export function UpdateScreen({ initialStatus, autoApply = false, onStatusChange, onClose }: UpdateScreenProps) {
   const [status, setStatus] = useState<UpdateStatus | null>(initialStatus);
-  const [phase, setPhase] = useState<"checking" | "applying" | "idle">("checking");
+  const [phase, setPhase] = useState<"checking" | "applying" | "idle">(autoApply ? "applying" : "checking");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const runCheck = (): void => {
@@ -131,22 +132,6 @@ export function UpdateScreen({ initialStatus, onStatusChange, onClose }: UpdateS
       });
   };
 
-  useEffect(() => {
-    runCheck();
-    // Only on mount: a fresh check every time the screen opens
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent): void => {
-      if (event.key === "Escape") {
-        onClose();
-      }
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
-
   const runApply = (): void => {
     setPhase("applying");
     setErrorMessage(null);
@@ -162,6 +147,28 @@ export function UpdateScreen({ initialStatus, onStatusChange, onClose }: UpdateS
         setPhase("idle");
       });
   };
+
+  useEffect(() => {
+    // Update now, from the banner or popover, already knows an update is pending,
+    // so it jumps straight to applying instead of re-checking first
+    if (autoApply) {
+      runApply();
+    } else {
+      runCheck();
+    }
+    // Only on mount: either a fresh check or an immediate apply, once per time the screen opens
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
 
   const busy: boolean = phase === "checking" || phase === "applying";
   const checking: boolean = phase === "checking";

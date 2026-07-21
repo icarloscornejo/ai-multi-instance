@@ -30,6 +30,7 @@ export function App() {
   const [isNewInstanceModalOpen, setIsNewInstanceModalOpen] = useState<boolean>(false);
   const [settingsOpen, setSettingsOpen] = useState<boolean>(false);
   const [updateViewOpen, setUpdateViewOpen] = useState<boolean>(false);
+  const [autoApplyOnOpen, setAutoApplyOnOpen] = useState<boolean>(false);
   const [deleteRequest, setDeleteRequest] = useState<Instance | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loadRetryMsRemaining, setLoadRetryMsRemaining] = useState<number>(LOAD_RETRY_DELAY_MS);
@@ -134,6 +135,13 @@ export function App() {
       setApplying(false);
     }
   }, [applying]);
+
+  // "Update now" from the banner or popover should show the update screen applying
+  // rather than installing silently in the background
+  const openUpdateScreenAndApply = useCallback((): void => {
+    setAutoApplyOnOpen(true);
+    setUpdateViewOpen(true);
+  }, []);
 
   // Arms a 5-minute deadline the first time a required update appears, and disarms it
   // (re-allowing a future arm) once the requirement clears, e.g. after a successful apply
@@ -252,8 +260,12 @@ export function App() {
     return (
       <UpdateScreen
         initialStatus={updateStatus}
+        autoApply={autoApplyOnOpen}
         onStatusChange={setUpdateStatus}
-        onClose={() => setUpdateViewOpen(false)}
+        onClose={() => {
+          setUpdateViewOpen(false);
+          setAutoApplyOnOpen(false);
+        }}
       />
     );
   }
@@ -269,7 +281,7 @@ export function App() {
           countdownMs={countdownMs}
           blockedReason={updateStatus?.blockedReason ?? null}
           applying={applying}
-          onUpdateNow={() => void applyUpdateNow()}
+          onUpdateNow={openUpdateScreenAndApply}
           onOpenUpdateScreen={() => setUpdateViewOpen(true)}
         />
       )}
@@ -285,7 +297,7 @@ export function App() {
         onReorder={reorderInstances}
         onAddClick={() => setIsNewInstanceModalOpen(true)}
         onUpdateClick={() => setUpdateViewOpen(true)}
-        onApplyNow={() => void applyUpdateNow()}
+        onApplyNow={openUpdateScreenAndApply}
         onSettingsClick={() => setSettingsOpen(true)}
         onCloseRequest={setDeleteRequest}
         theme={theme}
