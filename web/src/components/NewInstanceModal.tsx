@@ -51,7 +51,7 @@ export function NewInstanceModal({ instances, enabledProviders, onCreate, onClos
   const [branchInfo, setBranchInfo] = useState<LocationBranches | null>(null);
   const [branchAction, setBranchAction] = useState<BranchAction | null>(null);
   const [sourcePickerOpen, setSourcePickerOpen] = useState<boolean>(false);
-  const [pendingBranch, setPendingBranch] = useState<string | null>(null);
+  const [pendingAction, setPendingAction] = useState<BranchAction | null>(null);
   const [resumePromptOpen, setResumePromptOpen] = useState<boolean>(false);
 
   useEffect(() => {
@@ -78,18 +78,22 @@ export function NewInstanceModal({ instances, enabledProviders, onCreate, onClos
       .getLocationBranches(locationPath)
       .then((info) => {
         setBranchInfo(info);
-        setPendingBranch((currentPendingBranch) => {
-          if (currentPendingBranch !== null) {
-            setBranchAction(
-              currentPendingBranch === info.currentBranch ? null : { type: "checkout", branch: currentPendingBranch }
-            );
+        setPendingAction((currentPendingAction) => {
+          if (currentPendingAction !== null) {
+            if (currentPendingAction.type === "create") {
+              setBranchAction(currentPendingAction);
+            } else {
+              setBranchAction(
+                currentPendingAction.branch === info.currentBranch ? null : currentPendingAction
+              );
+            }
           }
           return null;
         });
       })
       .catch(() => {
         setBranchInfo(null);
-        setPendingBranch(null);
+        setPendingAction(null);
       });
   }, [locationPath]);
 
@@ -105,15 +109,19 @@ export function NewInstanceModal({ instances, enabledProviders, onCreate, onClos
 
   const handleSourceSelect = (selection: SourceSelection): void => {
     if (selection.branch === null) {
-      setPendingBranch(null);
+      setPendingAction(null);
       handleLocationChange(selection.location.path);
       return;
     }
+    const action: BranchAction =
+      selection.create !== undefined
+        ? { type: "create", branch: selection.branch, baseBranch: selection.create.baseBranch }
+        : { type: "checkout", branch: selection.branch };
     if (selection.location.path === locationPath) {
-      setBranchAction(selection.branch === branchInfo?.currentBranch ? null : { type: "checkout", branch: selection.branch });
+      setBranchAction(action.type === "checkout" && action.branch === branchInfo?.currentBranch ? null : action);
       return;
     }
-    setPendingBranch(selection.branch);
+    setPendingAction(action);
     handleLocationChange(selection.location.path);
   };
 

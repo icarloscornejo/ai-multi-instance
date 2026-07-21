@@ -2,13 +2,14 @@ import { Fragment, useEffect, useState } from "react";
 import { api } from "../api";
 import type { LocationInfo } from "../types";
 import { Modal } from "./Modal";
-import { btnGhost, inputClassName } from "../ui";
+import { btnGhost, btnPrimary, inputClassName } from "../ui";
 
 interface SourceSelection {
   location: LocationInfo;
   branch: string | null;
   currentBranch: string | null;
   isGitRepo: boolean;
+  create?: { baseBranch: string };
 }
 
 interface ChooseSourceModalProps {
@@ -44,6 +45,8 @@ function highlightMatch(text: string, query: string) {
 export function BranchSearchModal({ locations, onSelect, onClose }: ChooseSourceModalProps) {
   const [search, setSearch] = useState<string>("");
   const [entries, setEntries] = useState<LocationEntry[] | null>(null);
+  const [creatingIn, setCreatingIn] = useState<string | null>(null);
+  const [createBaseBranch, setCreateBaseBranch] = useState<string>("");
 
   useEffect(() => {
     let disposed: boolean = false;
@@ -81,6 +84,22 @@ export function BranchSearchModal({ locations, onSelect, onClose }: ChooseSource
     onClose();
   };
 
+  const openCreateRow = (entry: LocationEntry): void => {
+    setCreatingIn(entry.location.path);
+    setCreateBaseBranch(entry.currentBranch ?? entry.branches[0] ?? "");
+  };
+
+  const confirmCreate = (entry: LocationEntry): void => {
+    onSelect({
+      location: entry.location,
+      branch: trimmedSearch,
+      currentBranch: entry.currentBranch,
+      isGitRepo: true,
+      create: { baseBranch: createBaseBranch },
+    });
+    onClose();
+  };
+
   const visibleEntries: (LocationEntry & { matchingBranches: string[] })[] =
     entries?.map((entry) => {
       const projectMatches: boolean = entry.location.folderName.toLowerCase().includes(trimmedSearch.toLowerCase());
@@ -92,12 +111,15 @@ export function BranchSearchModal({ locations, onSelect, onClose }: ChooseSource
       };
     }) ?? [];
 
+  const canCreateIn = (entry: LocationEntry): boolean =>
+    entry.isGitRepo && trimmedSearch !== "" && !entry.branches.includes(trimmedSearch);
+
   const filteredEntries = visibleEntries.filter((entry) => {
     if (trimmedSearch === "") {
       return true;
     }
     if (entry.isGitRepo) {
-      return entry.matchingBranches.length > 0;
+      return entry.matchingBranches.length > 0 || canCreateIn(entry);
     }
     return entry.location.folderName.toLowerCase().includes(trimmedSearch.toLowerCase());
   });
@@ -122,7 +144,10 @@ export function BranchSearchModal({ locations, onSelect, onClose }: ChooseSource
           value={search}
           placeholder="Search or browse..."
           autoFocus
-          onChange={(event) => setSearch(event.target.value)}
+          onChange={(event) => {
+            setSearch(event.target.value);
+            setCreatingIn(null);
+          }}
         />
       </div>
 
@@ -162,6 +187,52 @@ export function BranchSearchModal({ locations, onSelect, onClose }: ChooseSource
                       </button>
                     );
                   })}
+                  {canCreateIn(entry) &&
+                    (creatingIn === entry.location.path ? (
+                      <div className="flex flex-col gap-[6px] rounded-[5px] bg-raised px-[8px] py-[7px] pl-[22px]">
+                        <div className="flex items-center gap-[6px] font-mono text-[12px] text-txt-body">
+                          <span className="font-semibold text-txt-bright">{trimmedSearch}</span>
+                          <span className="text-txt-dimmer">from</span>
+                          <select
+                            className="rounded-sm border border-border-strong bg-app px-[6px] py-[3px] font-mono text-[11.5px] text-txt-body outline-none focus:border-accent-border"
+                            value={createBaseBranch}
+                            onChange={(event) => setCreateBaseBranch(event.target.value)}
+                          >
+                            {entry.branches.map((branch) => (
+                              <option key={branch} value={branch}>
+                                {branch}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        <div className="flex justify-end gap-[8px]">
+                          <button type="button" onClick={() => setCreatingIn(null)} className={btnGhost}>
+                            Cancel
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => confirmCreate(entry)}
+                            disabled={createBaseBranch === ""}
+                            className={btnPrimary}
+                          >
+                            Create from {createBaseBranch}
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => openCreateRow(entry)}
+                        className="flex w-full items-center justify-between gap-[8px] rounded-[5px] px-[8px] py-[5px] pl-[22px] text-left font-mono text-[12px] text-txt-body hover:bg-accent-dim hover:text-txt-bright"
+                      >
+                        <span>
+                          Create &apos;{trimmedSearch}&apos;
+                        </span>
+                        <span className="shrink-0 whitespace-nowrap rounded-full bg-raised-2 px-[6px] py-[2px] font-sans text-[9.5px] font-bold uppercase tracking-[.03em] text-txt-secondary">
+                          New
+                        </span>
+                      </button>
+                    ))}
                 </>
               ) : (
                 <button
