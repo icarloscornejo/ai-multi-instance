@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
+import { ConnectionLostScreen } from "./components/ConnectionLostScreen";
 import { DeleteConfirmModal } from "./components/DeleteConfirmModal";
 import { EmptyState } from "./components/EmptyState";
 import { NewInstanceModal } from "./components/NewInstanceModal";
@@ -18,6 +19,10 @@ import type {
   UpdateStatus,
 } from "./types";
 
+// How long the initial-load retry waits between attempts, and the countdown
+// the ConnectionLostScreen ring animates against, kept in lockstep with it
+const LOAD_RETRY_DELAY_MS = 3_000;
+
 export function App() {
   const [config, setConfig] = useState<DashboardConfig | null>(null);
   const [instances, setInstances] = useState<Instance[]>([]);
@@ -27,6 +32,7 @@ export function App() {
   const [updateViewOpen, setUpdateViewOpen] = useState<boolean>(false);
   const [deleteRequest, setDeleteRequest] = useState<Instance | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadRetryMsRemaining, setLoadRetryMsRemaining] = useState<number>(LOAD_RETRY_DELAY_MS);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [applyDeadline, setApplyDeadline] = useState<number | null>(null);
   const [countdownMs, setCountdownMs] = useState<number>(0);
@@ -41,17 +47,50 @@ export function App() {
     applyTheme(theme);
   }, [theme]);
 
+  // The server briefly drops off (tsx watch restarts it) while an update is applying,
+  // so a failed initial load keeps retrying instead of stranding the user on a dead end
   useEffect(() => {
-    Promise.all([api.getConfig(), api.listInstances()])
-      .then(([loadedConfig, loadedInstances]) => {
-        setConfig(loadedConfig);
-        setInstances(loadedInstances);
-        const rememberedId: string | null = localStorage.getItem("ccdash.activeInstanceId");
-        const initialInstance: Instance | undefined =
-          loadedInstances.find((candidate) => candidate.id === rememberedId) ?? loadedInstances[0];
-        setActiveInstanceId(initialInstance?.id ?? null);
-      })
-      .catch((error: Error) => setLoadError(error.message));
+    let cancelled: boolean = false;
+    let retryTimeoutId: number | undefined;
+    let countdownIntervalId: number | undefined;
+
+    const load = (): void => {
+      Promise.all([api.getConfig(), api.listInstances()])
+        .then(([loadedConfig, loadedInstances]) => {
+          if (cancelled) {
+            return;
+          }
+          setLoadError(null);
+          setConfig(loadedConfig);
+          setInstances(loadedInstances);
+          const rememberedId: string | null = localStorage.getItem("ccdash.activeInstanceId");
+          const initialInstance: Instance | undefined =
+            loadedInstances.find((candidate) => candidate.id === rememberedId) ?? loadedInstances[0];
+          setActiveInstanceId(initialInstance?.id ?? null);
+        })
+        .catch((error: Error) => {
+          if (cancelled) {
+            return;
+          }
+          setLoadError(error.message);
+          const retryStartedAt: number = Date.now();
+          setLoadRetryMsRemaining(LOAD_RETRY_DELAY_MS);
+          countdownIntervalId = window.setInterval(() => {
+            setLoadRetryMsRemaining(Math.max(0, LOAD_RETRY_DELAY_MS - (Date.now() - retryStartedAt)));
+          }, 100);
+          retryTimeoutId = window.setTimeout(() => {
+            window.clearInterval(countdownIntervalId);
+            load();
+          }, LOAD_RETRY_DELAY_MS);
+        });
+    };
+
+    load();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(retryTimeoutId);
+      window.clearInterval(countdownIntervalId);
+    };
   }, []);
 
   // Keeps updateStatus fresh in the background so the toolbar indicator, popover, and
@@ -188,11 +227,7 @@ export function App() {
   };
 
   if (loadError !== null) {
-    return (
-      <div className="flex h-screen items-center justify-center text-[13px] text-diff-removed">
-        Could not connect to the server: {loadError}
-      </div>
-    );
+    return <ConnectionLostScreen msRemaining={loadRetryMsRemaining} totalMs={LOAD_RETRY_DELAY_MS} />;
   }
   if (config === null) {
     return <div className="flex h-screen items-center justify-center text-[13px] text-txt-dim">Loading...</div>;

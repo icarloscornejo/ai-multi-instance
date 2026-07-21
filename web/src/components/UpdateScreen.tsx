@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, ApiError } from "../api";
 import type { UpdateStatus } from "../types";
-import { btnGhost, btnOutline, btnPrimary, cardClassName } from "../ui";
+import { btnGhost, btnPrimary, cardClassName, iconBtnClassName } from "../ui";
 
 interface UpdateScreenProps {
   initialStatus: UpdateStatus | null;
@@ -170,10 +170,13 @@ export function UpdateScreen({ initialStatus, onStatusChange, onClose }: UpdateS
   return (
     <div className="flex h-screen items-center justify-center">
       <div className={`w-[580px] ${cardClassName}`}>
-        <div className="flex items-center justify-between">
+        <div className="flex items-center gap-[8px]">
           <h1 className="text-[15px] font-bold text-txt-bright">Update</h1>
-          <button type="button" onClick={onClose} className={btnGhost}>
-            Close
+          <button type="button" onClick={runCheck} disabled={busy} title="Check again" className={iconBtnClassName}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-[14px] w-[14px]">
+              <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+              <path d="M21 3v6h-6" />
+            </svg>
           </button>
         </div>
 
@@ -253,12 +256,13 @@ export function UpdateScreen({ initialStatus, onStatusChange, onClose }: UpdateS
         )}
 
         <div className="flex justify-end gap-[10px]">
-          <button type="button" onClick={runCheck} disabled={busy} className={btnOutline}>
-            Check again
+          <button type="button" onClick={onClose} disabled={busy} className={btnGhost}>
+            Close
           </button>
           {status !== null && status.updateAvailable && (
-            <button type="button" onClick={runApply} disabled={busy} className={btnPrimary}>
-              {phase === "applying" ? "Applying..." : "Apply update"}
+            <button type="button" onClick={runApply} disabled={busy} className={`${btnPrimary} flex items-center gap-[7px]`}>
+              {phase === "applying" && <span className="spinner spinner-on-accent h-[12px] w-[12px]" />}
+              {phase === "applying" ? "Applying update..." : "Apply update"}
             </button>
           )}
         </div>

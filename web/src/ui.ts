@@ -28,6 +28,9 @@ export const btnPrimary: string = `${btnBase} border border-accent bg-accent tex
 
 export const btnDanger: string = `${btnBase} border border-diff-removed bg-diff-removed text-on-accent hover:brightness-[1.06]`;
 
+export const iconBtnClassName: string =
+  "flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-sm border border-border bg-surface text-txt-dim transition-colors hover:bg-raised hover:text-txt-bright disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-surface disabled:hover:text-txt-dim";
+
 export function formatCountdown(ms: number): string {
   const totalSeconds: number = Math.max(0, Math.ceil(ms / 1000));
   const minutes: number = Math.floor(totalSeconds / 60);
