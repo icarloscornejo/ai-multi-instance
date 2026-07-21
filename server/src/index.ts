@@ -1,7 +1,9 @@
+
 import http from "node:http";
 import path from "node:path";
 import express, { type Request, type Response, type NextFunction } from "express";
 import { WebSocketServer, type WebSocket, type RawData } from "ws";
+import { AUTH_COOKIE_NAME, isAuthEnabled, readCookie, verifyToken } from "./auth";
 import { apiRouter } from "./routes";
 import { loadState } from "./store";
 import { bridgeTerminal } from "./terminal";
@@ -41,36 +43,57 @@ httpServer.on("upgrade", (request, socket, head) => {
       ? { cols: requestedCols, rows: requestedRows }
       : null;
 
-  webSocketServer.handleUpgrade(request, socket, head, (webSocket: WebSocket) => {
-    // bridgeTerminal performs several awaits (loadState here, and hasSession/createSession
-    // inside) before it can hook into live messages; the client may send its initial
-    // "resize" (and even type) throughout that window. "ws" does not buffer messages
-    // for an EventEmitter with no listener: without this synchronous buffer (which stays
-    // active until bridgeTerminal installs its own handler), that first resize is lost
-    // forever and the pty keeps the fallback size (see terminal.ts) until the client
-    // triggers the next real resize.
-    const pendingMessages: RawData[] = [];
-    const bufferMessage = (rawMessage: RawData): void => {
-      pendingMessages.push(rawMessage);
-    };
-    webSocket.on("message", bufferMessage);
-
-    void (async () => {
-      const state: DashboardState = await loadState();
-      const instance = state.instances.find((candidate) => candidate.id === instanceId);
-      if (instance === undefined) {
-        webSocket.removeListener("message", bufferMessage);
-        webSocket.close(4004, "Unknown instance");
+  void (async () => {
+    // The WS upgrade is the real attack surface (it reads/writes the terminal
+    // directly), so it needs the same cookie check as the REST API even though
+    // the static HTML/assets stay open.
+    if (isAuthEnabled()) {
+      const token: string | undefined = readCookie(request.headers.cookie, AUTH_COOKIE_NAME);
+      const isValid: boolean = await verifyToken(token);
+      if (!isValid) {
+        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+        socket.destroy();
         return;
       }
-      await bridgeTerminal(webSocket, instance, initialSize, pendingMessages, () =>
-        webSocket.removeListener("message", bufferMessage)
-      );
-    })().catch((error: Error) => {
-      console.error(`[server] failed to attach instance ${instanceId}:`, error.message);
-      webSocket.close(4000, error.message.slice(0, 120));
-    });
+    }
+    completeUpgrade();
+  })().catch((error: Error) => {
+    console.error("[server] failed to authorize websocket upgrade:", error.message);
+    socket.destroy();
   });
+
+  function completeUpgrade(): void {
+    webSocketServer.handleUpgrade(request, socket, head, (webSocket: WebSocket) => {
+      // bridgeTerminal performs several awaits (loadState here, and hasSession/createSession
+      // inside) before it can hook into live messages; the client may send its initial
+      // "resize" (and even type) throughout that window. "ws" does not buffer messages
+      // for an EventEmitter with no listener: without this synchronous buffer (which stays
+      // active until bridgeTerminal installs its own handler), that first resize is lost
+      // forever and the pty keeps the fallback size (see terminal.ts) until the client
+      // triggers the next real resize.
+      const pendingMessages: RawData[] = [];
+      const bufferMessage = (rawMessage: RawData): void => {
+        pendingMessages.push(rawMessage);
+      };
+      webSocket.on("message", bufferMessage);
+
+      void (async () => {
+        const state: DashboardState = await loadState();
+        const instance = state.instances.find((candidate) => candidate.id === instanceId);
+        if (instance === undefined) {
+          webSocket.removeListener("message", bufferMessage);
+          webSocket.close(4004, "Unknown instance");
+          return;
+        }
+        await bridgeTerminal(webSocket, instance, initialSize, pendingMessages, () =>
+          webSocket.removeListener("message", bufferMessage)
+        );
+      })().catch((error: Error) => {
+        console.error(`[server] failed to attach instance ${instanceId}:`, error.message);
+        webSocket.close(4000, error.message.slice(0, 120));
+      });
+    });
+  }
 });
 
 httpServer.listen(serverPort, serverHost, () => {

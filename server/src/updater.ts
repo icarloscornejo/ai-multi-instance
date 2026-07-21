@@ -143,6 +143,13 @@ async function refreshRestartStatus(currentCommit: string): Promise<void> {
           .filter((changedPath) => changedPath !== "")
       )
     : "none";
+  // "auto" changes are already live via tsx watch / Vite HMR, with no real process
+  // restart coming to bump startedAtCommit on its own: track it here instead, or the
+  // banner would report a pending restart forever even after the user reloads the page
+  if (status.restartKind === "auto") {
+    status.startedAtCommit = currentCommit;
+    status.pendingRestart = false;
+  }
 }
 
 export function getUpdateStatus(): UpdateStatus {

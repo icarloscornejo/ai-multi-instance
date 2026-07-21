@@ -12,7 +12,7 @@ export function ConnectionLostScreen({ msRemaining, totalMs }: ConnectionLostScr
 
   return (
     <div className="flex h-screen items-center justify-center">
-      <div className="flex w-[580px] min-h-[320px] flex-col items-center justify-center gap-[18px] rounded-lg border border-border bg-app p-[40px]">
+      <div className="flex w-full max-w-[580px] min-h-[320px] flex-col items-center justify-center gap-[18px] rounded-lg border border-border bg-app p-[40px] mx-[16px]">
         <div className="relative flex h-[64px] w-[64px] items-center justify-center">
           <svg viewBox="0 0 64 64" className="h-[64px] w-[64px] -rotate-90">
             <circle cx="32" cy="32" r={RING_RADIUS} fill="none" stroke="var(--color-border-strong)" strokeWidth="3" />

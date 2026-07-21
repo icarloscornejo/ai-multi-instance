@@ -1,16 +1,11 @@
 import { useEffect, type ReactNode } from "react";
 
-// Tracks nested modals so Escape closes only the topmost one instead of the whole stack
+// Tracks nested modals/sheets so Escape closes only the topmost one instead of the whole stack
 const openModalCloseHandlers: (() => void)[] = [];
 
-interface ModalProps {
-  title: string;
-  onClose: () => void;
-  children: ReactNode;
-  widthClassName?: string;
-}
-
-export function Modal({ title, onClose, children, widthClassName = "w-[420px]" }: ModalProps) {
+// Shared by Modal and BottomSheet so a sheet opened on top of a modal (or vice versa)
+// still closes in the right order on Escape
+export function useModalEscapeStack(onClose: () => void): void {
   useEffect(() => {
     openModalCloseHandlers.push(onClose);
     return () => {
@@ -30,6 +25,17 @@ export function Modal({ title, onClose, children, widthClassName = "w-[420px]" }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [onClose]);
+}
+
+interface ModalProps {
+  title: string;
+  onClose: () => void;
+  children: ReactNode;
+  widthClassName?: string;
+}
+
+export function Modal({ title, onClose, children, widthClassName = "w-[420px]" }: ModalProps) {
+  useModalEscapeStack(onClose);
 
   return (
     <div
@@ -41,7 +47,7 @@ export function Modal({ title, onClose, children, widthClassName = "w-[420px]" }
       }}
     >
       <div
-        className={`flex ${widthClassName} max-h-[85vh] flex-col gap-[14px] overflow-y-auto rounded-[10px] border border-border bg-surface p-[24px]`}
+        className={`flex ${widthClassName} max-w-[calc(100vw-32px)] max-h-[85vh] flex-col gap-[14px] overflow-y-auto rounded-[10px] border border-border bg-surface p-[24px]`}
       >
         <h2 className="text-[14px] font-semibold text-txt-bright">{title}</h2>
         {children}

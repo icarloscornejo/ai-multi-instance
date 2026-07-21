@@ -12,3 +12,13 @@ import { App } from "./App";
 // No StrictMode: the double effect mount in development would create two tmux
 // attaches per terminal (two websockets against the same session)
 createRoot(document.getElementById("root")!).render(<App />);
+
+// Registered only in prod: in dev, Vite's own dev server churn plus a stale SW from a
+// previous prod build would just cause confusion. See public/sw.js for why it doesn't cache.
+if ("serviceWorker" in navigator && import.meta.env.PROD) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js").catch((error: Error) => {
+      console.error("[pwa] service worker registration failed:", error.message);
+    });
+  });
+}

@@ -175,8 +175,8 @@ export function UpdateScreen({ initialStatus, autoApply = false, onStatusChange,
   const couldNotCheck: boolean = !checking && errorMessage !== null;
 
   return (
-    <div className="flex h-screen items-center justify-center">
-      <div className={`w-[580px] ${cardClassName}`}>
+    <div className="flex h-screen items-center justify-center px-[16px]">
+      <div className={`w-full max-w-[580px] max-h-[90vh] overflow-y-auto ${cardClassName}`}>
         <div className="flex items-center gap-[8px]">
           <h1 className="text-[15px] font-bold text-txt-bright">Update</h1>
           <button type="button" onClick={runCheck} disabled={busy} title="Check again" className={iconBtnClassName}>
@@ -187,14 +187,14 @@ export function UpdateScreen({ initialStatus, autoApply = false, onStatusChange,
           </button>
         </div>
 
-        <div className="grid grid-cols-[1fr_auto_1fr] items-stretch gap-[10px]">
+        <div className="grid grid-cols-1 items-stretch gap-[10px] sm:grid-cols-[1fr_auto_1fr]">
           <CommitBlock
             label="Current"
             hash={checking ? null : status?.currentCommit ?? null}
             subject={status?.currentSubject ?? null}
             highlighted={false}
           />
-          <div className="flex items-center justify-center text-[16px] text-txt-dim">→</div>
+          <div className="flex items-center justify-center text-[16px] text-txt-dim sm:rotate-0 rotate-90">→</div>
           <CommitBlock
             label="Latest"
             hash={checking ? null : status?.remoteCommit ?? null}

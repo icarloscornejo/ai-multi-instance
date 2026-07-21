@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import express, { type Request, type Response, type NextFunction, type Router } from "express";
+import { AUTH_COOKIE_NAME, checkPassword, isAuthEnabled, issueToken, requireAuth } from "./auth";
 import { buildLaunchCommand } from "./launch";
 import { isAgentProvider, PROVIDERS, sessionKeyFor } from "./providers";
 import { loadState, saveState } from "./store";
@@ -160,6 +161,32 @@ export const apiRouter: Router = express.Router();
 function resolveHomePath(rawPath: string): string {
   return path.resolve(rawPath.trim().replace(/^~(?=\/|$)/, process.env.HOME ?? "~"));
 }
+
+// Registered before requireAuth below so the gate itself stays reachable
+// without a cookie; every route after this line is protected.
+apiRouter.post(
+  "/auth/login",
+  wrapAsync(async (request, response) => {
+    if (!isAuthEnabled()) {
+      response.json({ ok: true });
+      return;
+    }
+    const { password } = request.body as { password?: unknown };
+    if (typeof password !== "string" || !checkPassword(password)) {
+      response.status(401).json({ error: "Incorrect password" });
+      return;
+    }
+    const { value, maxAgeMs } = await issueToken();
+    response.cookie(AUTH_COOKIE_NAME, value, {
+      httpOnly: true,
+      sameSite: "lax",
+      maxAge: maxAgeMs,
+    });
+    response.json({ ok: true });
+  })
+);
+
+apiRouter.use(requireAuth);
 
 apiRouter.get(
   "/config",

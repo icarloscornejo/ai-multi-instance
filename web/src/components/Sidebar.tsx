@@ -1,8 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { api } from "../api";
-import type { Instance, LiveStatus, UpdateInstancePayload } from "../types";
+import { useLiveStatus } from "../hooks/useLiveStatus";
+import type { Instance, UpdateInstancePayload } from "../types";
 
-const LIVE_STATUS_POLL_MS = 1000;
 const PROVIDER_LABELS = {
   claude: "Claude Code",
   codex: "Codex CLI",
@@ -134,63 +133,12 @@ function CopyButton({ value, title }: { value: string; title: string }) {
 
 export function Sidebar({ instance, onUpdate, onDeleteRequest }: SidebarProps) {
   const [commandDraft, setCommandDraft] = useState<string>(instance.command);
-  const [gitBranch, setGitBranch] = useState<string | null>(null);
-  const [liveStatus, setLiveStatus] = useState<LiveStatus | null>(null);
+  const { liveStatus, gitBranch } = useLiveStatus(instance.id, true);
 
   // When switching tabs the sidebar shows a different instance: resync the draft
   useEffect(() => {
     setCommandDraft(instance.command);
   }, [instance.id, instance.command]);
-
-  // Fallback branch lookup: used only while the live statusLine snapshot isn't
-  // available (not configured yet, or Claude hasn't redrawn its statusline here).
-  useEffect(() => {
-    let cancelled = false;
-    setGitBranch(null);
-    api
-      .getInstanceGit(instance.id)
-      .then((result) => {
-        if (!cancelled) {
-          setGitBranch(result.branch ?? null);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setGitBranch(null);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [instance.id]);
-
-  // Polls the statusLine snapshot the dashboard-statusline.sh wrapper writes, so the
-  // sidebar mirrors the same live model/effort/branch/context/cost data Claude Code's
-  // own statusline shows, without waiting for a manual refresh.
-  useEffect(() => {
-    let cancelled = false;
-    setLiveStatus(null);
-    const poll = (): void => {
-      api
-        .getInstanceLiveStatus(instance.id)
-        .then((result) => {
-          if (!cancelled) {
-            setLiveStatus(result);
-          }
-        })
-        .catch(() => {
-          if (!cancelled) {
-            setLiveStatus(null);
-          }
-        });
-    };
-    poll();
-    const intervalId: ReturnType<typeof setInterval> = setInterval(poll, LIVE_STATUS_POLL_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(intervalId);
-    };
-  }, [instance.id]);
 
   const liveBranch: string | undefined = liveStatus?.available === true ? liveStatus.branch ?? undefined : undefined;
 

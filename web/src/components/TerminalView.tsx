@@ -1,8 +1,15 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal, type ITheme } from "@xterm/xterm";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
+import { btnGhost } from "../ui";
 import type { Instance } from "../types";
 import type { Theme } from "../theme";
+
+export interface TerminalViewHandle {
+  sendInput: (data: string) => void;
+  scrollToBottom: () => void;
+  blurTerminal: () => void;
+}
 
 const MIN_FONT_SIZE = 10;
 const MAX_FONT_SIZE = 18;
@@ -74,9 +81,86 @@ interface TerminalViewProps {
   visible: boolean;
   onPersistFontSize: (instanceId: string, fontSize: number) => void;
   theme: Theme;
+  // Mobile navigates into the terminal screen without the user having tapped inside
+  // the terminal itself; auto-focusing there would pop the native keyboard unprompted
+  focusOnVisible?: boolean;
+  onAtBottomChange?: (atBottom: boolean) => void;
 }
 
-export function TerminalView({ instance, visible, onPersistFontSize, theme }: TerminalViewProps) {
+const RECONNECT_DELAY_MS = 3_000;
+const RECONNECT_RING_RADIUS = 16;
+const RECONNECT_RING_CIRCUMFERENCE = 2 * Math.PI * RECONNECT_RING_RADIUS;
+
+function DisconnectedOverlay({
+  msRemaining,
+  totalMs,
+  onReconnect,
+}: {
+  msRemaining: number;
+  totalMs: number;
+  onReconnect: () => void;
+}) {
+  const progress: number = 1 - msRemaining / totalMs;
+  const secondsRemaining: number = Math.max(1, Math.ceil(msRemaining / 1000));
+
+  return (
+    <div className="absolute inset-0 flex items-center justify-center bg-app/80">
+      <div className="flex w-[280px] flex-col items-center gap-[14px] rounded-lg border border-border bg-surface p-[26px] shadow-modal">
+        <div className="relative flex h-[38px] w-[38px] items-center justify-center">
+          <svg viewBox="0 0 38 38" className="h-[38px] w-[38px] -rotate-90">
+            <circle
+              cx="19"
+              cy="19"
+              r={RECONNECT_RING_RADIUS}
+              fill="none"
+              stroke="var(--color-border-strong)"
+              strokeWidth="3"
+            />
+            <circle
+              cx="19"
+              cy="19"
+              r={RECONNECT_RING_RADIUS}
+              fill="none"
+              stroke="var(--color-accent)"
+              strokeWidth="3"
+              strokeLinecap="round"
+              strokeDasharray={RECONNECT_RING_CIRCUMFERENCE}
+              strokeDashoffset={RECONNECT_RING_CIRCUMFERENCE * (1 - progress)}
+            />
+          </svg>
+          <span className="absolute flex items-center justify-center text-accent">
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="h-[15px] w-[15px]"
+            >
+              <path d="M1 9a16 16 0 0 1 22 0M5 13a10.5 10.5 0 0 1 14 0M8.5 17a5.5 5.5 0 0 1 7 0" />
+              <line x1="12" y1="21" x2="12.01" y2="21" />
+            </svg>
+          </span>
+        </div>
+        <div className="flex flex-col items-center gap-[3px] text-center">
+          <span className="text-[13px] font-semibold text-txt-bright">Session disconnected</span>
+          <span className="text-[11.5px] tabular-nums text-txt-dim">
+            Retrying in <span className="font-semibold text-txt-secondary">{secondsRemaining}</span> seconds...
+          </span>
+        </div>
+        <button type="button" onClick={onReconnect} className={`${btnGhost} px-[14px] py-[6px] text-[11.5px]`}>
+          Reconnect now
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(function TerminalView(
+  { instance, visible, onPersistFontSize, theme, focusOnVisible = true, onAtBottomChange },
+  forwardedRef
+) {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -84,7 +168,25 @@ export function TerminalView({ instance, visible, onPersistFontSize, theme }: Te
   const persistTimerRef = useRef<number | null>(null);
   const [fontSize, setFontSize] = useState<number>(instance.fontSize);
   const [disconnected, setDisconnected] = useState<boolean>(false);
+  const [reconnectMsRemaining, setReconnectMsRemaining] = useState<number>(RECONNECT_DELAY_MS);
   const [connectionEpoch, setConnectionEpoch] = useState<number>(0);
+  const onAtBottomChangeRef = useRef(onAtBottomChange);
+  onAtBottomChangeRef.current = onAtBottomChange;
+
+  useImperativeHandle(
+    forwardedRef,
+    () => ({
+      sendInput: (data: string) => {
+        const socket = socketRef.current;
+        if (socket !== null && socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: "input", data }));
+        }
+      },
+      scrollToBottom: () => terminalRef.current?.scrollToBottom(),
+      blurTerminal: () => terminalRef.current?.blur(),
+    }),
+    []
+  );
 
   const safeFit = useCallback((): void => {
     const container = containerRef.current;
@@ -186,6 +288,11 @@ export function TerminalView({ instance, visible, onPersistFontSize, theme }: Te
       return true;
     });
 
+    terminal.onScroll(() => {
+      const buffer = terminal.buffer.active;
+      onAtBottomChangeRef.current?.(buffer.viewportY >= buffer.baseY);
+    });
+
     const resizeObserver = new ResizeObserver(() => safeFit());
     resizeObserver.observe(container);
 
@@ -230,11 +337,28 @@ export function TerminalView({ instance, visible, onPersistFontSize, theme }: Te
         terminalRef.current?.write(event.data);
       }
     };
-    socket.onclose = () => setDisconnected(true);
+    // A real disconnect (server restart from tsx watch, self-update, etc.) keeps retrying
+    // every RECONNECT_DELAY_MS instead of stranding the user on the manual Reconnect button
+    let reconnectTimeoutId: number | undefined;
+    let reconnectCountdownIntervalId: number | undefined;
+    socket.onclose = () => {
+      setDisconnected(true);
+      const retryStartedAt: number = Date.now();
+      setReconnectMsRemaining(RECONNECT_DELAY_MS);
+      reconnectCountdownIntervalId = window.setInterval(() => {
+        setReconnectMsRemaining(Math.max(0, RECONNECT_DELAY_MS - (Date.now() - retryStartedAt)));
+      }, 100);
+      reconnectTimeoutId = window.setTimeout(() => {
+        window.clearInterval(reconnectCountdownIntervalId);
+        setConnectionEpoch((previousEpoch) => previousEpoch + 1);
+      }, RECONNECT_DELAY_MS);
+    };
 
     return () => {
       socket.onclose = null;
       socket.close();
+      window.clearTimeout(reconnectTimeoutId);
+      window.clearInterval(reconnectCountdownIntervalId);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectionEpoch, instance.id]);
@@ -255,11 +379,13 @@ export function TerminalView({ instance, visible, onPersistFontSize, theme }: Te
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
           safeFit();
-          terminalRef.current?.focus();
+          if (focusOnVisible) {
+            terminalRef.current?.focus();
+          }
         });
       });
     }
-  }, [visible, safeFit]);
+  }, [visible, safeFit, focusOnVisible]);
 
   const reconnect = (): void => {
     terminalRef.current?.reset();
@@ -271,18 +397,11 @@ export function TerminalView({ instance, visible, onPersistFontSize, theme }: Te
       <div className="relative flex-1 min-h-0 px-[22px] pt-[16px]">
         <div ref={containerRef} className="h-full w-full" />
         {disconnected && (
-          <div className="absolute inset-0 flex items-center justify-center bg-app/80">
-            <div className="flex flex-col items-center gap-3">
-              <span className="text-[13px] text-txt-dim">Session disconnected</span>
-              <button
-                type="button"
-                onClick={reconnect}
-                className="rounded-[6px] bg-accent px-[18px] py-[9px] text-[12.5px] font-semibold text-on-accent"
-              >
-                Reconnect
-              </button>
-            </div>
-          </div>
+          <DisconnectedOverlay
+            msRemaining={reconnectMsRemaining}
+            totalMs={RECONNECT_DELAY_MS}
+            onReconnect={reconnect}
+          />
         )}
         <div className="absolute bottom-[10px] right-[26px] flex gap-[6px]">
           <button
@@ -318,4 +437,6 @@ export function TerminalView({ instance, visible, onPersistFontSize, theme }: Te
       </div>
     </div>
   );
-}
+});
+
+TerminalView.displayName = "TerminalView";

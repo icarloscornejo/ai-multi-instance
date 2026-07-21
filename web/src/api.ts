@@ -19,11 +19,22 @@ export class ApiError extends Error {
   }
 }
 
+// App.tsx registers this once at startup so any request (not just the initial load) can
+// flip the app into the password-gate screen the moment the auth cookie is missing/expired
+let onUnauthorized: (() => void) | null = null;
+
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  onUnauthorized = handler;
+}
+
 async function requestJson<T>(url: string, options: RequestInit = {}): Promise<T> {
   const response: Response = await fetch(url, {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
+  if (response.status === 401 && !url.endsWith("/auth/login")) {
+    onUnauthorized?.();
+  }
   if (response.status === 204) {
     return undefined as T;
   }
@@ -35,6 +46,9 @@ async function requestJson<T>(url: string, options: RequestInit = {}): Promise<T
 }
 
 export const api = {
+  login: (password: string): Promise<{ ok: boolean }> =>
+    requestJson("/api/auth/login", { method: "POST", body: JSON.stringify({ password }) }),
+
   getConfig: (): Promise<DashboardConfig> => requestJson("/api/config"),
 
   getUpdateStatus: (): Promise<UpdateStatus> => requestJson("/api/update-status"),

@@ -17,14 +17,25 @@ import { restrictToVerticalAxis } from "@dnd-kit/modifiers";
 import { CSS } from "@dnd-kit/utilities";
 import { api, ApiError } from "../api";
 import { PROVIDER_OPTIONS } from "../providerOptions";
+import type { ThemePreference } from "../theme";
 import type { AgentProvider, DashboardConfig } from "../types";
 import { btnGhost, btnOutline, btnPrimary, cardClassName, errorTextClassName, inputClassName, inputErrorClassName } from "../ui";
+
+const THEME_OPTIONS: { value: ThemePreference; label: string }[] = [
+  { value: "light", label: "Light" },
+  { value: "dark", label: "Dark" },
+  { value: "system", label: "System" },
+];
 
 interface SetupScreenProps {
   initialLocations?: string[];
   initialEnabledProviders?: AgentProvider[];
   onConfigured: (config: DashboardConfig) => void;
   onClose?: () => void;
+  // Only the mobile Settings screen shows this (Decision D): the desktop toggle stays binary
+  showThemePicker?: boolean;
+  themePreference?: ThemePreference;
+  onThemePreferenceChange?: (preference: ThemePreference) => void;
 }
 
 interface LocationRow {
@@ -91,7 +102,15 @@ function SortableRow({ row, errorText, onChange, onRemove, onEnter, autoFocus }:
   );
 }
 
-export function SetupScreen({ initialLocations, initialEnabledProviders, onConfigured, onClose }: SetupScreenProps) {
+export function SetupScreen({
+  initialLocations,
+  initialEnabledProviders,
+  onConfigured,
+  onClose,
+  showThemePicker = false,
+  themePreference,
+  onThemePreferenceChange,
+}: SetupScreenProps) {
   const [locations, setLocations] = useState<LocationRow[]>(() => rowsFromInitial(initialLocations));
   const [existsMap, setExistsMap] = useState<Record<string, boolean>>({});
   const [enabledProviders, setEnabledProviders] = useState<AgentProvider[]>(
@@ -187,8 +206,8 @@ export function SetupScreen({ initialLocations, initialEnabledProviders, onConfi
 
   if (locations.length === 0) {
     return (
-      <div className="flex h-screen items-center justify-center">
-        <div className="flex w-[480px] flex-col items-center gap-[10px] rounded-lg border border-dashed border-border-strong p-[32px] text-center">
+      <div className="flex h-screen items-center justify-center px-[16px]">
+        <div className="flex w-full max-w-[480px] flex-col items-center gap-[10px] rounded-lg border border-dashed border-border-strong p-[32px] text-center">
           <div className="flex h-[36px] w-[36px] items-center justify-center rounded-sm border border-border-strong text-[16px] text-txt-dim">
             +
           </div>
@@ -205,8 +224,8 @@ export function SetupScreen({ initialLocations, initialEnabledProviders, onConfi
   }
 
   return (
-    <div className="flex h-screen items-center justify-center">
-      <div className={`w-[520px] ${cardClassName}`}>
+    <div className="flex h-screen items-center justify-center px-[16px]">
+      <div className={`w-full max-w-[520px] max-h-[90vh] overflow-y-auto ${cardClassName}`}>
         <div className="flex flex-col gap-[4px]">
           <h1 className="text-[15px] font-bold text-txt-bright">Locations</h1>
           <p className="text-[12.5px] leading-[1.55] text-txt-secondary">
@@ -240,6 +259,28 @@ export function SetupScreen({ initialLocations, initialEnabledProviders, onConfi
         >
           + Add location
         </button>
+
+        {showThemePicker && themePreference !== undefined && onThemePreferenceChange !== undefined && (
+          <div className="flex flex-col gap-[8px] border-t border-border pt-[14px]">
+            <h2 className="text-[12.5px] font-semibold text-txt-bright">Appearance</h2>
+            <div className="flex gap-[4px] rounded-sm border border-border-strong bg-app p-[3px]">
+              {THEME_OPTIONS.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => onThemePreferenceChange(option.value)}
+                  className={`flex-1 rounded-sm py-[7px] text-[12px] font-semibold ${
+                    themePreference === option.value
+                      ? "bg-raised-2 text-txt-bright"
+                      : "text-txt-secondary hover:text-txt-body"
+                  }`}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div className="flex flex-col gap-[4px] border-t border-border pt-[14px]">
           <h2 className="text-[12.5px] font-semibold text-txt-bright">Agents</h2>
