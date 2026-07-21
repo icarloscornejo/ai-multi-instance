@@ -156,6 +156,19 @@ export function TabBar({
   const editInputRef = useRef<HTMLInputElement>(null);
   const updateContainerRef = useRef<HTMLDivElement>(null);
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
+  // Tracks which remote commit we already auto-opened the popover for, so a poll refresh
+  // (or the user re-dismissing with Later) does not keep popping it back up on its own
+  const autoShownForCommitRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (updateRequired || updateStatus?.updateAvailable !== true || updateStatus.remoteCommit === null) {
+      return;
+    }
+    if (autoShownForCommitRef.current !== updateStatus.remoteCommit) {
+      autoShownForCommitRef.current = updateStatus.remoteCommit;
+      setPopoverOpen(true);
+    }
+  }, [updateRequired, updateStatus]);
 
   useEffect(() => {
     if (!popoverOpen) {
