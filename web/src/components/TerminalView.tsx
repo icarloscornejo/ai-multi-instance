@@ -1,4 +1,5 @@
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { getHostFontSize, setHostFontSize } from "../hostPrefs";
@@ -84,6 +85,68 @@ const RECONNECT_DELAY_MS = 3_000;
 const RECONNECT_RING_RADIUS = 16;
 const RECONNECT_RING_CIRCUMFERENCE = 2 * Math.PI * RECONNECT_RING_RADIUS;
 
+// tmux's mouse mode puts xterm's own touch-scroll to sleep (it only runs when
+// no mouse tracking is active) and attach runs tmux in the alt screen anyway, so
+// xterm's normal scrollback is empty regardless. Instead we translate swipes into
+// synthetic wheel events on xterm's element: its existing wheel handler already
+// encodes them with whatever mouse protocol tmux requested, and tmux's WheelPane
+// binding (see reduceScrollStep in server/src/tmux.ts) enters copy-mode and scrolls
+// 3 lines per tick, so we accumulate drag distance in 3-line steps to track the finger.
+const SYNTHETIC_WHEEL_TICK_LINES = 3;
+
+// Ticks are paced by ack instead of a fixed timer: the next tick is only dispatched once
+// the previous one's redraw has actually landed (see the ack machinery above the touch
+// listeners in TerminalView), so the client never queues up more redraws than the real
+// round trip can clear regardless of link latency (localhost, LAN, or the Cloudflare
+// tunnel all self-adjust). If an ack never arrives (e.g. the tick didn't change anything
+// because scrollback is already at an edge), this timeout unblocks the next tick instead
+// of stalling the gesture forever.
+const ACK_TIMEOUT_MS = 90;
+// Floor for momentum's own re-check cadence while coasting after the finger lifts (there
+// is no touchmove to drive it, so it must re-arm itself); NOT a wire-pacing interval.
+const MOMENTUM_TICK_INTERVAL_MS = 20;
+// Per-momentum-tick decay applied to the release velocity while coasting; ~50 ticks/sec
+// (1000 / MOMENTUM_TICK_INTERVAL_MS) at 0.95 decays to a stop in a bit over a second, so
+// the coast reads as a gradual ease-out instead of stopping short right after the finger
+// lifts.
+const MOMENTUM_DECAY_PER_TICK = 0.95;
+const MOMENTUM_MIN_VELOCITY_PX_PER_MS = 0.02;
+
+// A landed tick has already jumped the content by a full 3-line step; instead of showing
+// that step as a snap, we offset the container back by that same amount right as it lands
+// and animate the offset to 0, so the eye reads a slide instead of a jump. The duration is
+// a running average of the real interval between acks (see slideIntervalEmaMs below) so
+// each slide finishes roughly when the next step's data is expected, clamped so a single
+// slow or fast outlier reading can't produce a slide that's imperceptibly short or drags
+// on well past the next step.
+const SLIDE_MIN_DURATION_MS = 60;
+const SLIDE_MAX_DURATION_MS = ACK_TIMEOUT_MS + 40;
+const SLIDE_INTERVAL_EMA_ALPHA = 0.3;
+// 1-line fine ticks (see FINE_SCROLL_VELOCITY_PX_PER_MS below) cost the same full-pane
+// round trip as a 3-line tick, so covering the same distance takes 3x as many round trips.
+// Clamping their slide to the same ceiling as a 3-line tick means the animation finishes
+// before the real redraw lands whenever a round trip runs long, leaving a frozen frame
+// until the next one arrives, which reads as the swipe losing and regaining momentum. A
+// wider ceiling here lets the slide track the real round trip instead of stopping short.
+const FINE_SLIDE_MAX_DURATION_MS = ACK_TIMEOUT_MS + 160;
+
+// Below this velocity the coast is in its slow tail, where a 3-line jump is most visible
+// and message frequency is naturally low, so the traffic cost this app avoided by keeping
+// the server-side wheel bind at 3 lines (see reduceScrollStep in server/src/tmux.ts)
+// doesn't apply here. Only reachable during momentum (after the finger has lifted), never
+// during an active drag.
+const FINE_SCROLL_VELOCITY_PX_PER_MS = 0.15;
+// tmux's copy-mode-vi key table binds C-y/C-e to a 1-line scroll-up/scroll-down; that
+// table (reduceScrollStep only rebinds the 3-line WheelPane entries, these are untouched)
+// is only active while mode-keys is "vi", which this app never sets itself, it's whatever
+// the host's tmux config has. If mode-keys were ever "emacs" here, C-e resolves to
+// end-of-line in that table instead of scroll. To stay safe without reading tmux options
+// from the client, this is only sent once a wheel tick has already landed a real ack this
+// gesture (hasAckedThisGesture below), which is only possible from inside copy-mode,
+// never speculatively.
+const FINE_SCROLL_UP_BYTES = "\u0019"; // C-y
+const FINE_SCROLL_DOWN_BYTES = "\u0005"; // C-e
+
 function DisconnectedOverlay({
   msRemaining,
   totalMs,
@@ -165,6 +228,10 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   const [connectionEpoch, setConnectionEpoch] = useState<number>(0);
   const onAtBottomChangeRef = useRef(onAtBottomChange);
   onAtBottomChangeRef.current = onAtBottomChange;
+  const touchScrollRef = useRef<{ lastClientY: number; accumulatedPx: number; released: boolean } | null>(null);
+  // Set by the WS message handler's terminal.write() callback once a write has actually
+  // been parsed; read by the touch-scroll ack gate in the terminal-creation effect below.
+  const writeCommittedForAckRef = useRef<boolean>(false);
 
   useImperativeHandle(
     forwardedRef,
@@ -241,6 +308,19 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     terminalRef.current = terminal;
     fitAddonRef.current = fitAddon;
 
+    // DOM renderer repaints the whole pane's DOM nodes on every redraw; on mobile that's
+    // the single most expensive step in the touch-scroll round trip. WebGL renders to a
+    // canvas instead, which is cheap enough that it stops being the bottleneck. Falls back
+    // to the DOM renderer (xterm's default) if WebGL is unavailable or the context is lost,
+    // since it's the addon crashing/degrading, not something the terminal can't run without.
+    try {
+      const webglAddon = new WebglAddon();
+      webglAddon.onContextLoss(() => webglAddon.dispose());
+      terminal.loadAddon(webglAddon);
+    } catch {
+      // no WebGL support; xterm keeps using its default DOM renderer
+    }
+
     // Force the font to load and re-fit once it is ready (font-display: swap
     // may take a moment to resolve JetBrains Mono on first use).
     document.fonts
@@ -285,16 +365,274 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       onAtBottomChangeRef.current?.(buffer.viewportY >= buffer.baseY);
     });
 
+    // xterm's built-in touch-scroll only runs when no mouse tracking is active, so with
+    // tmux's mouse mode on (see SYNTHETIC_WHEEL_TICK_LINES above) it never fires; we
+    // synthesize the wheel events ourselves from the raw swipe instead.
+    //
+    // Ticks are paced by ack rather than fired synchronously inside touchmove: each tick
+    // makes tmux redraw the whole pane over the WebSocket, and a fast swipe can accumulate
+    // many lines' worth in a single touchmove callback. Firing them all at once queues up
+    // more redraws than the round trip can clear, so the screen visibly falls behind and
+    // then catches up in a stutter, which is what reads as not smooth, more than the
+    // line-jump size itself. Keeping exactly one redraw in flight, waiting for this tick's
+    // ack before sending the next, self-adjusts to the real round trip instead of guessing
+    // a fixed interval, and lets the tail continue to coast after the finger lifts
+    // (momentum), instead of stopping dead.
+    //
+    // "Ack" means the render that resulted from this tick's data actually landing. Two
+    // gates, both required: (1) writeCommittedForAckRef flips true only once
+    // terminal.write() has parsed the bytes from a socket message following this tick
+    // (armed fresh per tick), and (2) the onRender range below has to cover more than just
+    // the cursor's row, since cursorBlink also fires onRender and would otherwise ack
+    // instantly for the wrong reason. A safety timeout unblocks the gesture if a tick
+    // doesn't change anything (e.g. scrollback is already at an edge) and so never
+    // triggers a real redraw.
+    let dragVelocityPxPerMs = 0;
+    let lastMoveTimestamp = 0;
+    let lastMomentumTimestamp = 0;
+    let awaitingAck = false;
+    let ackTimeoutId: number | null = null;
+    let momentumTimeoutId: number | null = null;
+    // Signed px of the tick currently in flight (direction * tickPx), consumed once its
+    // ack lands to know which way and how far to slide the visual compensation from.
+    let pendingSlideOffsetPx = 0;
+    let pendingSlideWasFine = false;
+    let lastAckLandTimestamp = 0;
+    let slideIntervalEmaMs = SLIDE_MIN_DURATION_MS;
+    // Flips true the first time a real ack (not a timeout) lands for this gesture, which
+    // is only possible from inside copy-mode; gates the 1-line C-y/C-e fine-scroll path.
+    let hasAckedThisGesture = false;
+
+    const clearTimers = (): void => {
+      if (ackTimeoutId !== null) {
+        window.clearTimeout(ackTimeoutId);
+        ackTimeoutId = null;
+      }
+      if (momentumTimeoutId !== null) {
+        window.clearTimeout(momentumTimeoutId);
+        momentumTimeoutId = null;
+      }
+    };
+
+    const resetSlideTransform = (): void => {
+      container.style.transition = "none";
+      container.style.transform = "";
+      lastAckLandTimestamp = 0;
+      slideIntervalEmaMs = SLIDE_MIN_DURATION_MS;
+    };
+
+    const playSlideCompensation = (): void => {
+      const now: number = performance.now();
+      if (lastAckLandTimestamp !== 0) {
+        const observedIntervalMs: number = now - lastAckLandTimestamp;
+        slideIntervalEmaMs =
+          slideIntervalEmaMs * (1 - SLIDE_INTERVAL_EMA_ALPHA) + observedIntervalMs * SLIDE_INTERVAL_EMA_ALPHA;
+      }
+      lastAckLandTimestamp = now;
+
+      if (pendingSlideOffsetPx === 0) {
+        return;
+      }
+      const maxDurationMs: number = pendingSlideWasFine ? FINE_SLIDE_MAX_DURATION_MS : SLIDE_MAX_DURATION_MS;
+      const durationMs: number = Math.min(maxDurationMs, Math.max(SLIDE_MIN_DURATION_MS, slideIntervalEmaMs));
+      container.style.transition = "none";
+      container.style.transform = `translateY(${pendingSlideOffsetPx}px)`;
+      // Force a layout flush so the jump above is committed before the transition below
+      // is applied; otherwise the browser may coalesce both style writes into one frame
+      // and skip straight to the animated end state.
+      void container.offsetHeight;
+      container.style.transition = `transform ${durationMs}ms linear`;
+      container.style.transform = "translateY(0px)";
+      pendingSlideOffsetPx = 0;
+    };
+
+    const stopDraining = (): void => {
+      clearTimers();
+      awaitingAck = false;
+      touchScrollRef.current = null;
+      resetSlideTransform();
+    };
+
+    const attemptDispatch = (): void => {
+      if (awaitingAck) {
+        return;
+      }
+      const activeTerminal = terminalRef.current;
+      const touchState = touchScrollRef.current;
+      if (activeTerminal === null || touchState === null) {
+        stopDraining();
+        return;
+      }
+
+      if (touchState.released) {
+        const now: number = performance.now();
+        const elapsedMs: number = lastMomentumTimestamp === 0 ? 0 : now - lastMomentumTimestamp;
+        lastMomentumTimestamp = now;
+        if (Math.abs(dragVelocityPxPerMs) < MOMENTUM_MIN_VELOCITY_PX_PER_MS) {
+          stopDraining();
+          return;
+        }
+        touchState.accumulatedPx += dragVelocityPxPerMs * elapsedMs;
+        dragVelocityPxPerMs *= MOMENTUM_DECAY_PER_TICK;
+      }
+
+      const lineHeightPx: number = container.clientHeight / Math.max(1, activeTerminal.rows);
+      // Once this gesture has already proven copy-mode is active (a prior tick landed a
+      // real ack) and the coast has slowed into its tail, switch to 1-line raw key sends
+      // instead of 3-line synthetic wheel ticks (see FINE_SCROLL_VELOCITY_PX_PER_MS above).
+      const useFineScroll: boolean =
+        touchState.released && hasAckedThisGesture && Math.abs(dragVelocityPxPerMs) < FINE_SCROLL_VELOCITY_PX_PER_MS;
+      const tickLines: number = useFineScroll ? 1 : SYNTHETIC_WHEEL_TICK_LINES;
+      const tickPx: number = tickLines * lineHeightPx;
+      if (Math.abs(touchState.accumulatedPx) < tickPx) {
+        // Nothing to send yet. While coasting there is no touchmove to drive the next
+        // attempt, so re-arm ourselves; an active finger drag calls back in via
+        // handleTouchMove instead.
+        if (touchState.released) {
+          momentumTimeoutId = window.setTimeout(attemptDispatch, MOMENTUM_TICK_INTERVAL_MS);
+        }
+        return;
+      }
+
+      const direction: number = Math.sign(touchState.accumulatedPx);
+      touchState.accumulatedPx -= direction * tickPx;
+      pendingSlideOffsetPx = direction * tickPx;
+      pendingSlideWasFine = useFineScroll;
+      writeCommittedForAckRef.current = false;
+      if (useFineScroll) {
+        const socket = socketRef.current;
+        if (socket !== null && socket.readyState === WebSocket.OPEN) {
+          socket.send(
+            JSON.stringify({ type: "input", data: direction > 0 ? FINE_SCROLL_DOWN_BYTES : FINE_SCROLL_UP_BYTES })
+          );
+        }
+      } else {
+        activeTerminal.element?.dispatchEvent(
+          new WheelEvent("wheel", {
+            deltaY: direction * tickPx,
+            deltaMode: WheelEvent.DOM_DELTA_PIXEL,
+            bubbles: true,
+            cancelable: true,
+          })
+        );
+      }
+      awaitingAck = true;
+      ackTimeoutId = window.setTimeout(() => {
+        ackTimeoutId = null;
+        awaitingAck = false;
+        // No real redraw landed for this tick (e.g. scrollback was already at an edge),
+        // so there is nothing to visually compensate for; drop it rather than letting the
+        // next real ack apply a jump-and-slide offset for a step that never happened.
+        pendingSlideOffsetPx = 0;
+        attemptDispatch();
+      }, ACK_TIMEOUT_MS);
+    };
+
+    terminal.onRender(({ start, end }: { start: number; end: number }) => {
+      if (!awaitingAck || !writeCommittedForAckRef.current) {
+        return;
+      }
+      const cursorRow: number = terminal.buffer.active.cursorY;
+      const isCursorBlinkOnly: boolean = start === end && start === cursorRow;
+      if (isCursorBlinkOnly) {
+        return;
+      }
+      if (ackTimeoutId !== null) {
+        window.clearTimeout(ackTimeoutId);
+        ackTimeoutId = null;
+      }
+      awaitingAck = false;
+      hasAckedThisGesture = true;
+      playSlideCompensation();
+      attemptDispatch();
+    });
+
+    const handleTouchStart = (event: TouchEvent): void => {
+      if (event.touches.length !== 1) {
+        stopDraining();
+        return;
+      }
+      clearTimers();
+      awaitingAck = false;
+      hasAckedThisGesture = false;
+      pendingSlideOffsetPx = 0;
+      resetSlideTransform();
+      touchScrollRef.current = { lastClientY: event.touches[0].clientY, accumulatedPx: 0, released: false };
+      dragVelocityPxPerMs = 0;
+      lastMoveTimestamp = event.timeStamp;
+      lastMomentumTimestamp = 0;
+    };
+
+    const handleTouchMove = (event: TouchEvent): void => {
+      const activeTerminal = terminalRef.current;
+      const touchState = touchScrollRef.current;
+      if (
+        activeTerminal === null ||
+        touchState === null ||
+        activeTerminal.modes.mouseTrackingMode === "none" ||
+        event.touches.length !== 1
+      ) {
+        return;
+      }
+      // Without this the browser treats the gesture as unhandled and falls back to
+      // native pull-to-refresh/rubber-banding once it reaches the top.
+      event.preventDefault();
+      const currentClientY: number = event.touches[0].clientY;
+      const movedPx: number = touchState.lastClientY - currentClientY;
+      const elapsedMs: number = Math.max(1, event.timeStamp - lastMoveTimestamp);
+      dragVelocityPxPerMs = movedPx / elapsedMs;
+      lastMoveTimestamp = event.timeStamp;
+      touchState.lastClientY = currentClientY;
+      touchState.accumulatedPx += movedPx;
+
+      attemptDispatch();
+    };
+
+    const handleTouchRelease = (event: TouchEvent): void => {
+      if (event.touches.length > 0) {
+        return;
+      }
+      const touchState = touchScrollRef.current;
+      if (touchState === null) {
+        return;
+      }
+      touchState.released = true;
+      if (Math.abs(dragVelocityPxPerMs) < MOMENTUM_MIN_VELOCITY_PX_PER_MS) {
+        stopDraining();
+        return;
+      }
+      lastMomentumTimestamp = performance.now();
+      attemptDispatch();
+    };
+
+    container.addEventListener("touchstart", handleTouchStart, { passive: true });
+    container.addEventListener("touchmove", handleTouchMove, { passive: false });
+    container.addEventListener("touchend", handleTouchRelease, { passive: true });
+    container.addEventListener("touchcancel", handleTouchRelease, { passive: true });
+
     const resizeObserver = new ResizeObserver(() => safeFit());
     resizeObserver.observe(container);
 
     return () => {
       resizeObserver.disconnect();
+      container.removeEventListener("touchstart", handleTouchStart);
+      container.removeEventListener("touchmove", handleTouchMove);
+      container.removeEventListener("touchend", handleTouchRelease);
+      container.removeEventListener("touchcancel", handleTouchRelease);
+      stopDraining();
       if (persistTimerRef.current !== null) {
         window.clearTimeout(persistTimerRef.current);
       }
       socketRef.current?.close();
-      terminal.dispose();
+      try {
+        terminal.dispose();
+      } catch {
+        // xterm-addon-webgl can throw from its own internal teardown if the WebGL
+        // context was already lost/disposed by the time terminal.dispose() reaches it
+        // (see onContextLoss above). The terminal is being torn down either way, and
+        // with no error boundary in this app an uncaught throw here crashes the whole
+        // React tree instead of just this component.
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -326,7 +664,9 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     };
     socket.onmessage = (event: MessageEvent) => {
       if (typeof event.data === "string") {
-        terminalRef.current?.write(event.data);
+        terminalRef.current?.write(event.data, () => {
+          writeCommittedForAckRef.current = true;
+        });
       }
     };
     // A real disconnect (server restart from tsx watch, self-update, etc.) keeps retrying
@@ -386,8 +726,12 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
 
   return (
     <div className={`flex-1 min-h-0 flex-col ${visible ? "flex" : "hidden"}`}>
-      <div className="relative flex-1 min-h-0 px-[6px] pt-[6px]">
-        <div ref={containerRef} className="h-full w-full" />
+      <div className="relative flex-1 min-h-0 overflow-hidden px-[6px] pt-[6px]">
+        <div
+          ref={containerRef}
+          className="h-full w-full"
+          style={{ touchAction: "none", willChange: "transform" }}
+        />
         {disconnected && (
           <DisconnectedOverlay
             msRemaining={reconnectMsRemaining}
