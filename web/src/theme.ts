@@ -14,7 +14,7 @@ export function getInitialThemePreference(): ThemePreference {
   if (storedPreference === "dark" || storedPreference === "light" || storedPreference === "system") {
     return storedPreference;
   }
-  return "dark";
+  return "light";
 }
 
 export function getInitialTheme(): Theme {

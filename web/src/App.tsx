@@ -82,6 +82,20 @@ export function App() {
     return () => setUnauthorizedHandler(null);
   }, []);
 
+  // Mobile back-navigation out of a terminal (history.back()) can land the browser on a
+  // bfcache snapshot of this same page frozen from before the post-login reload, replaying
+  // stale in-memory state (e.g. the gate still open) instead of the live one. Forcing a real
+  // reload on restore is the standard fix: it's exactly what a manual refresh already does.
+  useEffect(() => {
+    const handlePageShow = (event: PageTransitionEvent): void => {
+      if (event.persisted) {
+        window.location.reload();
+      }
+    };
+    window.addEventListener("pageshow", handlePageShow);
+    return () => window.removeEventListener("pageshow", handlePageShow);
+  }, []);
+
   // The server briefly drops off (tsx watch restarts it) while an update is applying,
   // so a failed initial load keeps retrying instead of stranding the user on a dead end
   useEffect(() => {
@@ -450,7 +464,7 @@ export function App() {
                 instance={instance}
                 visible={instance.id === activeInstanceId}
                 theme={theme}
-                focusOnVisible={!isMobile || mobileScreen === "terminal"}
+                focusOnVisible={!isMobile}
                 onAtBottomChange={instance.id === activeInstanceId ? setActiveAtBottom : undefined}
               />
             ))

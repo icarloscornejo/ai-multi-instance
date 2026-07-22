@@ -6,11 +6,24 @@
     <link rel="icon" type="image/svg+xml" href="/ai-multi-instance.svg" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
-    <meta name="theme-color" content="#1c1b1a" />
+    <meta name="theme-color" content="#f7f6f5" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="Multi-Instance" />
     <title>AI Multi-Instance</title>
+    <script>
+      // Applies the theme class before first paint so new visitors (light is now the
+      // default, see theme.ts) don't see a flash of the dark palette while React mounts.
+      (function () {
+        var stored = localStorage.getItem("ccdash.theme");
+        var isDark =
+          stored === "dark" ||
+          (stored === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+        if (!isDark) {
+          document.documentElement.classList.add("light");
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
