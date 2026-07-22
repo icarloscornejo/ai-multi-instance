@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useState } from "react";
 import { api } from "../api";
 import type { LocationInfo } from "../types";
+import { CleanupBranchesModal } from "./CleanupBranchesModal";
 import { Modal } from "./Modal";
 import { btnGhost, btnPrimary, inputClassName } from "../ui";
 
@@ -47,6 +48,7 @@ export function BranchSearchModal({ locations, onSelect, onClose }: ChooseSource
   const [entries, setEntries] = useState<LocationEntry[] | null>(null);
   const [creatingIn, setCreatingIn] = useState<string | null>(null);
   const [createBaseBranch, setCreateBaseBranch] = useState<string>("");
+  const [cleanupLocation, setCleanupLocation] = useState<LocationInfo | null>(null);
 
   useEffect(() => {
     let disposed: boolean = false;
@@ -82,6 +84,25 @@ export function BranchSearchModal({ locations, onSelect, onClose }: ChooseSource
   const selectNonGit = (location: LocationInfo): void => {
     onSelect({ location, branch: null, currentBranch: null, isGitRepo: false });
     onClose();
+  };
+
+  const refreshEntry = (locationPath: string): void => {
+    api
+      .getLocationBranches(locationPath)
+      .then((info) => {
+        setEntries((current) =>
+          current === null
+            ? current
+            : current.map((entry) =>
+                entry.location.path === locationPath
+                  ? { ...entry, isGitRepo: info.isGitRepo, branches: info.branches, currentBranch: info.currentBranch }
+                  : entry
+              )
+        );
+      })
+      .catch(() => {
+        // Keep showing the stale list rather than clearing it on a transient error
+      });
   };
 
   const openCreateRow = (entry: LocationEntry): void => {
@@ -125,6 +146,7 @@ export function BranchSearchModal({ locations, onSelect, onClose }: ChooseSource
   });
 
   return (
+    <>
     <Modal title="Choose source" onClose={onClose} widthClassName="w-[560px]">
       <div className="relative">
         <svg
@@ -161,14 +183,23 @@ export function BranchSearchModal({ locations, onSelect, onClose }: ChooseSource
             <Fragment key={entry.location.path}>
               {entry.isGitRepo ? (
                 <>
-                  <button
-                    type="button"
-                    onClick={() => selectBranch(entry.location, entry.currentBranch ?? entry.branches[0], entry.currentBranch)}
-                    disabled={entry.currentBranch === null && entry.branches.length === 0}
-                    className="flex w-full items-center gap-[5px] rounded-[5px] px-[8px] pb-[2px] pt-[6px] text-left text-[11px] font-bold text-txt-secondary hover:bg-accent-dim hover:text-txt-bright disabled:cursor-default disabled:hover:bg-transparent disabled:hover:text-txt-secondary"
-                  >
-                    ▾ {entry.location.folderName}
-                  </button>
+                  <div className="flex w-full items-center justify-between gap-[8px]">
+                    <button
+                      type="button"
+                      onClick={() => selectBranch(entry.location, entry.currentBranch ?? entry.branches[0], entry.currentBranch)}
+                      disabled={entry.currentBranch === null && entry.branches.length === 0}
+                      className="flex flex-1 items-center gap-[5px] rounded-[5px] px-[8px] pb-[2px] pt-[6px] text-left text-[11px] font-bold text-txt-secondary hover:bg-accent-dim hover:text-txt-bright disabled:cursor-default disabled:hover:bg-transparent disabled:hover:text-txt-secondary"
+                    >
+                      ▾ {entry.location.folderName}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setCleanupLocation(entry.location)}
+                      className="shrink-0 whitespace-nowrap rounded-full px-[8px] py-[2px] text-[9.5px] font-bold uppercase tracking-[.03em] text-txt-dimmer hover:bg-raised-2 hover:text-txt-bright"
+                    >
+                      Clean up
+                    </button>
+                  </div>
                   {(trimmedSearch === "" ? entry.branches : entry.matchingBranches).map((branch) => {
                     const isCurrent: boolean = branch === entry.currentBranch;
                     return (
@@ -284,6 +315,15 @@ export function BranchSearchModal({ locations, onSelect, onClose }: ChooseSource
         </button>
       </div>
     </Modal>
+
+    {cleanupLocation !== null && (
+      <CleanupBranchesModal
+        location={cleanupLocation}
+        onClose={() => setCleanupLocation(null)}
+        onDeleted={() => refreshEntry(cleanupLocation.path)}
+      />
+    )}
+    </>
   );
 }
 

@@ -17,6 +17,9 @@ import type {
   CreateInstancePayload,
   DashboardState,
   InstanceRecord,
+  SkippedBranchReason,
+  StaleBranchesResponse,
+  StaleBranchReason,
   UpdateInstancePayload,
 } from "./types";
 
@@ -79,6 +82,171 @@ async function localBranches(cwd: string): Promise<string[]> {
     .split("\n")
     .map((branch) => branch.trim())
     .filter((branch) => branch !== "");
+}
+
+// Long-lived branches: never candidates for deletion, and kept in sync with origin
+// before a cleanup scan, even if a repo has several of them (e.g. main AND develop).
+const PROTECTED_BRANCH_NAMES: string[] = ["main", "master", "develop", "dev"];
+
+function isProtectedBranchName(branch: string): boolean {
+  return PROTECTED_BRANCH_NAMES.includes(branch);
+}
+
+// Prefers the remote's default branch (what "origin/HEAD" points to); falls back to the
+// first common name that exists locally, since not every repo has a remote configured.
+async function detectBaseBranch(cwd: string, branches: string[]): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync("git", ["-C", cwd, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"]);
+    const remoteDefault: string = stdout.trim().replace(/^origin\//, "");
+    if (remoteDefault !== "" && branches.includes(remoteDefault)) {
+      return remoteDefault;
+    }
+  } catch {
+    // No origin remote, or origin/HEAD isn't set locally (git remote set-head was never run)
+  }
+  return PROTECTED_BRANCH_NAMES.find((candidate) => branches.includes(candidate)) ?? null;
+}
+
+// Fast-forwards every protected branch present locally from its origin counterpart, so a
+// cleanup scan compares against up-to-date main/develop/etc. instead of a stale local copy.
+// Mirrors the fetch/ff-only logic already used when creating an instance off a base branch.
+async function updateProtectedBranches(cwd: string, branches: string[], current: string | null): Promise<string[]> {
+  const synced: string[] = [];
+  for (const branch of branches.filter(isProtectedBranchName)) {
+    try {
+      if (branch === current) {
+        // Checked out here: fast-forward it in place, never overwrite local commits
+        await execFileAsync("git", ["-C", cwd, "fetch", "origin", branch]);
+        await execFileAsync("git", ["-C", cwd, "merge", "--ff-only", `origin/${branch}`]);
+      } else {
+        // Not checked out: update its ref directly. A plain (non "+") refspec is
+        // fast-forward-only, git refuses on its own if the local branch has diverged
+        // or is checked out in another worktree
+        await execFileAsync("git", ["-C", cwd, "fetch", "origin", `${branch}:${branch}`]);
+      }
+      synced.push(branch);
+    } catch {
+      // No origin remote, no matching remote branch, diverged locally, or checked out
+      // in another worktree: leave the local branch untouched rather than fail the scan
+    }
+  }
+  return synced;
+}
+
+// Branches checked out in *other* worktrees of this repo (the primary worktree, cwd
+// itself, is excluded: its checked-out branch is handled like any other candidate, not
+// specially skipped, so that a merged branch you happen to be sitting on can still be
+// cleaned up).
+async function branchesCheckedOutInWorktrees(cwd: string): Promise<Set<string>> {
+  const { stdout } = await execFileAsync("git", ["-C", cwd, "worktree", "list", "--porcelain"]);
+  const resolvedCwd: string = path.resolve(cwd);
+  const branches: Set<string> = new Set();
+  let currentWorktreePath: string | null = null;
+  for (const line of stdout.split("\n")) {
+    const worktreeMatch: RegExpMatchArray | null = line.match(/^worktree (.+)$/);
+    if (worktreeMatch) {
+      currentWorktreePath = worktreeMatch[1];
+      continue;
+    }
+    const branchMatch: RegExpMatchArray | null = line.match(/^branch refs\/heads\/(.+)$/);
+    if (branchMatch && currentWorktreePath !== null && path.resolve(currentWorktreePath) !== resolvedCwd) {
+      branches.add(branchMatch[1]);
+    }
+  }
+  return branches;
+}
+
+async function mergedBranches(cwd: string, baseBranch: string): Promise<Set<string>> {
+  const { stdout } = await execFileAsync("git", [
+    "-C",
+    cwd,
+    "for-each-ref",
+    "--merged",
+    baseBranch,
+    "--format=%(refname:short)",
+    "refs/heads",
+  ]);
+  return new Set(
+    stdout
+      .split("\n")
+      .map((branch) => branch.trim())
+      .filter((branch) => branch !== "")
+  );
+}
+
+// Detects branches merged via GitHub/GitLab "squash and merge", which git's own --merged
+// check misses because the squash commit's tree matches the base but its parent doesn't.
+// Technique: replay the branch's tree on top of its merge-base with the base branch, then
+// ask `git cherry` whether that patch is already present upstream.
+async function isSquashMerged(cwd: string, baseBranch: string, branch: string): Promise<boolean> {
+  try {
+    const { stdout: mergeBaseOut } = await execFileAsync("git", ["-C", cwd, "merge-base", baseBranch, branch]);
+    const mergeBase: string = mergeBaseOut.trim();
+    const { stdout: treeOut } = await execFileAsync("git", ["-C", cwd, "rev-parse", `${branch}^{tree}`]);
+    const tree: string = treeOut.trim();
+    const { stdout: commitOut } = await execFileAsync("git", [
+      "-C",
+      cwd,
+      "commit-tree",
+      tree,
+      "-p",
+      mergeBase,
+      "-m",
+      "_",
+    ]);
+    const tmpCommit: string = commitOut.trim();
+    const { stdout: cherryOut } = await execFileAsync("git", ["-C", cwd, "cherry", baseBranch, tmpCommit]);
+    return cherryOut.trim().startsWith("-");
+  } catch {
+    return false;
+  }
+}
+
+async function findStaleBranches(cwd: string): Promise<
+  StaleBranchesResponse & { syncedBranches: string[] }
+> {
+  let branches: string[];
+  let current: string | null;
+  try {
+    branches = await localBranches(cwd);
+    current = await currentBranch(cwd);
+  } catch {
+    return { isGitRepo: false, baseBranch: null, currentBranch: null, candidates: [], skipped: [], syncedBranches: [] };
+  }
+
+  const syncedBranches: string[] = await updateProtectedBranches(cwd, branches, current);
+
+  const baseBranch: string | null = await detectBaseBranch(cwd, branches);
+  if (baseBranch === null) {
+    return { isGitRepo: true, baseBranch: null, currentBranch: current, candidates: [], skipped: [], syncedBranches };
+  }
+
+  const worktreeBranches: Set<string> = await branchesCheckedOutInWorktrees(cwd);
+  const merged: Set<string> = await mergedBranches(cwd, baseBranch);
+
+  const candidates: { branch: string; reason: StaleBranchReason }[] = [];
+  const skipped: { branch: string; reason: SkippedBranchReason }[] = [];
+
+  for (const branch of branches) {
+    if (branch === baseBranch) {
+      continue;
+    }
+    if (isProtectedBranchName(branch)) {
+      skipped.push({ branch, reason: "protected" });
+      continue;
+    }
+    if (worktreeBranches.has(branch)) {
+      skipped.push({ branch, reason: "worktree" });
+      continue;
+    }
+    if (merged.has(branch)) {
+      candidates.push({ branch, reason: "merged" });
+    } else if (await isSquashMerged(cwd, baseBranch, branch)) {
+      candidates.push({ branch, reason: "squash-merged" });
+    }
+  }
+
+  return { isGitRepo: true, baseBranch, currentBranch: current, candidates, skipped, syncedBranches };
 }
 
 function resolveLiveStatusSnapshotPath(instance: InstanceRecord): string {
@@ -356,6 +524,89 @@ apiRouter.get(
       // Not a git repo, or git not installed
       response.json({ isGitRepo: false, branches: [], currentBranch: null });
     }
+  })
+);
+
+apiRouter.get(
+  "/locations/stale-branches",
+  wrapAsync(async (request, response) => {
+    const state: DashboardState = await loadState();
+    const locationPath: string = typeof request.query.path === "string" ? request.query.path.trim() : "";
+    if (locationPath === "") {
+      response.status(400).json({ error: "Provide the location." });
+      return;
+    }
+    if (!state.config.locations.includes(locationPath)) {
+      response.status(400).json({ error: `Location ${locationPath} is not configured.` });
+      return;
+    }
+    if (!(await pathExists(locationPath))) {
+      response.status(404).json({ error: `Folder does not exist: ${locationPath}` });
+      return;
+    }
+    response.json(await findStaleBranches(locationPath));
+  })
+);
+
+apiRouter.post(
+  "/locations/stale-branches/delete",
+  wrapAsync(async (request, response) => {
+    const state: DashboardState = await loadState();
+    const locationPath: string = typeof request.body.path === "string" ? request.body.path.trim() : "";
+    const requestedBranches: unknown = request.body.branches;
+    if (locationPath === "") {
+      response.status(400).json({ error: "Provide the location." });
+      return;
+    }
+    if (!state.config.locations.includes(locationPath)) {
+      response.status(400).json({ error: `Location ${locationPath} is not configured.` });
+      return;
+    }
+    if (!(await pathExists(locationPath))) {
+      response.status(404).json({ error: `Folder does not exist: ${locationPath}` });
+      return;
+    }
+    if (!Array.isArray(requestedBranches) || !requestedBranches.every((branch) => typeof branch === "string")) {
+      response.status(400).json({ error: "Provide the branches to delete." });
+      return;
+    }
+
+    // Recompute candidates now, rather than trusting the client's earlier snapshot: the
+    // repo may have changed (new commits, a checkout, a new worktree) between when the
+    // list was fetched and when the user clicked delete.
+    const { candidates, baseBranch, currentBranch: checkedOutBranch } = await findStaleBranches(locationPath);
+    const candidateNames: Set<string> = new Set(candidates.map((candidate) => candidate.branch));
+    const invalidBranch: string | undefined = requestedBranches.find((branch) => !candidateNames.has(branch));
+    if (invalidBranch !== undefined) {
+      response.status(400).json({ error: `'${invalidBranch}' is no longer a safe branch to delete.` });
+      return;
+    }
+
+    // Deleting the branch checked out in this location requires switching off it first;
+    // baseBranch is guaranteed non-null here since it's what findStaleBranches compared
+    // candidates against in the first place.
+    if (checkedOutBranch !== null && requestedBranches.includes(checkedOutBranch) && baseBranch !== null) {
+      try {
+        await execFileAsync("git", ["-C", locationPath, "checkout", baseBranch]);
+      } catch (error) {
+        response
+          .status(409)
+          .json({ error: `Could not switch off '${checkedOutBranch}' before deleting it: ${(error as Error).message}` });
+        return;
+      }
+    }
+
+    const deleted: string[] = [];
+    const failed: { branch: string; error: string }[] = [];
+    for (const branch of requestedBranches) {
+      try {
+        await execFileAsync("git", ["-C", locationPath, "branch", "-D", branch]);
+        deleted.push(branch);
+      } catch (error) {
+        failed.push({ branch, error: (error as Error).message });
+      }
+    }
+    response.json({ deleted, failed });
   })
 );
 

@@ -55,6 +55,18 @@ export interface LocationBranches {
   currentBranch: string | null;
 }
 
+export type StaleBranchReason = "merged" | "squash-merged";
+export type SkippedBranchReason = "worktree" | "protected";
+
+export interface StaleBranchesResponse {
+  isGitRepo: boolean;
+  baseBranch: string | null;
+  currentBranch: string | null;
+  candidates: { branch: string; reason: StaleBranchReason }[];
+  skipped: { branch: string; reason: SkippedBranchReason }[];
+  syncedBranches: string[];
+}
+
 export interface UpdateInstancePayload {
   label?: string;
   command?: string;

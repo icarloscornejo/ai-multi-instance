@@ -7,6 +7,7 @@ import type {
   LiveStatus,
   LocationBranches,
   LocationInfo,
+  StaleBranchesResponse,
   TunnelStatus,
   UpdateInstancePayload,
   UpdateStatus,
@@ -80,6 +81,18 @@ export const api = {
 
   getLocationExists: (locationPath: string): Promise<{ exists: boolean }> =>
     requestJson(`/api/locations/exists?path=${encodeURIComponent(locationPath)}`),
+
+  getStaleBranches: (locationPath: string): Promise<StaleBranchesResponse> =>
+    requestJson(`/api/locations/stale-branches?path=${encodeURIComponent(locationPath)}`),
+
+  deleteStaleBranches: (
+    locationPath: string,
+    branches: string[]
+  ): Promise<{ deleted: string[]; failed: { branch: string; error: string }[] }> =>
+    requestJson("/api/locations/stale-branches/delete", {
+      method: "POST",
+      body: JSON.stringify({ path: locationPath, branches }),
+    }),
 
   getResumableSession: (provider: AgentProvider, locationPath: string, label: string): Promise<{ hasSession: boolean }> =>
     requestJson(
