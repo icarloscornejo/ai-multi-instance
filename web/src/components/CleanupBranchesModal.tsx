@@ -10,16 +10,6 @@ interface CleanupBranchesModalProps {
   onDeleted: () => void;
 }
 
-const REASON_LABELS: Record<string, string> = {
-  merged: "merged",
-  "squash-merged": "squash-merged",
-};
-
-const SKIPPED_REASON_LABELS: Record<string, string> = {
-  worktree: "in use by a worktree",
-  protected: "protected long-lived branch",
-};
-
 export function CleanupBranchesModal({ location, onClose, onDeleted }: CleanupBranchesModalProps) {
   const [data, setData] = useState<StaleBranchesResponse | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -37,7 +27,6 @@ export function CleanupBranchesModal({ location, onClose, onDeleted }: CleanupBr
           return;
         }
         setData(response);
-        setSelected(new Set(response.candidates.map((candidate) => candidate.branch)));
       })
       .catch((error) => {
         if (!disposed) {
@@ -108,29 +97,21 @@ export function CleanupBranchesModal({ location, onClose, onDeleted }: CleanupBr
       {loadError !== null && <div className={errorTextClassName}>{loadError}</div>}
 
       {loadError === null && data === null && (
-        <div className="text-[11.5px] text-txt-dimmer">Scanning branches...</div>
+        <div className="text-[11.5px] text-txt-dimmer">Loading branches...</div>
       )}
 
-      {data !== null && data.baseBranch === null && (
-        <div className="text-[11.5px] text-txt-dimmer">
-          Couldn't detect a base branch (no origin/HEAD and no local main/master/develop). Nothing to compare against.
-        </div>
+      {data !== null && !data.isGitRepo && (
+        <div className="text-[11.5px] text-txt-dimmer">Not a git repository.</div>
       )}
 
-      {data !== null && data.baseBranch !== null && (
+      {data !== null && data.isGitRepo && (
         <>
           <div className={hintTextClassName}>
-            Comparing against <span className="font-mono text-txt-secondary">{data.baseBranch}</span>
+            Pick any branch to delete. main/master/develop/dev are never shown here.
           </div>
 
-          {data.syncedBranches.length > 0 && (
-            <div className={hintTextClassName}>
-              Synced with origin: <span className="font-mono text-txt-secondary">{data.syncedBranches.join(", ")}</span>
-            </div>
-          )}
-
           {data.candidates.length === 0 ? (
-            <div className="text-[11.5px] text-txt-dimmer">Nothing to clean up here.</div>
+            <div className="text-[11.5px] text-txt-dimmer">No other local branches here.</div>
           ) : (
             <div className="flex flex-col gap-[2px] rounded-sm border border-border bg-app p-[6px]">
               <label className="flex items-center gap-[8px] px-[6px] py-[4px] text-[11.5px] font-semibold text-txt-secondary">
@@ -156,26 +137,21 @@ export function CleanupBranchesModal({ location, onClose, onDeleted }: CleanupBr
                     {candidate.branch === data.currentBranch && (
                       <span
                         className="shrink-0 whitespace-nowrap rounded-full bg-raised-2 px-[6px] py-[2px] text-[9.5px] font-bold uppercase tracking-[.03em] text-txt-dimmer"
-                        title={`Checked out here. Deleting it will switch this location to ${data.baseBranch ?? "the base branch"} first.`}
+                        title="Checked out here. Deleting it will switch this location to main/master/develop/dev first."
                       >
                         current
                       </span>
                     )}
-                  </span>
-                  <span className="shrink-0 whitespace-nowrap rounded-full bg-raised-2 px-[6px] py-[2px] text-[9.5px] font-bold uppercase tracking-[.03em] text-txt-secondary">
-                    {REASON_LABELS[candidate.reason]}
+                    {candidate.worktreePath !== undefined && (
+                      <span
+                        className="shrink-0 whitespace-nowrap rounded-full bg-raised-2 px-[6px] py-[2px] text-[9.5px] font-bold uppercase tracking-[.03em] text-diff-removed"
+                        title={`Checked out in another worktree at ${candidate.worktreePath}. Deleting it will remove that worktree folder, including any uncommitted changes in it.`}
+                      >
+                        worktree
+                      </span>
+                    )}
                   </span>
                 </label>
-              ))}
-            </div>
-          )}
-
-          {data.skipped.length > 0 && (
-            <div className="flex flex-col gap-[2px] text-[11px] text-txt-dimmer">
-              {data.skipped.map((skip) => (
-                <div key={skip.branch}>
-                  <span className="font-mono">{skip.branch}</span> skipped ({SKIPPED_REASON_LABELS[skip.reason]})
-                </div>
               ))}
             </div>
           )}
