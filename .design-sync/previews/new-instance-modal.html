@@ -1,0 +1,192 @@
+<!-- @dsCard group="Modals" name="New instance" subtitle="Simplified form with unified Source field (location + branch); Choose-source picker with fresh-open tree and live cross-location search; non-git and loading variants" -->
+<!doctype html>
+<html data-theme="light">
+<head>
+<meta charset="utf-8" />
+<link rel="stylesheet" href="styles.css" />
+<style>
+  body{background:var(--color-app);display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:center;gap:24px;min-height:100vh;padding:40px 20px}
+  .overlay{background:var(--color-overlay);display:flex;align-items:center;justify-content:center;padding:36px;border-radius:var(--radius-lg)}
+  .modal{width:400px;display:flex;flex-direction:column;gap:18px;border-radius:var(--radius-lg);border:1px solid var(--color-border);background:var(--color-surface);padding:24px;box-shadow:var(--shadow-modal)}
+  h2{font-size:14.5px;font-weight:700;color:var(--color-txt-bright);margin:0}
+  .field{display:flex;flex-direction:column}
+  .source-btn{display:flex;flex-direction:column;gap:2px;border:1px solid var(--color-border-strong);border-radius:var(--radius-sm);background:var(--color-app);padding:9px 11px;cursor:pointer}
+  .source-btn .top{display:flex;justify-content:space-between;align-items:center}
+  .source-btn .b{font-family:var(--font-mono);font-size:12.5px;font-weight:600;color:var(--color-txt-bright)}
+  .source-btn .loc{font-size:11px;color:var(--color-txt-dim)}
+  .source-btn .chev{font-size:11px;color:var(--color-txt-dim);display:flex;align-items:center;gap:3px}
+  .source-btn .chev svg{width:10px;height:10px}
+  .combo{position:relative}
+  .combo svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);width:13px;height:13px;color:var(--color-txt-dim)}
+  .combo .input{padding-left:30px;padding-right:26px}
+  .combo .chev{position:absolute;right:10px;top:50%;transform:translateY(-50%);font-size:11px;color:var(--color-txt-dim);pointer-events:none}
+  .tree{border:1px solid var(--color-border);border-radius:var(--radius-sm);background:var(--color-app);padding:4px;max-height:190px;overflow-y:auto}
+  .tree-loc{font-size:11px;font-weight:700;color:var(--color-txt-secondary);padding:6px 8px 2px;display:flex;align-items:center;gap:5px}
+  .tree-branch{font-family:var(--font-mono);font-size:12px;color:var(--color-txt-body);padding:5px 8px 5px 22px;border-radius:5px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .tree-branch:hover{background:var(--color-raised)}
+  .tree-branch.selected{background:var(--color-accent-dim);color:var(--color-txt-bright)}
+  .tree-loc.pickable{cursor:pointer;border-radius:5px;flex-direction:column;align-items:flex-start;gap:0;padding:0}
+  .tree-loc.pickable:hover{background:var(--color-raised)}
+  .tree-loc.pickable>.name{padding:6px 8px 2px}
+  .tree-note{font-size:12px;font-weight:400;font-style:italic;color:var(--color-txt-dimmer);padding:5px 8px 5px 22px}
+  .checkbox-row{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--color-txt-body)}
+  .checkbox-row input{width:14px;height:14px;accent-color:var(--color-accent)}
+  .adv-block{border-top:1px solid var(--color-border);padding-top:14px;display:flex;flex-direction:column;gap:12px}
+  .adv-label{font-size:11.5px;font-weight:600;color:var(--color-txt-secondary)}
+  .row2{display:flex;gap:10px}
+  .row2>div{flex:1}
+  .footer{display:flex;justify-content:flex-end;gap:10px}
+  .caption{width:400px;font-size:11px;color:var(--color-txt-dimmer);line-height:1.5}
+  .back-btn{background:none;border:none;color:var(--color-txt-dim);font-size:12px;cursor:pointer;display:flex;align-items:center;gap:6px;padding:0}
+  .back-btn:hover{color:var(--color-txt-secondary)}
+  .checked-badge{font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.03em;color:var(--color-accent);background:var(--color-accent-dim);padding:2px 6px;border-radius:999px;white-space:nowrap}
+  .empty-state{display:flex;flex-direction:column;align-items:center;text-align:center;gap:10px;padding:34px 16px 22px}
+  .empty-state svg{width:30px;height:30px;color:var(--color-txt-dimmer)}
+  .empty-state .t{font-size:12.5px;font-weight:600;color:var(--color-txt-secondary)}
+  .empty-state .s{font-size:11px;color:var(--color-txt-dimmer);line-height:1.5}
+  .agent-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .agent-btn{border-radius:var(--radius-sm);border:1px solid var(--color-border-strong);background:var(--color-app);color:var(--color-txt-secondary);text-align:left;font-size:12px;padding:9px 10px;cursor:pointer}
+  .agent-btn:hover{background:var(--color-raised)}
+  .agent-btn.selected{border-color:var(--color-accent);background:color-mix(in srgb, var(--color-accent) 10%, transparent);color:var(--color-txt-bright);font-weight:600}
+</style>
+</head>
+<body>
+  <div class="overlay">
+    <div class="modal">
+      <h2>New instance</h2>
+      <div class="field">
+        <label class="field-label">Source</label>
+        <div class="source-btn"><div class="top"><span class="b">main</span><span class="chev">Change<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg></span></div><span class="loc">claude-multi-instance</span></div>
+      </div>
+      <div class="field">
+        <label class="field-label">Name</label>
+        <input class="input error" value="feature-x" />
+        <div class="error-text">⚠ An instance named "feature-x" is already running here</div>
+      </div>
+      <div class="checkbox-row"><input type="checkbox" id="shellonly" /><label for="shellonly">Open shell only</label></div>
+      <div class="adv-block">
+        <div class="adv-label">Advanced launch options</div>
+        <div class="field">
+          <label class="field-label">Claude Code executable</label>
+          <input class="input" value="claude" />
+          <div class="hint-text">Use an executable name from PATH or an absolute path.</div>
+        </div>
+        <div class="row2">
+          <div class="field"><label class="field-label">Model</label><select class="input"><option>opusplan</option></select></div>
+          <div class="field"><label class="field-label">Effort</label><select class="input"><option>high</option></select></div>
+        </div>
+      </div>
+      <div class="footer">
+        <button class="btn btn-ghost">Cancel</button>
+        <button class="btn btn-primary" disabled>Launch</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="overlay">
+    <div class="modal">
+      <h2>New instance</h2>
+      <div class="field">
+        <label class="field-label">Source</label>
+        <div class="source-btn"><div class="top"><span class="b">main</span><span class="chev">Change<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg></span></div><span class="loc">claude-multi-instance</span></div>
+      </div>
+      <div class="field">
+        <label class="field-label">Name</label>
+        <input class="input" value="feature-x" />
+      </div>
+      <div class="field">
+        <label class="field-label">Agent</label>
+        <div class="agent-grid">
+          <button class="agent-btn selected">Claude Code</button>
+          <button class="agent-btn">Codex CLI</button>
+          <button class="agent-btn">Cursor Agent</button>
+          <button class="agent-btn">Other agent</button>
+        </div>
+      </div>
+      <div class="checkbox-row"><input type="checkbox" id="shellonly2" /><label for="shellonly2">Open shell only</label></div>
+      <div class="footer">
+        <button class="btn btn-ghost">Cancel</button>
+        <button class="btn btn-primary">Launch</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="overlay">
+    <div class="modal">
+      <button class="back-btn">← Back to feature-x</button>
+      <h2>Choose source</h2>
+      <div class="combo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><path d="m21 21-4.3-4.3"></path></svg><input class="input" placeholder="Search or browse…" /><span class="chev">▾</span></div>
+      <div class="tree">
+        <div class="tree-loc">▾ claude-multi-instance</div>
+        <div class="tree-branch selected">main <span class="current">current, checked out</span></div>
+        <div class="tree-branch">feature-x</div>
+        <div class="tree-branch">bugfix-login</div>
+        <div class="tree-loc">▾ claude-multi-instance-2</div>
+        <div class="tree-branch">feature-x <span class="checked-badge">Checked out</span></div>
+        <div class="tree-loc pickable">
+          <span class="name">▸ fresh-clone</span>
+          <div class="tree-note">not a git repo, click to use as-is</div>
+        </div>
+      </div>
+      <div class="branch-note">Just opened: no query yet, so the full tree is shown. Locations expand into branches, non-git locations show as a plain leaf with a note instead of a branch list.</div>
+      <div class="footer">
+        <button class="btn btn-ghost">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="overlay">
+    <div class="modal">
+      <button class="back-btn">← Back to feature-x</button>
+      <h2>Choose source</h2>
+      <div class="combo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><path d="m21 21-4.3-4.3"></path></svg><input class="input" value="fe" placeholder="Search or browse…" /></div>
+      <div class="tree">
+        <div class="tree-loc">▾ claude-multi-instance</div>
+        <div class="tree-branch"><span><mark>fe</mark>ature-x</span></div>
+        <div class="tree-loc">▾ claude-multi-instance-2</div>
+        <div class="tree-branch selected"><span><mark>fe</mark>ature-x</span> <span class="checked-badge">Checked out</span></div>
+      </div>
+      <div class="branch-note">Typing filters the same tree in place: only locations with a match stay expanded, query highlighted. Structure and grouping don't change, just what's shown.</div>
+      <div class="footer">
+        <button class="btn btn-ghost">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="overlay">
+    <div class="modal">
+      <button class="back-btn">← Back to feature-x</button>
+      <h2>Choose source</h2>
+      <div class="combo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><path d="m21 21-4.3-4.3"></path></svg><input class="input" value="zzz" /></div>
+      <div class="empty-state">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><path d="m21 21-4.3-4.3"></path></svg>
+        <div class="t">No branches match "zzz"</div>
+        <div class="s">Try a different name, or check the location list still has the repo you're looking for.</div>
+      </div>
+      <div class="footer">
+        <button class="btn btn-ghost">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="overlay">
+    <div class="modal">
+      <h2>New instance</h2>
+      <div class="field">
+        <label class="field-label">Source</label>
+        <div class="source-btn"><div class="top"><span class="b">fresh-clone</span><span class="chev">Change<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg></span></div><span class="loc">not a git repository</span></div>
+      </div>
+      <div class="field">
+        <label class="field-label">Name</label>
+        <input class="input" value="fresh-clone" />
+      </div>
+      <div class="footer">
+        <button class="btn btn-ghost">Cancel</button>
+        <button class="btn btn-primary" style="display:flex;align-items:center;gap:7px"><span style="width:12px;height:12px;border-radius:999px;border:2px solid rgba(0,0,0,.25);border-top-color:var(--color-on-accent);animation:spin .8s linear infinite;display:inline-block"></span>Launching…</button>
+      </div>
+    </div>
+  </div>
+  <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
+  <div class="caption">Left to right: simplified main form (single agent enabled), now with a single "Source" field replacing separate Location/Branch selects. Agent selector variant, shown when 2+ agents are enabled in Settings. "Choose source" freshly opened: no query, so it shows the full browsable tree (locations expand into branches, non-git locations appear as a plain leaf with a note, pickable as-is). Same picker mid-search: typing collapses the tree into a flat, ranked, cross-location match list. No-match empty state. Non-git source selected on the main form, with the Launch loading state. "Advanced launch options" is not a collapsible disclosure, it's just conditionally rendered whenever "Open shell only" is unchecked. The executable field label and hint text reflect the provider ("{Provider} executable", "Use an executable name from PATH or an absolute path."), and Model/Effort are hidden entirely for a custom-command provider.</div>
+</body>
+</html>

@@ -1,0 +1,112 @@
+<!-- @dsCard group="Mobile" name="Update flow" subtitle="Full-screen update, required banner, optional snackbar" -->
+<!doctype html>
+<html data-theme="light">
+<head>
+<meta charset="utf-8" />
+<link rel="stylesheet" href="styles.css" />
+<style>
+  body{background:var(--color-app);padding:40px 24px;display:flex;flex-direction:column;gap:12px}
+  .example-label{font-size:11px;font-weight:700;color:var(--color-txt-dim);text-transform:uppercase;letter-spacing:.03em;margin-bottom:8px}
+  .example{margin-bottom:40px}
+  .caption{margin-top:12px;font-size:11px;color:var(--color-txt-dimmer);line-height:1.6;max-width:1500px}
+  .u-body{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:16px}
+  .compare-m{display:flex;flex-direction:column;gap:8px}
+  .commit-block-m{border:1px solid var(--color-border);border-radius:var(--radius-md);padding:12px;display:flex;flex-direction:column;gap:4px;background:var(--color-app)}
+  .commit-block-m.latest{border-color:var(--color-accent-border);background:var(--color-accent-dim)}
+  .pill-m{width:fit-content;border-radius:999px;padding:2px 8px;font-size:10px;font-weight:700;letter-spacing:.03em;text-transform:uppercase}
+  .pill-m.current{background:var(--color-raised-2);color:var(--color-txt-secondary)}
+  .pill-m.latest{background:var(--color-accent);color:var(--color-on-accent)}
+  .changelog-m{display:flex;flex-direction:column;border:1px solid var(--color-border);border-radius:var(--radius-md)}
+  .commit-row-m{padding:10px 12px;border-bottom:1px solid var(--color-border);font-size:12px;color:var(--color-txt-body)}
+  .commit-row-m:last-child{border-bottom:none}
+  .commit-row-m .h{font-family:var(--font-mono);font-size:11px;color:var(--color-txt-dim);margin-right:8px}
+  .u-footer{padding:16px;border-top:1px solid var(--color-border)}
+  .banner-m{display:flex;flex-direction:column;gap:6px;padding:10px 16px;background:var(--color-danger-dim);border-bottom:1px solid var(--color-danger-border);font-size:12px;color:var(--color-txt-body)}
+  .banner-m b{color:var(--color-txt-bright)}
+  .card{display:flex;flex-direction:column;gap:6px;border-radius:10px;border:1px solid var(--color-border);background:var(--color-surface);padding:12px 14px;margin:12px}
+  .card .label{font:600 14px var(--font-ui);color:var(--color-txt-bright)}
+  .pill{font:600 10.5px var(--font-ui);color:var(--color-txt-secondary);background:var(--color-raised);border-radius:999px;padding:3px 9px}
+  .pill.branch{font-family:var(--font-mono);font-weight:500}
+  .snackbar-row{display:flex;align-items:center;gap:10px}
+</style>
+</head>
+<body>
+
+<div class="example-label">Update screen</div>
+<div class="example frame-row">
+  <div class="phone-frame">
+    <div class="phone-statusbar"><span>9:41</span><span>●●●●</span></div>
+    <div class="phone-body">
+      <div class="app-bar">
+        <button class="back-chevron" aria-label="Back">‹</button>
+        <span class="title">Update</span>
+      </div>
+      <div class="u-body">
+        <div class="compare-m">
+          <div class="commit-block-m"><span class="pill-m current">Current</span><span style="font-family:var(--font-mono);font-size:13px;color:var(--color-txt-bright)">947edda</span></div>
+          <div class="commit-block-m latest"><span class="pill-m latest">Latest</span><span style="font-family:var(--font-mono);font-size:13px;color:var(--color-txt-bright)">2a6a93d</span></div>
+        </div>
+        <div>
+          <div class="field-label">What's new</div>
+          <div class="changelog-m">
+            <div class="commit-row-m"><span class="h">2a6a93d</span>Fixes de mobile (foco de teclado, back al password screen) y light mode default</div>
+            <div class="commit-row-m"><span class="h">5f76564</span>Agrega limpieza de branches viejas al flujo New instance</div>
+            <div class="commit-row-m"><span class="h">3940c78</span>Touch-scroll tactil buttery smooth en TerminalView</div>
+          </div>
+        </div>
+      </div>
+      <div class="u-footer"><button class="btn btn-primary" style="width:100%">Apply update</button></div>
+    </div>
+    <div class="phone-home-indicator"></div>
+  </div>
+</div>
+<div class="caption">Full-screen version comparison and scrollable changelog, with "Apply update" pinned at the bottom above the home indicator instead of competing for space in a small card.</div>
+
+<div class="example-label">Required update banner (over home)</div>
+<div class="example frame-row">
+  <div class="phone-frame">
+    <div class="phone-statusbar"><span>9:41</span><span>●●●●</span></div>
+    <div class="phone-body">
+      <div class="banner-m">Required update installs automatically in <b>5:00</b>, save your work.<button class="btn btn-danger" style="align-self:flex-start;padding:6px 12px;font-size:11px">Update now</button></div>
+      <div class="app-bar">
+        <span class="title">AI Multi-Instance</span>
+        <button class="icon-btn-m" aria-label="Settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle></svg></button>
+      </div>
+      <div class="card">
+        <div class="label">feature-payments-api</div>
+        <div style="display:flex;gap:6px"><span class="pill">Claude Code · opusplan · high</span><span class="pill branch">feature-payments-api</span></div>
+      </div>
+    </div>
+    <div class="phone-home-indicator"></div>
+  </div>
+</div>
+<div class="caption">Required-update banner sits above the app bar, safe-area aware, unmissable but not blocking the list beneath it. Same countdown semantics as desktop.</div>
+
+<div class="example-label">Optional update (snackbar)</div>
+<div class="example frame-row">
+  <div class="phone-frame">
+    <div class="phone-statusbar"><span>9:41</span><span>●●●●</span></div>
+    <div class="phone-body">
+      <div class="app-bar">
+        <span class="title">AI Multi-Instance</span>
+        <button class="icon-btn-m" aria-label="Settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle></svg></button>
+      </div>
+      <div class="card">
+        <div class="label">feature-payments-api</div>
+        <div style="display:flex;gap:6px"><span class="pill">Claude Code · opusplan · high</span><span class="pill branch">feature-payments-api</span></div>
+      </div>
+      <div class="snackbar">
+        <div class="snackbar-row" style="flex:1">
+          <span>Update available · 3 commits behind</span>
+        </div>
+        <button class="snackbar-action" style="margin-right:6px">Later</button>
+        <button class="snackbar-action">Update</button>
+      </div>
+    </div>
+    <div class="phone-home-indicator"></div>
+  </div>
+</div>
+<div class="caption">Replaces the desktop UpdatePopover: a dismissible bottom snackbar over the home list with "Later"/"Update" buttons and exact copy "Update available · N commits behind", instead of a popover anchored to a toolbar button that doesn't exist on mobile.</div>
+
+</body>
+</html>

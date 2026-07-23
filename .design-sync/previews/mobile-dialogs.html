@@ -1,0 +1,45 @@
+<!-- @dsCard group="Mobile" name="Delete confirm" subtitle="Same centered Modal as desktop, no bottom-sheet variant" -->
+<!doctype html>
+<html data-theme="light">
+<head>
+<meta charset="utf-8" />
+<link rel="stylesheet" href="styles.css" />
+<style>
+  body{background:var(--color-app);padding:40px 24px;display:flex;flex-direction:column;gap:12px}
+  .example-label{font-size:11px;font-weight:700;color:var(--color-txt-dim);text-transform:uppercase;letter-spacing:.03em;margin-bottom:8px}
+  .example{margin-bottom:40px}
+  .caption{margin-top:12px;font-size:11px;color:var(--color-txt-dimmer);line-height:1.6;max-width:1500px}
+  .term-dim{flex:1;font-family:var(--font-mono);font-size:12px;color:var(--color-txt-dimmer);padding:14px}
+  .dialog-center{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:16px}
+  .modal{width:100%;max-width:320px;display:flex;flex-direction:column;gap:14px;border-radius:10px;border:1px solid var(--color-border);background:var(--color-surface);padding:20px;box-shadow:var(--shadow-modal)}
+  .modal h2{font-size:14px;font-weight:600;color:var(--color-txt-bright);margin:0}
+  .modal p{font-size:12.5px;line-height:1.55;color:var(--color-txt-body);margin:0}
+  .modal .path{font-family:var(--font-mono)}
+  .modal .footer{display:flex;justify-content:flex-end;gap:10px}
+</style>
+</head>
+<body>
+
+<div class="example-label">Delete instance</div>
+<div class="example frame-row">
+  <div class="phone-frame">
+    <div class="phone-body" style="position:relative">
+      <div class="term-dim">$ npm test<br />Tests: 24 passed, 24 total<br />$ </div>
+      <div class="scrim" style="position:absolute;inset:0"></div>
+      <div class="dialog-center">
+        <div class="modal" style="position:relative;z-index:1">
+          <h2>Delete instance</h2>
+          <p>The tmux session for <strong style="color:var(--color-txt-bright)">feature-x</strong> will be closed. The folder <span class="path">/Users/icarloscornejo/claude-multi-instance</span> and its contents are untouched.</p>
+          <div class="footer">
+            <button class="btn btn-ghost">Cancel</button>
+            <button class="btn btn-danger">Delete</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="caption">DeleteConfirmModal.tsx has no isMobile branching: mobile reuses the exact same centered Modal-wrapped dialog as desktop, just narrower. There is no bottom-sheet confirm variant and no separate alert/dialog system on mobile; ActionSheet (used for the terminal overflow menu and instance long-press menu) is the only bottom-sheet pattern in the app, and it's reserved for menus, not confirmations.</div>
+
+</body>
+</html>

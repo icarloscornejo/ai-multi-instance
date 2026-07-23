@@ -1,0 +1,62 @@
+<!-- @dsCard group="Mobile" name="New instance (same modal, phone width)" subtitle="No separate mobile flow: the desktop New instance modal is reused as-is, centered over the phone viewport" -->
+<!doctype html>
+<html data-theme="light">
+<head>
+<meta charset="utf-8" />
+<link rel="stylesheet" href="styles.css" />
+<style>
+  body{background:var(--color-app);padding:40px 24px;display:flex;flex-direction:column;gap:12px}
+  .example-label{font-size:11px;font-weight:700;color:var(--color-txt-dim);text-transform:uppercase;letter-spacing:.03em;margin-bottom:8px}
+  .example{margin-bottom:40px}
+  .caption{margin-top:12px;font-size:11px;color:var(--color-txt-dimmer);line-height:1.6;max-width:1500px}
+  .phone-body .overlay{position:absolute;inset:0;background:var(--color-overlay);display:flex;align-items:center;justify-content:center;padding:16px}
+  .modal{width:100%;max-width:340px;display:flex;flex-direction:column;gap:16px;border-radius:var(--radius-lg);border:1px solid var(--color-border);background:var(--color-surface);padding:20px;box-shadow:var(--shadow-modal)}
+  h2{font-size:14px;font-weight:700;color:var(--color-txt-bright);margin:0}
+  .field{display:flex;flex-direction:column}
+  .source-btn{display:flex;flex-direction:column;gap:2px;border:1px solid var(--color-border-strong);border-radius:var(--radius-sm);background:var(--color-app);padding:9px 11px}
+  .source-btn .top{display:flex;justify-content:space-between;align-items:center}
+  .source-btn .b{font-family:var(--font-mono);font-size:12.5px;font-weight:600;color:var(--color-txt-bright)}
+  .source-btn .loc{font-size:11px;color:var(--color-txt-dim)}
+  .source-btn .chev{font-size:11px;color:var(--color-txt-dim)}
+  .checkbox-row{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--color-txt-body)}
+  .checkbox-row input{width:14px;height:14px;accent-color:var(--color-accent)}
+  .footer{display:flex;justify-content:flex-end;gap:10px}
+</style>
+</head>
+<body>
+
+<div class="example-label">New instance on mobile</div>
+<div class="example frame-row">
+  <div class="phone-frame">
+    <div class="phone-statusbar"><span>9:41</span><span>●●●●</span></div>
+    <div class="phone-body" style="position:relative">
+      <div class="app-bar">
+        <span class="title">AI Multi-Instance</span>
+        <button class="icon-btn-m" aria-label="Settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle></svg></button>
+      </div>
+      <div class="overlay">
+        <div class="modal">
+          <h2>New instance</h2>
+          <div class="field">
+            <label class="field-label">Source</label>
+            <div class="source-btn"><div class="top"><span class="b">main</span><span class="chev">Change ▾</span></div><span class="loc">claude-multi-instance</span></div>
+          </div>
+          <div class="field">
+            <label class="field-label">Name</label>
+            <input class="input" value="feature-x" />
+          </div>
+          <div class="checkbox-row"><input type="checkbox" /><label>Open shell only</label></div>
+          <div class="footer">
+            <button class="btn btn-ghost">Cancel</button>
+            <button class="btn btn-primary">Launch</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="phone-home-indicator"></div>
+  </div>
+</div>
+<div class="caption">There is no dedicated mobile "New instance" screen: NewInstanceModal.tsx has no isMobile branching anywhere in it, so this is the exact same centered overlay modal used on desktop, just rendered inside a narrower viewport. "Choose source", the resumable-session prompt, and the field set (Name, "Open shell only", the conditionally-shown Advanced launch options) all behave identically to the desktop version shown in the New instance card.</div>
+
+</body>
+</html>
