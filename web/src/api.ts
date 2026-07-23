@@ -117,5 +117,16 @@ export const api = {
 
   stopTunnel: (): Promise<TunnelStatus> => requestJson("/api/tunnel/stop", { method: "POST" }),
 
+  getTunnelLogs: async (): Promise<string> => {
+    const response: Response = await fetch("/api/tunnel/logs");
+    if (response.status === 401) {
+      onUnauthorized?.();
+    }
+    if (!response.ok) {
+      throw new ApiError(`Error ${response.status}`, response.status);
+    }
+    return response.text();
+  },
+
   getLanAddress: (): Promise<LanAddress> => requestJson("/api/lan-address"),
 };

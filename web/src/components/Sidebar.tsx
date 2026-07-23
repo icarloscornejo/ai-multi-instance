@@ -73,7 +73,7 @@ function FieldLabel({ children, action }: { children: string; action?: ReactNode
 // navigator.clipboard requires a secure context (https, or the special-cased
 // "localhost"/127.0.0.1 hosts): it silently throws on plain http://ai.local even
 // though that resolves to loopback, so fall back to the legacy execCommand copy there.
-async function copyText(value: string): Promise<void> {
+export async function copyText(value: string): Promise<void> {
   if (window.isSecureContext) {
     try {
       await navigator.clipboard.writeText(value);

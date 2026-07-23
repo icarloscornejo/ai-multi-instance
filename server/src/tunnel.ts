@@ -1,4 +1,13 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { mkdirSync, writeFileSync, appendFileSync, readFileSync } from "node:fs";
+import path from "node:path";
+
+// Mirrors auth.ts/store.ts's data directory; cloudflared's own stdout+stderr (not just the
+// truncated tail this module keeps for parsing the URL) is kept here so a failure that
+// happens after the tunnel is already reported "running" (edge disconnects, protocol
+// fallback issues, etc.) leaves something inspectable instead of vanishing with the process.
+const dataDirectory: string = path.resolve(import.meta.dirname, "../../data");
+const logFilePath: string = path.join(dataDirectory, "cloudflared.log");
 
 export type TunnelState = "stopped" | "starting" | "running" | "error";
 
@@ -39,10 +48,33 @@ export function startTunnel(port: number): Promise<TunnelStatus> {
   status.error = null;
 
   startPromise = new Promise<TunnelStatus>((resolve) => {
-    const cloudflared: ChildProcess = spawn("cloudflared", ["tunnel", "--url", `http://localhost:${port}`]);
+    // QUIC (cloudflared's default) is UDP-based and gets silently blocked or throttled by
+    // a lot of mobile-hotspot/carrier NATs; the tunnel then reports a URL but never actually
+    // connects, with no error surfaced anywhere (see the finishError/finishRunning split
+    // below: cloudflared only fails loudly if it dies before printing a URL). http2 runs
+    // over a plain TCP/TLS connection instead, which those networks don't interfere with.
+    const cloudflared: ChildProcess = spawn("cloudflared", [
+      "tunnel",
+      "--protocol",
+      "http2",
+      "--url",
+      `http://localhost:${port}`,
+    ]);
     child = cloudflared;
     let stderrTail = "";
     let settled = false;
+
+    mkdirSync(dataDirectory, { recursive: true });
+    writeFileSync(logFilePath, `--- cloudflared started ${new Date().toISOString()} ---\n`);
+    const appendToLogFile = (chunk: Buffer): void => {
+      try {
+        appendFileSync(logFilePath, chunk);
+      } catch {
+        // Best-effort logging; never let a disk/permission issue take down the tunnel itself
+      }
+    };
+    cloudflared.stdout?.on("data", appendToLogFile);
+    cloudflared.stderr?.on("data", appendToLogFile);
 
     const finishError = (message: string): void => {
       if (settled) return;
@@ -102,6 +134,14 @@ export function startTunnel(port: number): Promise<TunnelStatus> {
   });
 
   return startPromise;
+}
+
+export function readTunnelLog(): string {
+  try {
+    return readFileSync(logFilePath, "utf8");
+  } catch {
+    return "";
+  }
 }
 
 export function stopTunnel(): TunnelStatus {

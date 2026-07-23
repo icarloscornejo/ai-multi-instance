@@ -2,6 +2,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
+import { useIsMobile } from "../hooks/useIsMobile";
 import { getHostFontSize, setHostFontSize } from "../hostPrefs";
 import { btnGhost } from "../ui";
 import type { Instance } from "../types";
@@ -222,10 +223,48 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   const fitAddonRef = useRef<FitAddon | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const persistTimerRef = useRef<number | null>(null);
-  const [fontSize, setFontSize] = useState<number>(() => getHostFontSize(instance.id, instance.fontSize));
+  const isMobile = useIsMobile();
+  // Mobile screens are small enough that the server's default (tuned for desktop) reads
+  // cramped-in-a-good-way but wastes space here; default to the smallest zoom on mobile
+  // until the user picks their own (still persisted separately per-device via hostPrefs).
+  const [fontSize, setFontSize] = useState<number>(() =>
+    getHostFontSize(instance.id, isMobile ? MIN_FONT_SIZE : instance.fontSize)
+  );
   const [disconnected, setDisconnected] = useState<boolean>(false);
   const [reconnectMsRemaining, setReconnectMsRemaining] = useState<number>(RECONNECT_DELAY_MS);
   const [connectionEpoch, setConnectionEpoch] = useState<number>(0);
+  // On mobile every instance mounts hidden (display: none) in the always-rendered pool, so
+  // fit() measures a zero-width container and the socket would open with xterm's 80x24
+  // fallback baked into the initial pty size. Deferring the connection until this instance
+  // has actually been shown once means the first fit is real, so the pty (and tmux's first
+  // redraw) is sized correctly from the start instead of needing a later resize that
+  // reflows a buffer already full of 80-column content and leaves the viewport unanchored
+  // from the tail.
+  const [hasBeenVisible, setHasBeenVisible] = useState<boolean>(visible);
+  // xterm measures its cell size once when the terminal is created (and again only if
+  // fontFamily/fontSize change later), never in reaction to the font finishing its network
+  // load. Creating the terminal before JetBrains Mono is ready bakes in the fallback font's
+  // (shorter) cell height, so fit() overcounts rows and the bottom ones render past the
+  // container's clipped edge. Gating terminal creation on the font being ready means the
+  // only measurement that matters always uses the real font.
+  const [fontReady, setFontReady] = useState<boolean>(false);
+  useEffect(() => {
+    let cancelled = false;
+    document.fonts
+      .load(`${fontSize}px "JetBrains Mono"`)
+      .catch(() => {
+        // Fall through to fallback-font metrics rather than never creating the terminal
+      })
+      .then(() => {
+        if (!cancelled) {
+          setFontReady(true);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const onAtBottomChangeRef = useRef(onAtBottomChange);
   onAtBottomChangeRef.current = onAtBottomChange;
   const touchScrollRef = useRef<{ lastClientY: number; accumulatedPx: number; released: boolean } | null>(null);
@@ -277,8 +316,12 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     [instance.id, safeFit]
   );
 
-  // Create the xterm terminal, once per instance
+  // Create the xterm terminal, once per instance, deferred until fontReady (see its
+  // declaration above): creating it earlier would measure cell size with the fallback font.
   useEffect(() => {
+    if (!fontReady) {
+      return;
+    }
     const container = containerRef.current;
     if (container === null) {
       return;
@@ -315,18 +358,18 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     // since it's the addon crashing/degrading, not something the terminal can't run without.
     try {
       const webglAddon = new WebglAddon();
-      webglAddon.onContextLoss(() => webglAddon.dispose());
+      webglAddon.onContextLoss(() => {
+        webglAddon.dispose();
+        // Mobile browsers reclaim the WebGL context when the app is backgrounded; falling
+        // back to the DOM renderer leaves whatever was on the canvas stale until new data
+        // writes a row. If nothing is being written (e.g. a prompt already sitting idle),
+        // the screen stays blank until this forces every row to repaint immediately.
+        terminal.refresh(0, terminal.rows - 1);
+      });
       terminal.loadAddon(webglAddon);
     } catch {
       // no WebGL support; xterm keeps using its default DOM renderer
     }
-
-    // Force the font to load and re-fit once it is ready (font-display: swap
-    // may take a moment to resolve JetBrains Mono on first use).
-    document.fonts
-      .load(`${terminal.options.fontSize}px "JetBrains Mono"`)
-      .then(() => safeFit())
-      .catch(() => safeFit());
 
     terminal.onData((typedData: string) => {
       const socket = socketRef.current;
@@ -393,6 +436,11 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     let awaitingAck = false;
     let ackTimeoutId: number | null = null;
     let momentumTimeoutId: number | null = null;
+    // Two ack timeouts in a row during coast mean the scrollback is pinned at an edge
+    // (tmux has nothing left to redraw), not that a tick was merely slow; without this the
+    // coast keeps retrying every ACK_TIMEOUT_MS until velocity decays to zero, which at the
+    // ~90ms-per-attempt pace near an edge takes several seconds of an invisible "stuck" loop.
+    let consecutiveAckTimeouts = 0;
     // Signed px of the tick currently in flight (direction * tickPx), consumed once its
     // ack lands to know which way and how far to slide the visual compensation from.
     let pendingSlideOffsetPx = 0;
@@ -524,6 +572,16 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
         // so there is nothing to visually compensate for; drop it rather than letting the
         // next real ack apply a jump-and-slide offset for a step that never happened.
         pendingSlideOffsetPx = 0;
+        const touchState = touchScrollRef.current;
+        if (touchState !== null && touchState.released) {
+          consecutiveAckTimeouts += 1;
+          // A single missed ack can just be a slow tick; two in a row while coasting
+          // means the scrollback is pinned at an edge and further ticks are pointless.
+          if (consecutiveAckTimeouts >= 2) {
+            stopDraining();
+            return;
+          }
+        }
         attemptDispatch();
       }, ACK_TIMEOUT_MS);
     };
@@ -543,6 +601,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       }
       awaitingAck = false;
       hasAckedThisGesture = true;
+      consecutiveAckTimeouts = 0;
       playSlideCompensation();
       attemptDispatch();
     });
@@ -555,6 +614,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       clearTimers();
       awaitingAck = false;
       hasAckedThisGesture = false;
+      consecutiveAckTimeouts = 0;
       pendingSlideOffsetPx = 0;
       resetSlideTransform();
       touchScrollRef.current = { lastClientY: event.touches[0].clientY, accumulatedPx: 0, released: false };
@@ -610,7 +670,18 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     container.addEventListener("touchend", handleTouchRelease, { passive: true });
     container.addEventListener("touchcancel", handleTouchRelease, { passive: true });
 
-    const resizeObserver = new ResizeObserver(() => safeFit());
+    // The container can resize outside any of the other repaint triggers below, e.g. a
+    // mobile browser's address bar collapsing mid-session (100dvh grows the layout when
+    // that happens). fit() alone only sends the new size to the pty; it does not repaint
+    // the newly revealed rows, so without a forced refresh here they stay blank until some
+    // unrelated event (reopening the screen, toggling the keyboard) happens to trigger one.
+    const resizeObserver = new ResizeObserver(() => {
+      safeFit();
+      const terminal = terminalRef.current;
+      if (terminal !== null) {
+        terminal.refresh(0, terminal.rows - 1);
+      }
+    });
     resizeObserver.observe(container);
 
     return () => {
@@ -635,10 +706,17 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [fontReady]);
 
-  // WebSocket connection to the tmux bridge; connectionEpoch allows manual reconnect
+  // WebSocket connection to the tmux bridge; connectionEpoch allows manual reconnect.
+  // Deferred until hasBeenVisible so the first fit (right below) measures a real,
+  // on-screen container instead of a hidden one (see hasBeenVisible's declaration above),
+  // and until fontReady so that fit exists at all (the terminal itself isn't created
+  // before then, see fontReady's declaration above) and measures with the real font.
   useEffect(() => {
+    if (!hasBeenVisible || !fontReady) {
+      return;
+    }
     // fit() is synchronous and the layout is settled when this effect runs (it runs
     // after the commit); we measure real cols/rows BEFORE opening the socket so we
     // can send them in the URL. The server uses this as the pty's initial size instead
@@ -660,6 +738,10 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       const terminal = terminalRef.current;
       if (terminal !== null) {
         socket.send(JSON.stringify({ type: "resize", cols: terminal.cols, rows: terminal.rows }));
+        // A reconnect on mobile often coincides with the same background/foreground cycle
+        // that can silently drop the WebGL context; force a full repaint so nothing is left
+        // showing whatever was on screen before the drop.
+        terminal.refresh(0, terminal.rows - 1);
       }
     };
     socket.onmessage = (event: MessageEvent) => {
@@ -693,7 +775,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       window.clearInterval(reconnectCountdownIntervalId);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectionEpoch, instance.id]);
+  }, [connectionEpoch, instance.id, hasBeenVisible, fontReady]);
 
   // The terminal already exists with the mount-time palette; on theme toggle
   // only the active palette needs reassigning, no need to recreate the session
@@ -703,6 +785,12 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     }
   }, [theme]);
 
+  useEffect(() => {
+    if (visible && !hasBeenVisible) {
+      setHasBeenVisible(true);
+    }
+  }, [visible, hasBeenVisible]);
+
   // When becoming visible again the container recovers real dimensions: re-fit and focus.
   // Double rAF because returning from Settings may leave the flex layout not yet settled
   // on the first frame (a single rAF sometimes measures the container mid-transition).
@@ -711,6 +799,13 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
           safeFit();
+          // Coming back from background can leave the canvas stale if the WebGL context
+          // was reclaimed while hidden; force a full repaint rather than waiting for the
+          // next write to touch every row.
+          const terminal = terminalRef.current;
+          if (terminal !== null) {
+            terminal.refresh(0, terminal.rows - 1);
+          }
           if (focusOnVisible) {
             terminalRef.current?.focus();
           }
@@ -726,10 +821,13 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
 
   return (
     <div className={`flex-1 min-h-0 flex-col ${visible ? "flex" : "hidden"}`}>
-      <div className="relative flex-1 min-h-0 overflow-hidden px-[6px] pt-[6px]">
+      <div
+        className="relative flex-1 min-h-0 overflow-hidden"
+        style={{ background: terminalThemesByMode[theme].background }}
+      >
         <div
           ref={containerRef}
-          className="h-full w-full"
+          className="flex h-full w-full justify-center"
           style={{ touchAction: "none", willChange: "transform" }}
         />
         {disconnected && (
@@ -739,7 +837,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
             onReconnect={reconnect}
           />
         )}
-        <div className="absolute bottom-[4px] right-[10px] flex gap-[6px]">
+        <div className="absolute bottom-[12px] right-[14px] flex gap-[6px]">
           <button
             type="button"
             onClick={() => applyZoom(-1)}

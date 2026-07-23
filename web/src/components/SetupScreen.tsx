@@ -18,6 +18,7 @@ import { CSS } from "@dnd-kit/utilities";
 import QRCode from "qrcode";
 import { api, ApiError } from "../api";
 import { useModalEscapeStack } from "./Modal";
+import { copyText } from "./Sidebar";
 import { PROVIDER_OPTIONS } from "../providerOptions";
 import type { ThemePreference } from "../theme";
 import type { AgentProvider, DashboardConfig, TunnelStatus } from "../types";
@@ -194,6 +195,9 @@ function TunnelSection() {
   const [passwordInput, setPasswordInput] = useState<string>("");
   const [settingPassword, setSettingPassword] = useState<boolean>(false);
   const [passwordError, setPasswordError] = useState<string | null>(null);
+  const [logs, setLogs] = useState<string | null>(null);
+  const [logsLoading, setLogsLoading] = useState<boolean>(false);
+  const [logsCopied, setLogsCopied] = useState<boolean>(false);
 
   useEffect(() => {
     if (!isAllowedHost) {
@@ -226,6 +230,17 @@ function TunnelSection() {
       setStatus(await api.stopTunnel());
     } catch (error) {
       setErrorMessage(error instanceof ApiError ? error.message : "Unexpected error stopping the tunnel.");
+    }
+  };
+
+  const loadLogs = async (): Promise<void> => {
+    setLogsLoading(true);
+    try {
+      setLogs(await api.getTunnelLogs());
+    } catch (error) {
+      setLogs(error instanceof ApiError ? `Error loading logs: ${error.message}` : "Error loading logs.");
+    } finally {
+      setLogsLoading(false);
     }
   };
 
@@ -319,7 +334,7 @@ function TunnelSection() {
       )}
 
       {!needsPassword && (
-        <div>
+        <div className="flex gap-[8px]">
           {status?.state === "running" ? (
             <button type="button" onClick={() => void handleStop()} className={btnOutline}>
               Stop tunnel
@@ -334,6 +349,41 @@ function TunnelSection() {
               {status?.state === "starting" ? "Starting…" : "Start tunnel"}
             </button>
           )}
+          <button
+            type="button"
+            onClick={() => (logs === null ? void loadLogs() : setLogs(null))}
+            className={btnGhost}
+          >
+            {logs === null ? "View logs" : "Hide logs"}
+          </button>
+        </div>
+      )}
+
+      {logs !== null && (
+        <div className="flex flex-col gap-[6px]">
+          <div className="flex items-center justify-between">
+            <span className="text-[11px] text-txt-secondary">cloudflared output (data/cloudflared.log)</span>
+            <div className="flex gap-[8px]">
+              <button
+                type="button"
+                onClick={() => {
+                  void copyText(logs).then(() => {
+                    setLogsCopied(true);
+                    setTimeout(() => setLogsCopied(false), 1500);
+                  });
+                }}
+                className={btnGhost}
+              >
+                {logsCopied ? "Copied" : "Copy"}
+              </button>
+              <button type="button" onClick={() => void loadLogs()} disabled={logsLoading} className={btnGhost}>
+                {logsLoading ? "Refreshing…" : "Refresh"}
+              </button>
+            </div>
+          </div>
+          <pre className="max-h-[260px] overflow-auto whitespace-pre-wrap break-all rounded-sm border border-border-strong bg-app p-[10px] text-[10.5px] leading-[1.4] text-txt-secondary">
+            {logs.length > 0 ? logs : "(empty)"}
+          </pre>
         </div>
       )}
     </div>

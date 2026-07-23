@@ -10,7 +10,7 @@ import { buildLaunchCommand } from "./launch";
 import { isAgentProvider, PROVIDERS, sessionKeyFor } from "./providers";
 import { loadState, saveState } from "./store";
 import { createSession, getPaneCurrentPath, killSession, sendCommandToSession } from "./tmux";
-import { getTunnelStatus, startTunnel, stopTunnel } from "./tunnel";
+import { getTunnelStatus, readTunnelLog, startTunnel, stopTunnel } from "./tunnel";
 import { applyUpdate, checkForUpdate, getUpdateStatus } from "./updater";
 import type {
   BranchAction,
@@ -646,6 +646,13 @@ apiRouter.post(
 
 apiRouter.post("/tunnel/stop", (_request, response) => {
   response.json(stopTunnel());
+});
+
+// Full stdout+stderr from the current/last cloudflared run, for diagnosing failures that
+// only show up after the tunnel already reported a URL (edge disconnects, protocol errors),
+// which getTunnelStatus's short-lived error field never captures (see tunnel.ts).
+apiRouter.get("/tunnel/logs", (_request, response) => {
+  response.type("text/plain").send(readTunnelLog());
 });
 
 // Lets the phone scan a second QR for same-network access (no cloudflared/DNS involved),
