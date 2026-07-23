@@ -1,0 +1,50 @@
+<!-- @dsCard group="Mobile" name="Instance settings sheet" subtitle="Label, location, provider+command, branch, live status grid, delete" -->
+<!doctype html>
+<html data-theme="light">
+<head>
+<meta charset="utf-8" />
+<link rel="stylesheet" href="styles.css" />
+<style>
+  body{background:var(--color-app);display:flex;flex-wrap:wrap;gap:32px;padding:40px 20px}
+  .settings-sheet{display:flex;flex-direction:column;gap:14px;max-height:70vh;overflow-y:auto}
+  .fl{display:flex;flex-direction:column;gap:5px}
+  .fl .lbl{font:600 11px var(--font-ui);text-transform:uppercase;letter-spacing:.02em;color:var(--color-txt-dim)}
+  .fl .val{font-family:var(--font-mono);font-size:13px;color:var(--color-txt-body)}
+  .fl .box{border-radius:8px;background:var(--color-raised);padding:9px 11px;font-family:var(--font-mono);font-size:12px;color:var(--color-txt-secondary);word-break:break-all}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px 10px}
+  .del-btn{margin-top:6px;align-self:flex-start;border-top:1px solid var(--color-border);width:100%;text-align:left;padding:14px 4px 2px;font:600 13.5px var(--font-ui);color:var(--color-danger);background:none;border-left:none;border-right:none;border-bottom:none}
+</style>
+</head>
+<body>
+  <div class="phone-frame">
+    <div class="phone-statusbar"><span>9:41</span><span>●●●●</span></div>
+    <div class="phone-body">
+      <div class="scrim"></div>
+      <div class="sheet" style="max-height:88%">
+        <div class="sheet-handle"></div>
+        <div class="sheet-title">Instance settings</div>
+        <div class="settings-sheet">
+          <div class="fl"><span class="lbl">Label</span><input class="input" style="font-family:var(--font-mono);font-size:13px" value="feature-payments-api" /></div>
+          <div class="fl"><span class="lbl">Location</span><div class="box">/Users/carlos/repos/api-server</div></div>
+          <div class="fl"><span class="lbl">Provider</span><span class="val" style="font-family:var(--font-ui);font-weight:600;font-size:12.5px">Claude Code</span><input class="input" style="font-family:var(--font-mono);font-size:12.5px" value="claude" /></div>
+          <div class="fl"><span class="lbl">Branch</span><span class="val">feature-payments-api <span style="color:var(--color-txt-dim)">(+142 -18)</span></span></div>
+          <div class="grid2">
+            <div class="fl"><span class="lbl">Model</span><span class="val">opusplan</span></div>
+            <div class="fl"><span class="lbl">Effort</span><span class="val">high</span></div>
+            <div class="fl"><span class="lbl">Context</span><span class="val" style="color:oklch(78% 0.15 95)">62k/200k (31%)</span></div>
+            <div class="fl"><span class="lbl">Session cost</span><span class="val">$3.42</span></div>
+            <div class="fl"><span class="lbl">5H limit</span><span class="val" style="color:oklch(72% 0.16 55)">78%</span></div>
+            <div class="fl"><span class="lbl">7D limit</span><span class="val" style="color:var(--color-success)">34%</span></div>
+            <div class="fl"><span class="lbl">Burn</span><span class="val">$0.85/h</span></div>
+            <div class="fl"><span class="lbl">Today</span><span class="val">$11.20</span></div>
+          </div>
+          <button class="del-btn">✕ Delete instance</button>
+        </div>
+      </div>
+    </div>
+    <div class="phone-home-indicator"></div>
+  </div>
+
+  <div style="width:390px;font-size:11px;color:var(--color-txt-dimmer);line-height:1.5">Reached from the terminal's overflow menu. Label is the only field with its own text input (saves on blur, reverts if left blank); Location is a read-only path box; Model/Effort/Context/etc. are plain live-status text, not editable controls, and only appear once the provider has exposed session data (polled only while this sheet is open, unlike the desktop sidebar which polls continuously). There is no font-size stepper anywhere in this sheet.</div>
+</body>
+</html>

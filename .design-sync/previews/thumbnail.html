@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<link rel="stylesheet" href="styles.css" />
+<style>
+  *{margin:0;box-sizing:border-box}
+  body{width:1280px;height:854px;display:flex;font-family:var(--font-ui)}
+  .main{flex:1;background:var(--color-accent);display:flex;align-items:center;justify-content:center}
+  .name{color:var(--color-on-accent);font-weight:800;font-size:96px;letter-spacing:-.01em;text-align:center;line-height:1.05}
+  .strip{width:120px;display:flex;flex-direction:column}
+  .strip div{flex:1}
+</style>
+</head>
+<body>
+  <div class="main"><div class="name">AI<br/>Multi-<br/>Instance</div></div>
+  <div class="strip">
+    <div style="background:oklch(83% 0.006 50)"></div>
+    <div style="background:var(--color-accent)"></div>
+    <div style="background:var(--color-danger)"></div>
+    <div style="background:oklch(29% 0.005 50)"></div>
+  </div>
+</body>
+</html>

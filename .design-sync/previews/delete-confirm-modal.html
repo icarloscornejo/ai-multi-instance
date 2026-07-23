@@ -1,0 +1,31 @@
+<!-- @dsCard group="Modals" name="Delete instance" subtitle="Single confirm variant: title, plain paragraph, Cancel/Delete" -->
+<!doctype html>
+<html data-theme="light">
+<head>
+<meta charset="utf-8" />
+<link rel="stylesheet" href="styles.css" />
+<style>
+  body{background:var(--color-app);display:flex;flex-direction:column;align-items:center;gap:24px;min-height:100vh;padding:40px 20px}
+  .overlay{background:var(--color-overlay);display:flex;align-items:center;justify-content:center;padding:36px;border-radius:var(--radius-lg)}
+  .modal{width:400px;display:flex;flex-direction:column;gap:14px;border-radius:10px;border:1px solid var(--color-border);background:var(--color-surface);padding:24px;box-shadow:var(--shadow-modal)}
+  h2{font-size:14px;font-weight:600;color:var(--color-txt-bright);margin:0}
+  p{font-size:12.5px;line-height:1.55;color:var(--color-txt-body);margin:0}
+  .path{font-family:var(--font-mono)}
+  .footer{display:flex;justify-content:flex-end;gap:10px}
+  .caption{width:400px;font-size:11px;color:var(--color-txt-dimmer);line-height:1.5}
+</style>
+</head>
+<body>
+  <div class="overlay">
+    <div class="modal">
+      <h2>Delete instance</h2>
+      <p>The tmux session for <strong style="color:var(--color-txt-bright)">feature-payments-api</strong> will be closed. The folder <span class="path">/Users/carlos/repos/api-server</span> and its contents are untouched.</p>
+      <div class="footer">
+        <button class="btn btn-ghost">Cancel</button>
+        <button class="btn btn-danger">Delete</button>
+      </div>
+    </div>
+  </div>
+  <div class="caption">Single variant, no "running session" warning banner and no typed-confirmation step: whether Claude is actively running in the instance doesn't change this dialog. Deleting only closes the tmux session; the folder itself is never touched.</div>
+</body>
+</html>

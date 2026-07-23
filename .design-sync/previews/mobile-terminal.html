@@ -1,0 +1,91 @@
+<!-- @dsCard group="Mobile" name="Terminal view" subtitle="Header, instance switcher sheet, overflow sheet, accessory key row" -->
+<!doctype html>
+<html data-theme="light">
+<head>
+<meta charset="utf-8" />
+<link rel="stylesheet" href="styles.css" />
+<style>
+  body{background:var(--color-app);display:flex;flex-wrap:wrap;gap:32px;padding:40px 20px}
+  .term-bar{height:46px;flex-shrink:0;display:flex;align-items:center;gap:4px;border-bottom:1px solid var(--color-border);background:var(--color-app);padding:0 10px}
+  .term-bar .icon-btn{width:30px;height:30px;flex-shrink:0;display:flex;align-items:center;justify-content:center;border-radius:6px;color:var(--color-txt-secondary)}
+  .term-bar .icon-btn svg{width:16px;height:16px}
+  .term-bar .label{flex:1;min-width:0;padding:0 4px;font:600 13.5px var(--font-ui);color:var(--color-txt-bright);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .term-body{flex:1;min-height:0;background:#161412;color:#c9c4bd;font:12px var(--font-mono);padding:10px 12px;overflow:hidden}
+  .term-body .prompt{color:#8fd19e}
+  .scroll-btn{position:absolute;right:14px;bottom:70px;width:36px;height:36px;border-radius:999px;background:var(--color-raised-2);color:var(--color-txt-bright);display:flex;align-items:center;justify-content:center;font-size:15px;box-shadow:var(--shadow-modal);border:none}
+  .switch-row{display:flex;flex-direction:column}
+  .switch-item{padding:12px 20px;text-align:left;font-size:14px;color:var(--color-txt-secondary);background:none;border:none}
+  .switch-item.active{font-weight:600;color:var(--color-txt-bright)}
+  .switch-item.new{border-top:1px solid var(--color-border);color:var(--color-txt-dim)}
+  .caption{width:390px;font-size:11px;line-height:1.5;color:var(--color-txt-dimmer)}
+</style>
+</head>
+<body>
+  <div class="phone-frame">
+    <div class="phone-statusbar"><span>9:41</span><span>●●●●</span></div>
+    <div class="phone-body">
+      <div class="term-bar">
+        <button class="icon-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"></path></svg></button>
+        <span class="label">feature-payments-api</span>
+        <button class="icon-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="6" rx="1.5"></rect><rect x="3" y="14" width="18" height="6" rx="1.5"></rect></svg></button>
+        <button class="icon-btn"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"></circle><circle cx="12" cy="12" r="1.8"></circle><circle cx="19" cy="12" r="1.8"></circle></svg></button>
+      </div>
+      <div class="term-body" style="position:relative">
+        <div><span class="prompt">❯</span> npm run build</div>
+        <div>...</div>
+        <div>build finished in 4.2s</div>
+        <div><span class="prompt">❯</span> _</div>
+        <button class="scroll-btn" aria-label="Scroll to bottom">↓</button>
+      </div>
+      <div class="key-row">
+        <div class="key">Esc</div><div class="key">^C</div><div class="key">←</div><div class="key">↑</div><div class="key">↓</div><div class="key">→</div><div class="key">^V</div><div class="key key--active">Enter</div>
+      </div>
+    </div>
+    <div class="phone-home-indicator"></div>
+  </div>
+
+  <div class="phone-frame">
+    <div class="phone-statusbar"><span>9:41</span><span>●●●●</span></div>
+    <div class="phone-body">
+      <div class="term-bar" style="opacity:.5">
+        <button class="icon-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"></path></svg></button>
+        <span class="label">feature-payments-api</span>
+      </div>
+      <div class="term-body" style="opacity:.5"><div><span class="prompt">❯</span> _</div></div>
+      <div class="scrim"></div>
+      <div class="sheet">
+        <div class="sheet-handle"></div>
+        <div class="sheet-title">Instances</div>
+        <div class="switch-row">
+          <button class="switch-item active">feature-payments-api</button>
+          <button class="switch-item">quick-fix</button>
+          <button class="switch-item">docs-site</button>
+          <button class="switch-item new">+ New instance</button>
+        </div>
+      </div>
+    </div>
+    <div class="phone-home-indicator"></div>
+  </div>
+
+  <div class="phone-frame">
+    <div class="phone-statusbar"><span>9:41</span><span>●●●●</span></div>
+    <div class="phone-body">
+      <div class="term-bar" style="opacity:.5">
+        <button class="icon-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"></path></svg></button>
+        <span class="label">feature-payments-api</span>
+      </div>
+      <div class="term-body" style="opacity:.5"><div><span class="prompt">❯</span> _</div></div>
+      <div class="scrim"></div>
+      <div class="sheet">
+        <div class="sheet-handle"></div>
+        <button class="action-sheet-btn">Instance settings</button>
+        <button class="action-sheet-btn danger">Close instance</button>
+        <button class="action-sheet-btn">Cancel</button>
+      </div>
+    </div>
+    <div class="phone-home-indicator"></div>
+  </div>
+
+  <div class="caption">Left to right: terminal open, key row is Esc/^C/arrows/^V (clipboard paste, only shown when the browser exposes a readable clipboard)/Enter, plain circular "↓" scroll-to-bottom button (no label). Instance switcher opens as a plain vertical list of instance names in a bottom sheet, not a row of cards, with a "+ New instance" row appended. Overflow menu (the "..." button) has exactly two actions: "Instance settings" and "Close instance", no status dot appears in the header.</div>
+</body>
+</html>

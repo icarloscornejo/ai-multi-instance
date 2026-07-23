@@ -1,0 +1,87 @@
+<!-- @dsCard group="Mobile" name="Home / Instance list" subtitle="Card list, empty state, long-press delete, FAB" -->
+<!doctype html>
+<html data-theme="light">
+<head>
+<meta charset="utf-8" />
+<link rel="stylesheet" href="styles.css" />
+<style>
+  body{background:var(--color-app);display:flex;flex-wrap:wrap;gap:32px;padding:40px 20px}
+  .home-bar{height:46px;flex-shrink:0;display:flex;align-items:center;justify-content:space-between;padding:0 14px;border-bottom:1px solid var(--color-border);background:var(--color-surface)}
+  .home-bar .title{font:700 15px var(--font-ui);color:var(--color-txt-bright)}
+  .home-bar .gear{width:34px;height:34px;display:flex;align-items:center;justify-content:center;color:var(--color-txt-secondary)}
+  .home-bar .gear svg{width:18px;height:18px}
+  .card{display:flex;flex-direction:column;gap:6px;border-radius:10px;border:1px solid var(--color-border);background:var(--color-surface);padding:12px 14px;position:relative}
+  .card .top{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .card .label{font:600 14px var(--font-ui);color:var(--color-txt-bright);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .card .chev{color:var(--color-txt-dimmer);flex-shrink:0}
+  .card .badges{display:flex;gap:6px;flex-wrap:wrap}
+  .pill{font:600 10.5px var(--font-ui);color:var(--color-txt-secondary);background:var(--color-raised);border-radius:999px;padding:3px 9px}
+  .pill.branch{font-family:var(--font-mono);font-weight:500}
+  .list{display:flex;flex-direction:column;gap:10px;padding:12px;flex:1;overflow-y:auto}
+  .fab{position:absolute;right:20px;bottom:calc(var(--safe-bottom) + 24px);width:52px;height:52px;border-radius:999px;background:var(--color-accent);color:var(--color-on-accent);display:flex;align-items:center;justify-content:center;font-size:24px;border:none;box-shadow:var(--shadow-modal)}
+  .empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px}
+  .empty .t{font:500 13px var(--font-ui);color:var(--color-txt-dim)}
+  .sheet-actions{display:flex;flex-direction:column}
+  .caption{width:390px;font-size:11px;line-height:1.5;color:var(--color-txt-dimmer)}
+</style>
+</head>
+<body>
+  <div class="phone-frame">
+    <div class="phone-statusbar"><span>9:41</span><span>●●●●</span></div>
+    <div class="phone-body">
+      <div class="home-bar"><span class="title">AI Multi-Instance</span><button class="gear"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg></button></div>
+      <div class="list">
+        <div class="card">
+          <div class="top"><span class="label">feature-payments-api</span><svg class="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"></path></svg></div>
+          <div class="badges"><span class="pill">Claude Code · opusplan · high</span><span class="pill branch">feature-payments-api</span></div>
+        </div>
+        <div class="card">
+          <div class="top"><span class="label">quick-fix</span><svg class="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"></path></svg></div>
+          <div class="badges"><span class="pill">Claude Code · opusplan</span><span class="pill branch">main</span></div>
+        </div>
+        <div class="card">
+          <div class="top"><span class="label">docs-site</span><svg class="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"></path></svg></div>
+          <div class="badges"><span class="pill">Codex CLI</span></div>
+        </div>
+      </div>
+      <button class="fab">+</button>
+    </div>
+    <div class="phone-home-indicator"></div>
+  </div>
+
+  <div class="phone-frame">
+    <div class="phone-statusbar"><span>9:41</span><span>●●●●</span></div>
+    <div class="phone-body">
+      <div class="home-bar"><span class="title">AI Multi-Instance</span><button class="gear"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle></svg></button></div>
+      <div class="empty">
+        <div class="t">No active instances</div>
+        <button class="btn btn-outline">New instance</button>
+      </div>
+    </div>
+    <div class="phone-home-indicator"></div>
+  </div>
+
+  <div class="phone-frame">
+    <div class="phone-statusbar"><span>9:41</span><span>●●●●</span></div>
+    <div class="phone-body">
+      <div class="home-bar" style="opacity:.5"><span class="title">AI Multi-Instance</span><button class="gear"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle></svg></button></div>
+      <div class="list" style="opacity:.5">
+        <div class="card"><div class="top"><span class="label">feature-payments-api</span></div><div class="badges"><span class="pill">Claude Code · opusplan · high</span><span class="pill branch">feature-payments-api</span></div></div>
+        <div class="card"><div class="top"><span class="label">quick-fix</span></div><div class="badges"><span class="pill">Claude Code · opusplan</span><span class="pill branch">main</span></div></div>
+      </div>
+      <div class="scrim"></div>
+      <div class="sheet">
+        <div class="sheet-handle"></div>
+        <div class="sheet-title">feature-payments-api</div>
+        <div class="sheet-actions">
+          <button class="action-sheet-btn danger">Delete</button>
+          <button class="action-sheet-btn">Cancel</button>
+        </div>
+      </div>
+    </div>
+    <div class="phone-home-indicator"></div>
+  </div>
+
+  <div class="caption">Left to right: home with instances (each card shows label, a provider+model+effort pill, and a branch pill when the branch has loaded, no status dot, activity text, or timestamp: the card is a one-shot git lookup, not a live poll), empty state (plain centered text and button, no icon), long-press action sheet (a single Delete action plus the sheet's own Cancel row, not a 3-option menu). FAB only shows once there is at least one instance.</div>
+</body>
+</html>

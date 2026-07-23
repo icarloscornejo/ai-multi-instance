@@ -1,0 +1,87 @@
+<!-- @dsCard group="Full screens" name="Setup: Locations, Agents, LAN & Remote access" subtitle="First-run and Settings-mode desktop card; row errors and empty state" -->
+<!doctype html>
+<html data-theme="light">
+<head>
+<meta charset="utf-8" />
+<link rel="stylesheet" href="styles.css" />
+<style>
+  body{background:var(--color-app);display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:center;gap:24px;min-height:100vh;padding:40px 20px}
+  .card{width:520px;display:flex;flex-direction:column;gap:16px;border-radius:14px;border:1px solid var(--color-border);background:var(--color-surface);padding:26px;box-shadow:var(--shadow-modal)}
+  h1{font-size:15px;font-weight:700;color:var(--color-txt-bright);margin:0}
+  .lead{font-size:12.5px;line-height:1.55;color:var(--color-txt-secondary);margin:0}
+  .row{display:flex;align-items:center;gap:8px}
+  .grip{width:14px;flex-shrink:0;text-align:center;font-size:13px;color:var(--color-txt-dimmer)}
+  .rm{width:28px;height:28px;flex-shrink:0;display:flex;align-items:center;justify-content:center;border-radius:6px;color:var(--color-txt-dim);font-size:13px}
+  .add-row{width:100%;border-radius:6px;border:1px dashed var(--color-border-strong);padding:10px;font-size:12px;font-weight:600;color:var(--color-txt-secondary);text-align:center}
+  h2{font-size:12.5px;font-weight:600;color:var(--color-txt-bright);margin:0}
+  .section{display:flex;flex-direction:column;gap:8px;border-top:1px solid var(--color-border);padding-top:14px}
+  .check-row{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--color-txt-body)}
+  .footer{display:flex;align-items:center;justify-content:flex-end;gap:10px}
+  .logbox{max-height:180px;overflow:auto;white-space:pre-wrap;word-break:break-all;border-radius:6px;border:1px solid var(--color-border-strong);background:var(--color-app);padding:10px;font-family:var(--font-mono);font-size:10.5px;line-height:1.4;color:var(--color-txt-secondary)}
+  .caption{width:520px;font-size:11px;line-height:1.5;color:var(--color-txt-dimmer)}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div>
+      <h1>Locations</h1>
+      <p class="lead">Each location is a folder where terminals open. Open multiple instances in the same location at once. There's no per-folder limit.</p>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <div class="row"><span class="grip">⋮⋮</span><input class="input" value="/Users/carlos/repos/api-server" /><span class="rm">✕</span></div>
+      <div class="row"><span class="grip">⋮⋮</span><input class="input error" value="/Users/carlos/repos/api-server" /><span class="rm">✕</span></div>
+      <div style="margin-left:22px" class="error-text">⚠ Already added, remove one of the duplicates</div>
+      <div class="row"><span class="grip">⋮⋮</span><input class="input" value="/Users/carlos/repos/docs-site" /><span class="rm">✕</span></div>
+    </div>
+    <button class="add-row">+ Add location</button>
+
+    <div class="section">
+      <h2>Agents</h2>
+      <p class="lead">Agents shown when launching a new instance. At least one must stay enabled.</p>
+      <label class="check-row"><input type="checkbox" checked />Claude Code</label>
+      <label class="check-row"><input type="checkbox" checked />Codex CLI</label>
+      <label class="check-row"><input type="checkbox" />Cursor Agent</label>
+      <label class="check-row"><input type="checkbox" />Custom command</label>
+    </div>
+
+    <div class="section">
+      <h2>Same Wi-Fi network</h2>
+      <p class="lead">On the same Wi-Fi as this machine, skip the tunnel and scan this instead.</p>
+      <div style="display:flex;gap:14px;align-items:flex-start">
+        <div style="width:90px;height:90px;background:#fff;border:1px solid var(--color-border-strong);border-radius:6px"></div>
+        <a href="#" style="font-size:12px;color:var(--color-accent);font-weight:500">https://192.168.1.42:8443</a>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Remote access</h2>
+      <p class="lead">Expose this dashboard over a public HTTPS URL via Cloudflare, so you can open it from your phone off the LAN. The URL is temporary and changes every time the tunnel restarts.</p>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-outline">Stop tunnel</button>
+        <button class="btn btn-ghost">Hide logs</button>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span style="font-size:11px;color:var(--color-txt-secondary)">cloudflared output (data/cloudflared.log)</span>
+        <div style="display:flex;gap:8px"><button class="btn btn-ghost">Copy</button><button class="btn btn-ghost">Refresh</button></div>
+      </div>
+      <div class="logbox">2026-07-21T18:02:11Z INF Registered tunnel connection
+2026-07-21T18:02:12Z INF Starting metrics server on 127.0.0.1:20241/metrics
+2026-07-21T18:02:14Z INF Route propagating, it may take up to 1 minute</div>
+    </div>
+
+    <div class="footer">
+      <button class="btn btn-ghost">Cancel</button>
+      <button class="btn btn-primary">Save</button>
+    </div>
+  </div>
+
+  <div class="card" style="align-items:center;text-align:center;gap:10px;padding:34px">
+    <div style="width:36px;height:36px;border-radius:6px;border:1px solid var(--color-border-strong);display:flex;align-items:center;justify-content:center;font-size:16px;color:var(--color-txt-dim)">+</div>
+    <div style="font-size:12.5px;font-weight:600;color:var(--color-txt-bright)">No locations yet</div>
+    <div style="max-width:320px;font-size:11.5px;line-height:1.5;color:var(--color-txt-dim)">Add a folder to start opening Claude instances in it. You can add as many as you like.</div>
+    <button class="btn btn-outline">Add your first location</button>
+  </div>
+
+  <div class="caption">Left: Settings mode, opened via the gear icon in the tab bar, showing every section stacked in a single scrollable column (Locations, Agents, same-Wi-Fi QR, and Remote access with an expanded cloudflared log viewer). Same-Wi-Fi and Remote-access sections only render on the desktop-only "ai.local" host, never on a tunnel URL or on mobile. Right: first-run empty state before any location has been added, with no Cancel button since there is nothing yet to cancel back to.</div>
+</body>
+</html>

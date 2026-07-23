@@ -1,0 +1,52 @@
+<!-- @dsCard group="Full screens" name="Connection lost" subtitle="Friendly reconnect state with a live countdown ring" -->
+<!doctype html>
+<html data-theme="light">
+<head>
+<meta charset="utf-8" />
+<link rel="stylesheet" href="styles.css" />
+<style>
+  body{display:flex;flex-direction:column;align-items:center;gap:24px;min-height:100vh;padding:40px 20px}
+  .screen{width:580px;min-height:320px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;border-radius:var(--radius-lg);border:1px solid var(--color-border);background:var(--color-app);padding:40px}
+  .ring-wrap{position:relative;width:64px;height:64px;display:flex;align-items:center;justify-content:center}
+  .ring-wrap svg{width:64px;height:64px;transform:rotate(-90deg)}
+  .ring-track{fill:none;stroke:var(--color-border-strong);stroke-width:3}
+  .ring-progress{fill:none;stroke:var(--color-accent);stroke-width:3;stroke-linecap:round;transition:stroke-dashoffset 1s linear}
+  .ring-icon{position:absolute;color:var(--color-accent);display:flex}
+  .ring-icon svg{width:22px;height:22px}
+  .title{font-size:15px;font-weight:600;color:var(--color-txt-bright)}
+  .subtitle{font-size:12.5px;color:var(--color-txt-dim);text-align:center;max-width:380px;line-height:1.5}
+  .countdown{font-size:12px;color:var(--color-txt-dimmer);font-variant-numeric:tabular-nums}
+  .countdown b{color:var(--color-txt-secondary);font-weight:600}
+  .caption{width:580px;font-size:11px;color:var(--color-txt-dimmer);line-height:1.6}
+</style>
+</head>
+<body>
+  <div class="screen">
+    <div class="ring-wrap">
+      <svg viewBox="0 0 64 64">
+        <circle class="ring-track" cx="32" cy="32" r="28"></circle>
+        <circle class="ring-progress" id="ring" cx="32" cy="32" r="28" stroke-dasharray="175.9" stroke-dashoffset="0"></circle>
+      </svg>
+      <span class="ring-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 9a16 16 0 0 1 22 0M5 13a10.5 10.5 0 0 1 14 0M8.5 17a5.5 5.5 0 0 1 7 0"></path><line x1="12" y1="21" x2="12.01" y2="21"></line></svg>
+      </span>
+    </div>
+    <div class="title">Reconnecting to the local server</div>
+    <div class="subtitle">The connection to the app's local server was lost, likely because it briefly restarted during a self-update. Your instances are unaffected, and this will resolve on its own.</div>
+    <div class="countdown">Retrying in <b id="secs">3</b> seconds...</div>
+  </div>
+  <div class="caption">Replaces a raw fetch error with plain-language framing, plus a live countdown ring that ticks down each retry cycle while the local server restarts mid self-update. There is no manual retry button and no separate "still can't reach it" state: the screen just keeps auto-retrying with a fresh countdown each cycle until the connection returns.</div>
+  <script>
+    const total = 3, ring = document.getElementById('ring'), secsEl = document.getElementById('secs'), circumference = 175.9;
+    let remaining = total;
+    function tick() {
+      secsEl.textContent = remaining;
+      ring.style.strokeDashoffset = circumference * (1 - remaining / total);
+      remaining--;
+      if (remaining < 0) remaining = total;
+    }
+    tick();
+    setInterval(tick, 1000);
+  </script>
+</body>
+</html>

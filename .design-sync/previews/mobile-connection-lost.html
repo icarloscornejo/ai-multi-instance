@@ -1,0 +1,41 @@
+<!-- @dsCard group="Mobile" name="Connection lost" subtitle="Same reconnect screen as desktop, no mobile-only variant" -->
+<!doctype html>
+<html data-theme="light">
+<head>
+<meta charset="utf-8" />
+<link rel="stylesheet" href="styles.css" />
+<style>
+  body{background:var(--color-app);padding:40px 24px;display:flex;flex-direction:column;gap:12px}
+  .example-label{font-size:11px;font-weight:700;color:var(--color-txt-dim);text-transform:uppercase;letter-spacing:.03em;margin-bottom:8px}
+  .example{margin-bottom:40px}
+  .caption{margin-top:12px;font-size:11px;color:var(--color-txt-dimmer);line-height:1.6;max-width:1500px}
+  .cl-body{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:0 28px;gap:18px;text-align:center}
+  .ring-wrap-m{position:relative;width:56px;height:56px}
+  .ring-wrap-m svg{width:56px;height:56px;transform:rotate(-90deg)}
+  .ring-track-m{fill:none;stroke:var(--color-border-strong);stroke-width:3}
+  .ring-progress-m{fill:none;stroke:var(--color-accent);stroke-width:3;stroke-linecap:round}
+  .cl-title{font-size:15px;font-weight:600;color:var(--color-txt-bright)}
+  .cl-sub{font-size:12.5px;color:var(--color-txt-dim);line-height:1.5}
+</style>
+</head>
+<body>
+
+<div class="example-label">Reconnecting</div>
+<div class="example frame-row">
+  <div class="phone-frame">
+    <div class="phone-statusbar"><span>9:41</span><span>●●●●</span></div>
+    <div class="phone-body">
+      <div class="cl-body">
+        <div class="ring-wrap-m"><svg viewBox="0 0 56 56"><circle class="ring-track-m" cx="28" cy="28" r="24"></circle><circle class="ring-progress-m" cx="28" cy="28" r="24" stroke-dasharray="150.8" stroke-dashoffset="40"></circle></svg></div>
+        <div class="cl-title">Reconnecting to the local server</div>
+        <div class="cl-sub">The connection to the app's local server was lost, likely because it briefly restarted during a self-update. Your instances are unaffected, and this will resolve on its own.</div>
+        <div style="font-size:12px;color:var(--color-txt-dimmer)">Retrying in <strong style="color:var(--color-txt-secondary)">2</strong> seconds...</div>
+      </div>
+    </div>
+    <div class="phone-home-indicator"></div>
+  </div>
+</div>
+<div class="caption">ConnectionLostScreen.tsx has no isMobile prop and no mobile-specific variant: this is the exact same centered ring/title/subtitle/countdown screen as desktop, just laid out on a narrower viewport. There is no manual "Retry now" button and no separate repeated-failure state; it keeps auto-retrying with a fresh countdown each cycle.</div>
+
+</body>
+</html>
