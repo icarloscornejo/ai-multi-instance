@@ -164,7 +164,7 @@ function LanAccessSection() {
   }
 
   return (
-    <div className="flex flex-col gap-[8px] border-t border-border pt-[14px]">
+    <div className="flex flex-col gap-[8px]">
       <h2 className="text-[12.5px] font-semibold text-txt-bright">Same Wi-Fi network</h2>
       <p className="text-[11.5px] leading-[1.5] text-txt-secondary">
         On the same Wi-Fi as this machine, skip the tunnel and scan this instead.
@@ -269,7 +269,7 @@ function TunnelSection() {
   }
 
   return (
-    <div className="flex flex-col gap-[8px] border-t border-border pt-[14px]">
+    <div className="flex flex-col gap-[8px]">
       <h2 className="text-[12.5px] font-semibold text-txt-bright">Remote access</h2>
       <p className="text-[11.5px] leading-[1.5] text-txt-secondary">
         Expose this dashboard over a public HTTPS URL via Cloudflare, so you can open it from your phone off the LAN.
@@ -516,94 +516,122 @@ export function SetupScreen({
     );
   }
 
+  // Above ~900px there's room to split into two columns (Locations/Agents/LAN on the left,
+  // Remote access on the right) instead of one long scrolling column; below that, or on
+  // mobile devices (which never render the LAN/Tunnel columns), stay single-column.
+  const cardWidthClassName: string = isMobile
+    ? "w-full max-w-[520px]"
+    : "w-full max-w-[520px] min-[900px]:max-w-[min(92vw,1280px)]";
+  const contentLayoutClassName: string = isMobile
+    ? "flex flex-col gap-[18px]"
+    : "flex flex-col gap-[18px] min-[900px]:grid min-[900px]:grid-cols-2 min-[900px]:items-start min-[900px]:gap-x-[80px] min-[900px]:gap-y-0";
+
   return (
     <div className="flex h-screen items-center justify-center px-[16px]">
-      <div className={`w-full max-w-[520px] max-h-[90vh] overflow-y-auto ${cardClassName}`}>
-        <div className="flex flex-col gap-[4px]">
-          <h1 className="text-[15px] font-bold text-txt-bright">Locations</h1>
-          <p className="text-[12.5px] leading-[1.55] text-txt-secondary">
-            Each location is a folder where terminals open. Open multiple instances in the same location at once.
-            There's no per-folder limit.
-          </p>
-        </div>
-
-        <DndContext sensors={sensors} collisionDetection={closestCenter} modifiers={[restrictToVerticalAxis]} onDragEnd={handleDragEnd}>
-          <SortableContext items={locations.map((row) => row.id)} strategy={verticalListSortingStrategy}>
-            <div className="flex flex-col gap-[10px]">
-              {locations.map((row, index) => (
-                <SortableRow
-                  key={row.id}
-                  row={row}
-                  errorText={rowError(row)}
-                  onChange={setLocationAt}
-                  onRemove={removeLocationAt}
-                  onEnter={() => void handleSave()}
-                  autoFocus={index === 0}
-                />
-              ))}
+      <div className={`max-h-[90vh] overflow-y-auto ${cardWidthClassName} ${cardClassName}`}>
+        <div className={contentLayoutClassName}>
+          <div className="flex min-w-0 flex-col gap-[18px]">
+            <div className="flex flex-col gap-[4px]">
+              <h1 className="text-[15px] font-bold text-txt-bright">Locations</h1>
+              <p className="text-[12.5px] leading-[1.55] text-txt-secondary">
+                Each location is a folder where terminals open. Open multiple instances in the same location at once.
+                There's no per-folder limit.
+              </p>
             </div>
-          </SortableContext>
-        </DndContext>
 
-        <button
-          type="button"
-          onClick={addLocation}
-          className="w-full rounded-sm border border-dashed border-border-strong py-[10px] text-[12px] font-semibold text-txt-secondary hover:border-accent-border hover:text-accent"
-        >
-          + Add location
-        </button>
+            <DndContext sensors={sensors} collisionDetection={closestCenter} modifiers={[restrictToVerticalAxis]} onDragEnd={handleDragEnd}>
+              <SortableContext items={locations.map((row) => row.id)} strategy={verticalListSortingStrategy}>
+                <div className="flex flex-col gap-[10px]">
+                  {locations.map((row, index) => (
+                    <SortableRow
+                      key={row.id}
+                      row={row}
+                      errorText={rowError(row)}
+                      onChange={setLocationAt}
+                      onRemove={removeLocationAt}
+                      onEnter={() => void handleSave()}
+                      autoFocus={index === 0}
+                    />
+                  ))}
+                </div>
+              </SortableContext>
+            </DndContext>
 
-        {showThemePicker && themePreference !== undefined && onThemePreferenceChange !== undefined && (
-          <div className="flex flex-col gap-[8px] border-t border-border pt-[14px]">
-            <h2 className="text-[12.5px] font-semibold text-txt-bright">Appearance</h2>
-            <div className="flex gap-[4px] rounded-sm border border-border-strong bg-app p-[3px]">
-              {THEME_OPTIONS.map((option) => (
-                <button
-                  key={option.value}
-                  type="button"
-                  onClick={() => onThemePreferenceChange(option.value)}
-                  className={`flex-1 rounded-sm py-[7px] text-[12px] font-semibold ${
-                    themePreference === option.value
-                      ? "bg-raised-2 text-txt-bright"
-                      : "text-txt-secondary hover:text-txt-body"
-                  }`}
-                >
-                  {option.label}
-                </button>
-              ))}
+            <button
+              type="button"
+              onClick={addLocation}
+              className="w-full rounded-sm border border-dashed border-border-strong py-[10px] text-[12px] font-semibold text-txt-secondary hover:border-accent-border hover:text-accent"
+            >
+              + Add location
+            </button>
+
+            {showThemePicker && themePreference !== undefined && onThemePreferenceChange !== undefined && (
+              <div className="flex flex-col gap-[8px] border-t border-border pt-[14px]">
+                <h2 className="text-[12.5px] font-semibold text-txt-bright">Appearance</h2>
+                <div className="flex gap-[4px] rounded-sm border border-border-strong bg-app p-[3px]">
+                  {THEME_OPTIONS.map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      onClick={() => onThemePreferenceChange(option.value)}
+                      className={`flex-1 rounded-sm py-[7px] text-[12px] font-semibold ${
+                        themePreference === option.value
+                          ? "bg-raised-2 text-txt-bright"
+                          : "text-txt-secondary hover:text-txt-body"
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="flex flex-col gap-[4px] border-t border-border pt-[14px]">
+              <h2 className="text-[12.5px] font-semibold text-txt-bright">Agents</h2>
+              <p className="text-[11.5px] leading-[1.5] text-txt-secondary">
+                Agents shown when launching a new instance. At least one must stay enabled.
+              </p>
             </div>
+            <div className="flex flex-col gap-[8px]">
+              {PROVIDER_OPTIONS.map((option) => {
+                const checked: boolean = enabledProviders.includes(option.value);
+                const isLastEnabled: boolean = checked && enabledProviders.length === 1;
+                return (
+                  <label
+                    key={option.value}
+                    className={`flex items-center gap-[8px] text-[12px] text-txt-body ${isLastEnabled ? "opacity-50" : ""}`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      disabled={isLastEnabled}
+                      onChange={() => toggleProvider(option.value)}
+                    />
+                    {option.label}
+                  </label>
+                );
+              })}
+            </div>
+
           </div>
-        )}
 
-        <div className="flex flex-col gap-[4px] border-t border-border pt-[14px]">
-          <h2 className="text-[12.5px] font-semibold text-txt-bright">Agents</h2>
-          <p className="text-[11.5px] leading-[1.5] text-txt-secondary">
-            Agents shown when launching a new instance. At least one must stay enabled.
-          </p>
+          {/* Border-top goes on whichever child actually renders first (LanAccessSection and
+              TunnelSection can each independently render null), and only when stacked below
+              900px where this column no longer sits beside Locations/Agents but under them. */}
+          {!isMobile && (
+            <div
+              className={
+                "flex min-w-0 flex-col gap-[18px] " +
+                "[&>*+*]:border-t [&>*+*]:border-border [&>*+*]:pt-[14px] " +
+                "max-[899px]:[&>*:first-child]:border-t max-[899px]:[&>*:first-child]:border-border max-[899px]:[&>*:first-child]:pt-[14px]"
+              }
+            >
+              <LanAccessSection />
+              <TunnelSection />
+            </div>
+          )}
         </div>
-        <div className="flex flex-col gap-[8px]">
-          {PROVIDER_OPTIONS.map((option) => {
-            const checked: boolean = enabledProviders.includes(option.value);
-            const isLastEnabled: boolean = checked && enabledProviders.length === 1;
-            return (
-              <label
-                key={option.value}
-                className={`flex items-center gap-[8px] text-[12px] text-txt-body ${isLastEnabled ? "opacity-50" : ""}`}
-              >
-                <input
-                  type="checkbox"
-                  checked={checked}
-                  disabled={isLastEnabled}
-                  onChange={() => toggleProvider(option.value)}
-                />
-                {option.label}
-              </label>
-            );
-          })}
-        </div>
-
-        {!isMobile && <LanAccessSection />}
-        {!isMobile && <TunnelSection />}
 
         {errorMessage !== null && <div className={errorTextClassName}>{errorMessage}</div>}
 
