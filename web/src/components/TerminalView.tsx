@@ -327,7 +327,11 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       return;
     }
     const terminal = new Terminal({
-      fontFamily: '"JetBrains Mono", ui-monospace, monospace',
+      // "Apple Symbols" is the only font in this stack with monochrome glyphs for
+      // Claude Code's status icons (play/pause); without it iOS falls through to
+      // Apple Color Emoji for the glyphs it does have and draws nothing for the
+      // ones it doesn't
+      fontFamily: '"JetBrains Mono", "Apple Symbols", ui-monospace, monospace',
       fontSize,
       theme: terminalThemesByMode[theme],
       cursorBlink: true,
@@ -746,7 +750,21 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     };
     socket.onmessage = (event: MessageEvent) => {
       if (typeof event.data === "string") {
-        terminalRef.current?.write(event.data, () => {
+        // Claude Code's status/output glyphs (auto-accept ⏵⏵, manual ⏸, tool-call
+        // bullet ⏺) all live in the Miscellaneous Technical block and arrive as plain
+        // codepoints, no emoji variation selector (confirmed via tmux capture-pane hex
+        // dump). Mobile Safari has no monochrome glyph for any of them in this font
+        // stack and falls through to Apple Color Emoji, which draws nothing for
+        // U+23F5 and a colorful icon for U+23F8/U+23FA. U+23F5 and U+23FA are remapped
+        // to common dingbats with much wider font coverage (U+25B6, U+25CF; U+25B6
+        // confirmed on device). U+23F8 instead gets an appended U+FE0E (text
+        // presentation selector, zero-width for xterm) since that alone was enough
+        // to force its monochrome glyph.
+        const text = event.data
+          .replace(/\u23F5/g, "\u25B6")
+          .replace(/\u23F8/g, "\u23F8\uFE0E")
+          .replace(/\u23FA/g, "\u25CF");
+        terminalRef.current?.write(text, () => {
           writeCommittedForAckRef.current = true;
         });
       }
