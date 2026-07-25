@@ -9,6 +9,7 @@ import { MobileKeyBar } from "./components/MobileKeyBar";
 import { MobileTerminalChrome } from "./components/MobileTerminalChrome";
 import { NewInstanceModal } from "./components/NewInstanceModal";
 import { RequiredUpdateBanner } from "./components/RequiredUpdateBanner";
+import { ServerErrorScreen } from "./components/ServerErrorScreen";
 import { SetupScreen } from "./components/SetupScreen";
 import { Sidebar } from "./components/Sidebar";
 import { TabBar } from "./components/TabBar";
@@ -34,8 +35,7 @@ import type {
   UpdateStatus,
 } from "./types";
 
-// How long the initial-load retry waits between attempts, and the countdown
-// the ConnectionLostScreen ring animates against, kept in lockstep with it
+// How long the initial-load retry waits between attempts before trying again
 const LOAD_RETRY_DELAY_MS = 3_000;
 
 export function App() {
@@ -47,13 +47,12 @@ export function App() {
   const [updateViewOpen, setUpdateViewOpen] = useState<boolean>(false);
   const [autoApplyOnOpen, setAutoApplyOnOpen] = useState<boolean>(false);
   const [deleteRequest, setDeleteRequest] = useState<Instance | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadFailure, setLoadFailure] = useState<"connection" | "server" | null>(null);
   const [gateOpen, setGateOpen] = useState<boolean>(false);
   // Mirrors gateOpen for the pageshow handler below, which is registered once and would
   // otherwise close over the initial (stale) value instead of the live one.
   const gateOpenRef = useRef<boolean>(false);
   gateOpenRef.current = gateOpen;
-  const [loadRetryMsRemaining, setLoadRetryMsRemaining] = useState<number>(LOAD_RETRY_DELAY_MS);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [applyDeadline, setApplyDeadline] = useState<number | null>(null);
   const [countdownMs, setCountdownMs] = useState<number>(0);
@@ -117,7 +116,6 @@ export function App() {
   useEffect(() => {
     let cancelled: boolean = false;
     let retryTimeoutId: number | undefined;
-    let countdownIntervalId: number | undefined;
 
     const load = (): void => {
       Promise.all([api.getConfig(), api.listInstances()])
@@ -125,7 +123,7 @@ export function App() {
           if (cancelled) {
             return;
           }
-          setLoadError(null);
+          setLoadFailure(null);
           setConfig(loadedConfig);
           setInstances(loadedInstances);
           const rememberedId: string | null = localStorage.getItem("ccdash.activeInstanceId");
@@ -153,16 +151,10 @@ export function App() {
             // handler above already opens the gate, so no reconnect-retry loop here
             return;
           }
-          setLoadError(error.message);
-          const retryStartedAt: number = Date.now();
-          setLoadRetryMsRemaining(LOAD_RETRY_DELAY_MS);
-          countdownIntervalId = window.setInterval(() => {
-            setLoadRetryMsRemaining(Math.max(0, LOAD_RETRY_DELAY_MS - (Date.now() - retryStartedAt)));
-          }, 100);
-          retryTimeoutId = window.setTimeout(() => {
-            window.clearInterval(countdownIntervalId);
-            load();
-          }, LOAD_RETRY_DELAY_MS);
+          // An ApiError means the server responded (even if with a 4xx/5xx); anything else
+          // (fetch's TypeError) means the server never answered at all
+          setLoadFailure(error instanceof ApiError ? "server" : "connection");
+          retryTimeoutId = window.setTimeout(load, LOAD_RETRY_DELAY_MS);
         });
     };
 
@@ -170,7 +162,6 @@ export function App() {
     return () => {
       cancelled = true;
       window.clearTimeout(retryTimeoutId);
-      window.clearInterval(countdownIntervalId);
     };
   }, []);
 
@@ -390,8 +381,11 @@ export function App() {
   if (gateOpen) {
     return <GateScreen onUnlocked={() => window.location.reload()} />;
   }
-  if (loadError !== null) {
-    return <ConnectionLostScreen msRemaining={loadRetryMsRemaining} totalMs={LOAD_RETRY_DELAY_MS} />;
+  if (loadFailure === "connection") {
+    return <ConnectionLostScreen />;
+  }
+  if (loadFailure === "server") {
+    return <ServerErrorScreen />;
   }
   if (config === null) {
     return (

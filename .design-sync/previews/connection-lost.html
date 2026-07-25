@@ -35,7 +35,7 @@
     <div class="subtitle">The connection to the app's local server was lost, likely because it briefly restarted during a self-update. Your instances are unaffected, and this will resolve on its own.</div>
     <div class="countdown">Retrying in <b id="secs">3</b> seconds...</div>
   </div>
-  <div class="caption">Replaces a raw fetch error with plain-language framing, plus a live countdown ring that ticks down each retry cycle while the local server restarts mid self-update. There is no manual retry button and no separate "still can't reach it" state: the screen just keeps auto-retrying with a fresh countdown each cycle until the connection returns.</div>
+  <div class="caption">Replaces a raw fetch error with plain-language framing, plus a live countdown ring that ticks down each retry cycle while the local server restarts mid self-update. There is no manual retry button and no separate "still can't reach it" state: the screen just keeps auto-retrying with a fresh countdown each cycle until the connection returns. Note: this is currently the ONLY error screen shown for any non-401 failure from the initial config/instances load, including a real 500 from the API. The self-update copy is misleading in that case since nothing is actually restarting; a real 500 needs its own distinct state (App.tsx's load().catch, currently undifferentiated).</div>
   <script>
     const total = 3, ring = document.getElementById('ring'), secsEl = document.getElementById('secs'), circumference = 175.9;
     let remaining = total;

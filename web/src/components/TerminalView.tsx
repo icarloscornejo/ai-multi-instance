@@ -5,6 +5,7 @@ import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useSta
 import { useIsMobile } from "../hooks/useIsMobile";
 import { getHostFontSize, setHostFontSize } from "../hostPrefs";
 import { btnGhost } from "../ui";
+import { RetryRing } from "./RetryRing";
 import type { Instance } from "../types";
 import type { Theme } from "../theme";
 
@@ -86,8 +87,6 @@ interface TerminalViewProps {
 }
 
 const RECONNECT_DELAY_MS = 3_000;
-const RECONNECT_RING_RADIUS = 16;
-const RECONNECT_RING_CIRCUMFERENCE = 2 * Math.PI * RECONNECT_RING_RADIUS;
 
 // tmux's mouse mode puts xterm's own touch-scroll to sleep (it only runs when
 // no mouse tracking is active) and attach runs tmux in the alt screen anyway, so
@@ -151,63 +150,27 @@ const FINE_SCROLL_VELOCITY_PX_PER_MS = 0.15;
 const FINE_SCROLL_UP_BYTES = "\u0019"; // C-y
 const FINE_SCROLL_DOWN_BYTES = "\u0005"; // C-e
 
-function DisconnectedOverlay({
-  msRemaining,
-  totalMs,
-  onReconnect,
-}: {
-  msRemaining: number;
-  totalMs: number;
-  onReconnect: () => void;
-}) {
-  const progress: number = 1 - msRemaining / totalMs;
-  const secondsRemaining: number = Math.max(1, Math.ceil(msRemaining / 1000));
-
+function DisconnectedOverlay({ onReconnect }: { onReconnect: () => void }) {
   return (
     <div className="absolute inset-0 flex items-center justify-center bg-app/80">
       <div className="flex w-[280px] flex-col items-center gap-[14px] rounded-lg border border-border bg-surface p-[26px] shadow-modal">
-        <div className="relative flex h-[38px] w-[38px] items-center justify-center">
-          <svg viewBox="0 0 38 38" className="h-[38px] w-[38px] -rotate-90">
-            <circle
-              cx="19"
-              cy="19"
-              r={RECONNECT_RING_RADIUS}
-              fill="none"
-              stroke="var(--color-border-strong)"
-              strokeWidth="3"
-            />
-            <circle
-              cx="19"
-              cy="19"
-              r={RECONNECT_RING_RADIUS}
-              fill="none"
-              stroke="var(--color-accent)"
-              strokeWidth="3"
-              strokeLinecap="round"
-              strokeDasharray={RECONNECT_RING_CIRCUMFERENCE}
-              strokeDashoffset={RECONNECT_RING_CIRCUMFERENCE * (1 - progress)}
-            />
+        <RetryRing size={38} tone="accent">
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className="h-[15px] w-[15px]"
+          >
+            <path d="M1 9a16 16 0 0 1 22 0M5 13a10.5 10.5 0 0 1 14 0M8.5 17a5.5 5.5 0 0 1 7 0" />
+            <line x1="12" y1="21" x2="12.01" y2="21" />
           </svg>
-          <span className="absolute flex items-center justify-center text-accent">
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              className="h-[15px] w-[15px]"
-            >
-              <path d="M1 9a16 16 0 0 1 22 0M5 13a10.5 10.5 0 0 1 14 0M8.5 17a5.5 5.5 0 0 1 7 0" />
-              <line x1="12" y1="21" x2="12.01" y2="21" />
-            </svg>
-          </span>
-        </div>
+        </RetryRing>
         <div className="flex flex-col items-center gap-[3px] text-center">
           <span className="text-[13px] font-semibold text-txt-bright">Session disconnected</span>
-          <span className="text-[11.5px] tabular-nums text-txt-dim">
-            Retrying in <span className="font-semibold text-txt-secondary">{secondsRemaining}</span> seconds...
-          </span>
+          <span className="text-[11.5px] text-txt-dim">Retrying automatically...</span>
         </div>
         <button type="button" onClick={onReconnect} className={`${btnGhost} px-[14px] py-[6px] text-[11.5px]`}>
           Reconnect now
@@ -235,7 +198,6 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     getHostFontSize(instance.id, isMobile ? MIN_FONT_SIZE : instance.fontSize)
   );
   const [disconnected, setDisconnected] = useState<boolean>(false);
-  const [reconnectMsRemaining, setReconnectMsRemaining] = useState<number>(RECONNECT_DELAY_MS);
   const [connectionEpoch, setConnectionEpoch] = useState<number>(0);
   // On mobile every instance mounts hidden (display: none) in the always-rendered pool, so
   // fit() measures a zero-width container and the socket would open with xterm's 80x24
@@ -814,16 +776,9 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     // A real disconnect (server restart from tsx watch, self-update, etc.) keeps retrying
     // every RECONNECT_DELAY_MS instead of stranding the user on the manual Reconnect button
     let reconnectTimeoutId: number | undefined;
-    let reconnectCountdownIntervalId: number | undefined;
     socket.onclose = () => {
       setDisconnected(true);
-      const retryStartedAt: number = Date.now();
-      setReconnectMsRemaining(RECONNECT_DELAY_MS);
-      reconnectCountdownIntervalId = window.setInterval(() => {
-        setReconnectMsRemaining(Math.max(0, RECONNECT_DELAY_MS - (Date.now() - retryStartedAt)));
-      }, 100);
       reconnectTimeoutId = window.setTimeout(() => {
-        window.clearInterval(reconnectCountdownIntervalId);
         setConnectionEpoch((previousEpoch) => previousEpoch + 1);
       }, RECONNECT_DELAY_MS);
     };
@@ -832,7 +787,6 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       socket.onclose = null;
       socket.close();
       window.clearTimeout(reconnectTimeoutId);
-      window.clearInterval(reconnectCountdownIntervalId);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectionEpoch, instance.id, hasBeenVisible, fontReady]);
@@ -918,13 +872,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
           className="flex h-full w-full justify-center"
           style={{ touchAction: "none", willChange: "transform" }}
         />
-        {disconnected && (
-          <DisconnectedOverlay
-            msRemaining={reconnectMsRemaining}
-            totalMs={RECONNECT_DELAY_MS}
-            onReconnect={reconnect}
-          />
-        )}
+        {disconnected && <DisconnectedOverlay onReconnect={reconnect} />}
         <div className="absolute bottom-[12px] right-[14px] flex gap-[6px]">
           <button
             type="button"
