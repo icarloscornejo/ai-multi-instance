@@ -11,7 +11,7 @@ import { isAgentProvider, PROVIDERS, sessionKeyFor } from "./providers";
 import { loadState, saveState } from "./store";
 import { createSession, getPaneCurrentPath, killSession, sendCommandToSession } from "./tmux";
 import { getTunnelStatus, readTunnelLog, startTunnel, stopTunnel } from "./tunnel";
-import { applyUpdate, checkForUpdate, getUpdateStatus } from "./updater";
+import { applyUpdate, checkForUpdate, getUpdateStatus, resetToRemote } from "./updater";
 import type {
   BranchAction,
   CreateInstancePayload,
@@ -543,6 +543,13 @@ apiRouter.post(
   "/update/apply",
   wrapAsync(async (_request, response) => {
     response.json(await applyUpdate());
+  })
+);
+
+apiRouter.post(
+  "/update/reset",
+  wrapAsync(async (_request, response) => {
+    response.json(await resetToRemote());
   })
 );
 

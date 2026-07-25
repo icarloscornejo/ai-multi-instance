@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { api, ApiError } from "../api";
 import type { UpdateStatus } from "../types";
-import { btnGhost, btnPrimary, cardClassName, iconBtnClassName } from "../ui";
+import { btnDanger, btnGhost, btnPrimary, cardClassName, iconBtnClassName } from "../ui";
+import { ResetConfirmModal } from "./ResetConfirmModal";
 
 interface UpdateScreenProps {
   initialStatus: UpdateStatus | null;
@@ -115,6 +116,18 @@ export function UpdateScreen({ initialStatus, autoApply = false, onStatusChange,
   const [status, setStatus] = useState<UpdateStatus | null>(initialStatus);
   const [phase, setPhase] = useState<"checking" | "applying" | "idle">(autoApply ? "applying" : "checking");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [showResetConfirm, setShowResetConfirm] = useState<boolean>(false);
+
+  const runReset = async (): Promise<void> => {
+    setErrorMessage(null);
+    try {
+      const result = await api.resetToRemote();
+      setStatus(result);
+      onStatusChange(result);
+    } catch (error) {
+      setErrorMessage(error instanceof ApiError ? error.message : "Could not reset to origin/main.");
+    }
+  };
 
   const runCheck = (): void => {
     setPhase("checking");
@@ -219,9 +232,25 @@ export function UpdateScreen({ initialStatus, autoApply = false, onStatusChange,
         )}
 
         {status !== null && !checking && status.blockedReason !== null && (
-          <div className="rounded-sm border border-diff-removed-border bg-diff-removed-dim px-[12px] py-[10px] text-[11.5px] text-txt-body">
-            ⚠ {status.blockedReason}
+          <div className="flex flex-col gap-[10px] rounded-sm border border-diff-removed-border bg-diff-removed-dim px-[12px] py-[10px] text-[11.5px] text-txt-body">
+            <span>⚠ {status.blockedReason}</span>
+            {status.resetLosesWork && (
+              <button type="button" onClick={() => setShowResetConfirm(true)} className={`${btnDanger} w-fit`}>
+                Reset to origin/main
+              </button>
+            )}
           </div>
+        )}
+
+        {showResetConfirm && status !== null && (
+          <ResetConfirmModal
+            localOnlyCommits={status.localOnlyCommits}
+            onConfirm={async () => {
+              await runReset();
+              setShowResetConfirm(false);
+            }}
+            onClose={() => setShowResetConfirm(false)}
+          />
         )}
 
         <div>

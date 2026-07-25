@@ -63,6 +63,8 @@ export const api = {
 
   applyUpdate: (): Promise<UpdateStatus> => requestJson("/api/update/apply", { method: "POST" }),
 
+  resetToRemote: (): Promise<UpdateStatus> => requestJson("/api/update/reset", { method: "POST" }),
+
   saveConfig: (payload: { locations: string[]; enabledProviders: AgentProvider[] }): Promise<DashboardConfig> =>
     requestJson("/api/config", { method: "PUT", body: JSON.stringify(payload) }),
 

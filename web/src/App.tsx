@@ -175,10 +175,16 @@ export function App() {
   }, []);
 
   // Keeps updateStatus fresh in the background so the toolbar indicator, popover, and
-  // mandatory-update banner reflect reality without the user opening the Update screen
+  // mandatory-update banner reflect reality without the user opening the Update screen.
+  // Skips polling while the tab is hidden (each check runs a git fetch against GitHub, and
+  // a forgotten background tab shouldn't burn through rate limits) and fires one right away
+  // when the tab becomes visible again instead of waiting out the rest of the interval.
   useEffect(() => {
     let cancelled: boolean = false;
     const poll = (): void => {
+      if (document.hidden) {
+        return;
+      }
       api
         .checkForUpdate()
         .then((freshStatus) => {
@@ -188,11 +194,18 @@ export function App() {
         })
         .catch(() => undefined);
     };
+    const handleVisibilityChange = (): void => {
+      if (!document.hidden) {
+        poll();
+      }
+    };
     poll();
-    const intervalId: number = window.setInterval(poll, 150_000);
+    const intervalId: number = window.setInterval(poll, 30_000);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
     return () => {
       cancelled = true;
       window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, []);
 

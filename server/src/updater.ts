@@ -32,6 +32,14 @@ export interface UpdateStatus {
   currentVersion: string | null;
   remoteVersion: string | null;
   requiredUpdate: boolean;
+  // HEAD is not an ancestor of origin/main and the two commits differ (e.g. after a
+  // force-pushed history rewrite upstream)
+  diverged: boolean;
+  // origin/main..HEAD: commits only reachable locally, shown before a destructive reset
+  localOnlyCommits: ChangelogEntry[];
+  // true when HEAD's tree differs from origin/main's: a reset would discard real content,
+  // not just replay the same tree under different commit hashes
+  resetLosesWork: boolean;
 }
 
 const status: UpdateStatus = {
@@ -50,6 +58,9 @@ const status: UpdateStatus = {
   currentVersion: null,
   remoteVersion: null,
   requiredUpdate: false,
+  diverged: false,
+  localOnlyCommits: [],
+  resetLosesWork: false,
 };
 
 // A required update forces auto-install on a countdown with no way to dismiss it, so it
@@ -96,6 +107,20 @@ async function isBehindRemote(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+// Distinguishes a divergence that only replays identical content under different commit
+// hashes (safe to auto-reset) from one that carries real local-only content (destructive)
+async function inspectDivergence(): Promise<{ localOnlyCommits: ChangelogEntry[]; resetLosesWork: boolean }> {
+  const localOnlyCommits: ChangelogEntry[] = await getChangelog("origin/main", "HEAD");
+  let resetLosesWork = true;
+  try {
+    await runGit(["diff", "--quiet", "origin/main", "HEAD"]);
+    resetLosesWork = false;
+  } catch {
+    resetLosesWork = true;
+  }
+  return { localOnlyCommits, resetLosesWork };
 }
 
 async function getSubject(ref: string): Promise<string> {
@@ -181,12 +206,30 @@ export async function checkForUpdate(): Promise<UpdateStatus> {
     if (currentCommit !== remoteCommit) {
       const behindRemote: boolean = await isBehindRemote();
       status.updateAvailable = behindRemote;
-      status.blockedReason = behindRemote ? null : "Local history diverges from origin/main. Update manually.";
       status.changelog = behindRemote ? await getChangelog(currentCommit, remoteCommit) : [];
+      if (behindRemote) {
+        status.diverged = false;
+        status.localOnlyCommits = [];
+        status.resetLosesWork = false;
+        status.blockedReason = null;
+      } else {
+        const divergence = await inspectDivergence();
+        status.diverged = true;
+        status.localOnlyCommits = divergence.localOnlyCommits;
+        status.resetLosesWork = divergence.resetLosesWork;
+        status.blockedReason = divergence.resetLosesWork
+          ? `Local history diverges from origin/main with ${divergence.localOnlyCommits.length} local ${
+              divergence.localOnlyCommits.length === 1 ? "commit" : "commits"
+            } not on origin/main.`
+          : null;
+      }
     } else {
       status.updateAvailable = false;
       status.blockedReason = null;
       status.changelog = [];
+      status.diverged = false;
+      status.localOnlyCommits = [];
+      status.resetLosesWork = false;
     }
 
     await refreshVersionStatus();
@@ -201,8 +244,22 @@ export async function checkForUpdate(): Promise<UpdateStatus> {
   return getUpdateStatus();
 }
 
-// Applies an update previously reported by checkForUpdate: fast-forwards onto
-// origin/main and syncs dependencies, but only if the repo is behind and clean
+// Shared by applyUpdate's auto-recovery path and the explicit resetToRemote(): tags the
+// abandoned HEAD for a manual undo, then hard-resets onto origin/main and syncs deps.
+// Never called with a dirty working tree: callers must check status --porcelain first.
+async function performReset(): Promise<void> {
+  await runGit(["tag", `pre-reset-${Date.now()}`]);
+  await runGit(["reset", "--hard", "origin/main"]);
+  await execFileAsync("npm", ["install", "--no-audit", "--no-fund"], { cwd: dashboardRepoRoot });
+  // Discard any churn that npm install may have left in the lockfile
+  await runGit(["checkout", "--", "package-lock.json"]).catch(() => undefined);
+}
+
+// Applies an update previously reported by checkForUpdate: fast-forwards onto origin/main
+// and syncs dependencies when behind, or auto-recovers via performReset() when diverged but
+// content-identical (e.g. after a force-pushed history rewrite upstream that changed no
+// tracked content). A divergence that would actually discard local content is left blocked,
+// for resetToRemote() to handle behind an explicit user confirmation.
 export async function applyUpdate(): Promise<UpdateStatus> {
   if (updateInProgress) {
     return getUpdateStatus();
@@ -230,16 +287,79 @@ export async function applyUpdate(): Promise<UpdateStatus> {
         currentCommit = remoteCommit;
         status.blockedReason = null;
         status.changelog = [];
+        status.diverged = false;
+        status.localOnlyCommits = [];
+        status.resetLosesWork = false;
+      } else if (!behindRemote && workingTreeClean) {
+        const divergence = await inspectDivergence();
+        if (!divergence.resetLosesWork) {
+          await performReset();
+          currentCommit = remoteCommit;
+          status.blockedReason = null;
+          status.changelog = [];
+          status.diverged = false;
+          status.localOnlyCommits = [];
+          status.resetLosesWork = false;
+        } else {
+          status.diverged = true;
+          status.localOnlyCommits = divergence.localOnlyCommits;
+          status.resetLosesWork = true;
+          status.blockedReason = `Local history diverges from origin/main with ${divergence.localOnlyCommits.length} local ${
+            divergence.localOnlyCommits.length === 1 ? "commit" : "commits"
+          } not on origin/main.`;
+        }
       } else {
-        status.blockedReason = workingTreeClean
-          ? "Local history diverges from origin/main. Update manually."
-          : "There are uncommitted local changes in the dashboard folder.";
+        status.blockedReason = "There are uncommitted local changes in the dashboard folder.";
       }
     } else {
       status.blockedReason = null;
+      status.diverged = false;
+      status.localOnlyCommits = [];
+      status.resetLosesWork = false;
     }
 
     status.currentCommit = currentCommit;
+    status.currentSubject = await getSubject(currentCommit);
+    status.updateAvailable = currentCommit !== remoteCommit;
+    await refreshVersionStatus();
+    await refreshRestartStatus(currentCommit);
+    status.lastError = null;
+  } catch (error) {
+    status.lastError = (error as Error).message;
+  } finally {
+    status.lastCheckAt = new Date().toISOString();
+    updateInProgress = false;
+  }
+  return getUpdateStatus();
+}
+
+// Explicit, user-confirmed recovery for a divergence that would discard local content
+// (status.resetLosesWork === true). Tags the abandoned HEAD before resetting, so it stays
+// recoverable with `git reset --hard <tag>`.
+export async function resetToRemote(): Promise<UpdateStatus> {
+  if (updateInProgress) {
+    return getUpdateStatus();
+  }
+  updateInProgress = true;
+  try {
+    await runGit(["fetch", "--quiet", "origin", "main"]);
+    const remoteCommit: string = await runGit(["rev-parse", "origin/main"]);
+    await runGit(["checkout", "--", "package-lock.json"]).catch(() => undefined);
+    const workingTreeClean: boolean = (await runGit(["status", "--porcelain"])) === "";
+    if (!workingTreeClean) {
+      status.blockedReason = "There are uncommitted local changes in the dashboard folder.";
+    } else {
+      await performReset();
+      status.blockedReason = null;
+      status.changelog = [];
+      status.diverged = false;
+      status.localOnlyCommits = [];
+      status.resetLosesWork = false;
+    }
+
+    const currentCommit: string = await runGit(["rev-parse", "HEAD"]);
+    status.currentCommit = currentCommit;
+    status.remoteCommit = remoteCommit;
     status.currentSubject = await getSubject(currentCommit);
     status.updateAvailable = currentCommit !== remoteCommit;
     await refreshVersionStatus();

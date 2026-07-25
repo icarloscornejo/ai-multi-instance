@@ -79,6 +79,9 @@ export interface UpdateStatus {
   currentVersion: string | null;
   remoteVersion: string | null;
   requiredUpdate: boolean;
+  diverged: boolean;
+  localOnlyCommits: ChangelogEntry[];
+  resetLosesWork: boolean;
 }
 
 export type TunnelState = "stopped" | "starting" | "running" | "error";
