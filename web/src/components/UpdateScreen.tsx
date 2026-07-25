@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, ApiError } from "../api";
 import type { UpdateStatus } from "../types";
-import { btnDanger, btnGhost, btnPrimary, cardClassName, iconBtnClassName } from "../ui";
+import { btnGhost, btnPrimary, cardClassName, iconBtnClassName } from "../ui";
 import { ResetConfirmModal } from "./ResetConfirmModal";
 
 interface UpdateScreenProps {
@@ -232,10 +232,10 @@ export function UpdateScreen({ initialStatus, autoApply = false, onStatusChange,
         )}
 
         {status !== null && !checking && status.blockedReason !== null && (
-          <div className="flex flex-col gap-[10px] rounded-sm border border-diff-removed-border bg-diff-removed-dim px-[12px] py-[10px] text-[11.5px] text-txt-body">
-            <span>⚠ {status.blockedReason}</span>
+          <div className="flex flex-wrap items-center justify-between gap-[10px] text-[11.5px] text-txt-dim">
+            <span>{status.blockedReason}</span>
             {status.resetLosesWork && (
-              <button type="button" onClick={() => setShowResetConfirm(true)} className={`${btnDanger} w-fit`}>
+              <button type="button" onClick={() => setShowResetConfirm(true)} className={`${btnGhost} shrink-0`}>
                 Reset to origin/main
               </button>
             )}
@@ -283,11 +283,9 @@ export function UpdateScreen({ initialStatus, autoApply = false, onStatusChange,
           </div>
         </div>
 
-        {status !== null && !checking && status.pendingRestart && (
+        {status !== null && !checking && status.pendingRestart && status.restartKind === "auto" && (
           <div className="text-[11.5px] text-accent">
-            {status.restartKind === "auto"
-              ? "Only server/web code changed: tsx watch and Vite already hot-reloaded it. Reload this page to run the new frontend."
-              : "Stop npm run dev with Ctrl+C and run it again to apply the new version. tmux sessions are preserved."}
+            Only server/web code changed: tsx watch and Vite already hot-reloaded it. Reload this page to run the new frontend.
           </div>
         )}
 

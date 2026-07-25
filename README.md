@@ -1,6 +1,6 @@
 # AI Multi-Instance
 
-**Version:** 1.11.1
+**Version:** 1.12.0
 
 Local dashboard for running Claude Code, Codex CLI, Cursor Agent, custom commands, and shell sessions in parallel. Every instance is a real tmux-backed terminal, so it survives browser and dashboard restarts. Works well from a phone browser too, with its own password-protected home, terminal, and settings screens.
 
@@ -32,7 +32,7 @@ Open <http://ai.local> (`http://localhost` also works). Existing installations m
 3. **Closing the browser does not kill anything**: sessions live in tmux. When you reopen the dashboard, each tab reconnects to its session with all output intact.
 4. **Delete an instance** (from the instance sidebar): closes the tmux session. The folder and its contents are untouched on disk.
 5. **Terminal zoom**: `A-` / `A+` buttons or `Cmd +` / `Cmd -` with focus inside the terminal. The size persists per instance.
-6. **Update** (button in the tab bar): fetches the latest version from GitHub and applies it (fast-forward + npm install) if there are no local changes in the folder. If it updated, it shows a "relaunch dashboard" notice: stop `npm run dev` with Ctrl+C and run it again. Sessions live in tmux so relaunching does not interrupt anything.
+6. **Update** (button in the tab bar): fetches the latest version from GitHub and applies it (fast-forward + npm install) if there are no local changes in the folder. Server/web code changes hot-reload automatically (`tsx watch` and Vite); other changes (dependencies, config) need `npm run dev` restarted manually. Sessions live in tmux so relaunching does not interrupt anything.
 
 ## Mobile
 

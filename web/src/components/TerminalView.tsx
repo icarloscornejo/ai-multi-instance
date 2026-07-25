@@ -3,7 +3,9 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { useIsMobile } from "../hooks/useIsMobile";
+import { useWakeRetry } from "../hooks/useWakeRetry";
 import { getHostFontSize, setHostFontSize } from "../hostPrefs";
+import { retryDelayMs } from "../retry";
 import { btnGhost } from "../ui";
 import { RetryRing } from "./RetryRing";
 import type { Instance } from "../types";
@@ -85,8 +87,6 @@ interface TerminalViewProps {
   focusOnVisible?: boolean;
   onAtBottomChange?: (atBottom: boolean) => void;
 }
-
-const RECONNECT_DELAY_MS = 3_000;
 
 // tmux's mouse mode puts xterm's own touch-scroll to sleep (it only runs when
 // no mouse tracking is active) and attach runs tmux in the alt screen anyway, so
@@ -190,6 +190,9 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   const webglAddonRef = useRef<WebglAddon | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const persistTimerRef = useRef<number | null>(null);
+  // Lives outside the connection effect (which reruns on every connectionEpoch bump) so the
+  // backoff keeps counting across reconnect attempts instead of resetting each time.
+  const reconnectAttemptRef = useRef<number>(0);
   const isMobile = useIsMobile();
   // Mobile screens are small enough that the server's default (tuned for desktop) reads
   // cramped-in-a-good-way but wastes space here; default to the smallest zoom on mobile
@@ -748,6 +751,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     socketRef.current = socket;
 
     socket.onopen = () => {
+      reconnectAttemptRef.current = 0;
       setDisconnected(false);
       safeFit();
       const terminal = terminalRef.current;
@@ -774,13 +778,14 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       }
     };
     // A real disconnect (server restart from tsx watch, self-update, etc.) keeps retrying
-    // every RECONNECT_DELAY_MS instead of stranding the user on the manual Reconnect button
+    // on a growing backoff instead of stranding the user on the manual Reconnect button
     let reconnectTimeoutId: number | undefined;
     socket.onclose = () => {
       setDisconnected(true);
       reconnectTimeoutId = window.setTimeout(() => {
         setConnectionEpoch((previousEpoch) => previousEpoch + 1);
-      }, RECONNECT_DELAY_MS);
+      }, retryDelayMs(reconnectAttemptRef.current));
+      reconnectAttemptRef.current += 1;
     };
 
     return () => {
@@ -793,31 +798,19 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
 
   // A backgrounded tab freezes JS timers, so the socket can die (server ping timeout, OS
   // reclaiming the connection) without onclose ever running; it only fires once the tab
-  // wakes back up, and from there the effect above still waits the full RECONNECT_DELAY_MS
-  // before retrying. That reads as an avoidable ~3s stall exactly when the user is already
-  // back and waiting. Reconnecting immediately on visibility/pageshow instead of waiting for
-  // that timer to run its course removes the stall while leaving RECONNECT_DELAY_MS in place
-  // for genuine live disconnects (server restart, etc). pageshow is also listened for
-  // because a bfcache restore closes sockets and doesn't reliably fire visibilitychange in
-  // every browser.
-  useEffect(() => {
-    const reconnectIfStale = (): void => {
-      if (document.visibilityState !== "visible") {
-        return;
-      }
-      const socket = socketRef.current;
-      if (socket !== null && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) {
-        return;
-      }
-      setConnectionEpoch((previousEpoch) => previousEpoch + 1);
-    };
-    document.addEventListener("visibilitychange", reconnectIfStale);
-    window.addEventListener("pageshow", reconnectIfStale);
-    return () => {
-      document.removeEventListener("visibilitychange", reconnectIfStale);
-      window.removeEventListener("pageshow", reconnectIfStale);
-    };
-  }, []);
+  // wakes back up, and from there the effect above still waits out the rest of the current
+  // backoff delay before retrying. That reads as an avoidable stall exactly when the user is
+  // already back and waiting. Reconnecting immediately (and resetting the backoff) instead of
+  // waiting for that timer to run its course removes the stall while leaving the backoff in
+  // place for genuine live disconnects (server restart, etc).
+  useWakeRetry(() => {
+    const socket = socketRef.current;
+    if (socket !== null && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) {
+      return;
+    }
+    reconnectAttemptRef.current = 0;
+    setConnectionEpoch((previousEpoch) => previousEpoch + 1);
+  });
 
   // The terminal already exists with the mount-time palette; on theme toggle
   // only the active palette needs reassigning, no need to recreate the session
@@ -858,6 +851,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
 
   const reconnect = (): void => {
     terminalRef.current?.reset();
+    reconnectAttemptRef.current = 0;
     setConnectionEpoch((previousEpoch) => previousEpoch + 1);
   };
 

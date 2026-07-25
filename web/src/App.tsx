@@ -18,6 +18,7 @@ import { UpdateScreen } from "./components/UpdateScreen";
 import { useIsMobile } from "./hooks/useIsMobile";
 import { useVisualViewport } from "./hooks/useVisualViewport";
 import { useWakeLock } from "./hooks/useWakeLock";
+import { useWakeRetry } from "./hooks/useWakeRetry";
 import {
   applyThemePreference,
   getInitialTheme,
@@ -27,6 +28,7 @@ import {
   type ThemePreference,
 } from "./theme";
 import { getInitialKeyBarPrefs, persistKeyBarPrefs, type KeyBarPref } from "./keyBar";
+import { retryDelayMs } from "./retry";
 import type {
   CreateInstancePayload,
   DashboardConfig,
@@ -34,9 +36,6 @@ import type {
   UpdateInstancePayload,
   UpdateStatus,
 } from "./types";
-
-// How long the initial-load retry waits between attempts before trying again
-const LOAD_RETRY_DELAY_MS = 3_000;
 
 export function App() {
   const [config, setConfig] = useState<DashboardConfig | null>(null);
@@ -48,6 +47,13 @@ export function App() {
   const [autoApplyOnOpen, setAutoApplyOnOpen] = useState<boolean>(false);
   const [deleteRequest, setDeleteRequest] = useState<Instance | null>(null);
   const [loadFailure, setLoadFailure] = useState<"connection" | "server" | null>(null);
+  // Mirrors loadFailure for the wake-retry handler below, which is registered once and
+  // would otherwise close over the initial (stale) value instead of the live one.
+  const loadFailureRef = useRef<"connection" | "server" | null>(null);
+  loadFailureRef.current = loadFailure;
+  const loadRetryAttemptRef = useRef<number>(0);
+  const loadRetryTimeoutIdRef = useRef<number | undefined>(undefined);
+  const loadRef = useRef<() => void>(() => undefined);
   const [gateOpen, setGateOpen] = useState<boolean>(false);
   // Mirrors gateOpen for the pageshow handler below, which is registered once and would
   // otherwise close over the initial (stale) value instead of the live one.
@@ -115,7 +121,6 @@ export function App() {
   // so a failed initial load keeps retrying instead of stranding the user on a dead end
   useEffect(() => {
     let cancelled: boolean = false;
-    let retryTimeoutId: number | undefined;
 
     const load = (): void => {
       Promise.all([api.getConfig(), api.listInstances()])
@@ -123,6 +128,7 @@ export function App() {
           if (cancelled) {
             return;
           }
+          loadRetryAttemptRef.current = 0;
           setLoadFailure(null);
           setConfig(loadedConfig);
           setInstances(loadedInstances);
@@ -154,16 +160,30 @@ export function App() {
           // An ApiError means the server responded (even if with a 4xx/5xx); anything else
           // (fetch's TypeError) means the server never answered at all
           setLoadFailure(error instanceof ApiError ? "server" : "connection");
-          retryTimeoutId = window.setTimeout(load, LOAD_RETRY_DELAY_MS);
+          loadRetryTimeoutIdRef.current = window.setTimeout(load, retryDelayMs(loadRetryAttemptRef.current));
+          loadRetryAttemptRef.current += 1;
         });
     };
 
+    loadRef.current = load;
     load();
     return () => {
       cancelled = true;
-      window.clearTimeout(retryTimeoutId);
+      window.clearTimeout(loadRetryTimeoutIdRef.current);
     };
   }, []);
+
+  // While a load failure is being retried on a backoff timer, coming back to the
+  // foreground (or the network coming back) should not have to wait out the rest of
+  // that delay: retry immediately and reset the backoff, same as a fresh failure would.
+  useWakeRetry(() => {
+    if (loadFailureRef.current === null) {
+      return;
+    }
+    window.clearTimeout(loadRetryTimeoutIdRef.current);
+    loadRetryAttemptRef.current = 0;
+    loadRef.current();
+  });
 
   // Keeps updateStatus fresh in the background so the toolbar indicator, popover, and
   // mandatory-update banner reflect reality without the user opening the Update screen.
