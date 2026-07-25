@@ -157,8 +157,10 @@ export function TabBar({
   const updateContainerRef = useRef<HTMLDivElement>(null);
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
   // Tracks which remote commit we already auto-opened the popover for, so a poll refresh
-  // (or the user re-dismissing with Later) does not keep popping it back up on its own
-  const autoShownForCommitRef = useRef<string | null>(null);
+  // (or the user re-dismissing with Later) does not keep popping it back up on its own.
+  // Persisted to localStorage (not just a plain ref) so a full page reload, e.g. right
+  // after an update applies, does not forget a commit it already showed and reopen it.
+  const autoShownForCommitRef = useRef<string | null>(localStorage.getItem("ccdash.updatePopoverShownCommit"));
 
   useEffect(() => {
     if (updateRequired || updateStatus?.updateAvailable !== true || updateStatus.remoteCommit === null) {
@@ -166,6 +168,7 @@ export function TabBar({
     }
     if (autoShownForCommitRef.current !== updateStatus.remoteCommit) {
       autoShownForCommitRef.current = updateStatus.remoteCommit;
+      localStorage.setItem("ccdash.updatePopoverShownCommit", updateStatus.remoteCommit);
       setPopoverOpen(true);
     }
   }, [updateRequired, updateStatus]);

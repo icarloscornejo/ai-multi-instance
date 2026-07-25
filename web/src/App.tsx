@@ -63,6 +63,12 @@ export function App() {
   const [applyDeadline, setApplyDeadline] = useState<number | null>(null);
   const [countdownMs, setCountdownMs] = useState<number>(0);
   const [applying, setApplying] = useState<boolean>(false);
+  // Mirror applying/updateViewOpen for the background poll effect below, which has an
+  // empty dependency array and would otherwise close over stale (initial) values.
+  const applyingRef = useRef<boolean>(false);
+  applyingRef.current = applying;
+  const updateViewOpenRef = useRef<boolean>(false);
+  updateViewOpenRef.current = updateViewOpen;
   const autoApplyFiredRef = useRef<boolean>(false);
   const [theme, setTheme] = useState<Theme>(getInitialTheme);
   const [themePreference, setThemePreference] = useState<ThemePreference>(getInitialThemePreference);
@@ -75,8 +81,12 @@ export function App() {
   useWakeLock(isMobile && mobileScreen === "terminal");
   const [mobileUpdateSnackbarOpen, setMobileUpdateSnackbarOpen] = useState<boolean>(false);
   // Mirrors TabBar's popover auto-show: opens once per newly-seen remote commit, and
-  // re-dismissing with "Later" does not keep popping it back up for the same commit
-  const mobileSnackbarShownForCommitRef = useRef<string | null>(null);
+  // re-dismissing with "Later" does not keep popping it back up for the same commit.
+  // Persisted to localStorage (not just a plain ref) so a full page reload, e.g. right
+  // after an update applies, does not forget a commit it already showed and reopen it.
+  const mobileSnackbarShownForCommitRef = useRef<string | null>(
+    localStorage.getItem("ccdash.mobileSnackbarShownCommit")
+  );
 
   const updateRequired: boolean =
     updateStatus?.requiredUpdate === true && updateStatus.updateAvailable === true;
@@ -190,10 +200,14 @@ export function App() {
   // Skips polling while the tab is hidden (each check runs a git fetch against GitHub, and
   // a forgotten background tab shouldn't burn through rate limits) and fires one right away
   // when the tab becomes visible again instead of waiting out the rest of the interval.
+  // Also skips while an apply is in flight or the Update screen is open: applyUpdate() holds
+  // a server-side mutex and returns a stale snapshot to concurrent checks, so a poll landing
+  // mid-apply could overwrite fresh state with an outdated "update available" for a commit
+  // that is, by the time the response arrives, already applied.
   useEffect(() => {
     let cancelled: boolean = false;
     const poll = (): void => {
-      if (document.hidden) {
+      if (document.hidden || applyingRef.current || updateViewOpenRef.current) {
         return;
       }
       api
@@ -315,6 +329,7 @@ export function App() {
     }
     if (mobileSnackbarShownForCommitRef.current !== updateStatus.remoteCommit) {
       mobileSnackbarShownForCommitRef.current = updateStatus.remoteCommit;
+      localStorage.setItem("ccdash.mobileSnackbarShownCommit", updateStatus.remoteCommit);
       setMobileUpdateSnackbarOpen(true);
     }
   }, [isMobile, updateRequired, updateStatus]);
