@@ -213,7 +213,10 @@ export function App() {
       api
         .checkForUpdate()
         .then((freshStatus) => {
-          if (!cancelled) {
+          // A poll already in flight when an apply started isn't stopped by the guard
+          // above (that only blocks new polls from firing); re-check here too so its
+          // stale response, arriving after the fact, can't overwrite the fresh status.
+          if (!cancelled && !applyingRef.current && !updateViewOpenRef.current) {
             setUpdateStatus(freshStatus);
           }
         })
