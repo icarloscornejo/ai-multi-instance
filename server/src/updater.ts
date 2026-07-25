@@ -68,7 +68,10 @@ export function isMajorBump(localVersion: string | null, remoteVersion: string |
 
 // tsx watch restarts the server automatically for changes under server/src, and vite
 // hot-reloads web/src in the browser: those paths need no manual relaunch from the user.
-// Any other path (package.json, root configs, vite.config, etc.) does require one.
+// This holds for both LAN and tunnel visitors now that the tunnel points at Caddy -> Vite
+// instead of the prebuilt web/dist (see server/src/tunnel.ts), so there's a single frontend
+// pipeline to reason about here, not two. Any other path (package.json, root configs,
+// vite.config, etc.) does require a manual relaunch.
 function classifyRestartKind(changedPaths: string[]): RestartKind {
   if (changedPaths.length === 0) {
     return "none";

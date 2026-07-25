@@ -21,6 +21,7 @@ import { useModalEscapeStack } from "./Modal";
 import { copyText } from "./Sidebar";
 import { PROVIDER_OPTIONS } from "../providerOptions";
 import type { ThemePreference } from "../theme";
+import { KEY_BAR_CATALOG, reorderById, type KeyBarPref } from "../keyBar";
 import type { AgentProvider, DashboardConfig, TunnelStatus } from "../types";
 import { btnGhost, btnOutline, btnPrimary, cardClassName, errorTextClassName, inputClassName, inputErrorClassName } from "../ui";
 
@@ -39,6 +40,10 @@ interface SetupScreenProps {
   showThemePicker?: boolean;
   themePreference?: ThemePreference;
   onThemePreferenceChange?: (preference: ThemePreference) => void;
+  // Same mobile-only gating as showThemePicker: desktop never renders this section
+  showKeyBarPicker?: boolean;
+  keyBarPrefs?: KeyBarPref[];
+  onKeyBarPrefsChange?: (prefs: KeyBarPref[]) => void;
   // Gates the Remote access (tunnel) section: never on mobile, and desktop-only hostname below
   isMobile?: boolean;
 }
@@ -78,7 +83,12 @@ function SortableRow({ row, errorText, onChange, onRemove, onEnter, autoFocus }:
       className={`flex flex-col gap-[5px] ${isDragging ? "z-10 opacity-80" : ""}`}
     >
       <div className="flex items-center gap-[8px]">
-        <span {...attributes} {...listeners} className="w-[14px] shrink-0 cursor-grab text-center text-[13px] text-txt-dimmer">
+        <span
+          {...attributes}
+          {...listeners}
+          style={{ touchAction: "none" }}
+          className="w-[14px] shrink-0 cursor-grab text-center text-[13px] text-txt-dimmer"
+        >
           ⋮⋮
         </span>
         <input
@@ -104,6 +114,38 @@ function SortableRow({ row, errorText, onChange, onRemove, onEnter, autoFocus }:
       </div>
       {errorText !== null && <div className={`${errorTextClassName} ml-[22px]`}>⚠ {errorText}</div>}
     </div>
+  );
+}
+
+interface SortableKeyRowProps {
+  pref: KeyBarPref;
+  label: string;
+  disabled: boolean;
+  onToggle: () => void;
+}
+
+function SortableKeyRow({ pref, label, disabled, onToggle }: SortableKeyRowProps) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: pref.id });
+
+  return (
+    <label
+      ref={setNodeRef}
+      style={{ transform: CSS.Translate.toString(transform), transition }}
+      className={`flex items-center gap-[8px] text-[12px] text-txt-body ${isDragging ? "z-10 opacity-80" : ""} ${
+        disabled ? "opacity-50" : ""
+      }`}
+    >
+      <span
+        {...attributes}
+        {...listeners}
+        style={{ touchAction: "none" }}
+        className="w-[14px] shrink-0 cursor-grab text-center text-[13px] text-txt-dimmer"
+      >
+        ⋮⋮
+      </span>
+      <input type="checkbox" checked={pref.enabled} disabled={disabled} onChange={onToggle} />
+      {label}
+    </label>
   );
 }
 
@@ -398,6 +440,9 @@ export function SetupScreen({
   showThemePicker = false,
   themePreference,
   onThemePreferenceChange,
+  showKeyBarPicker = false,
+  keyBarPrefs,
+  onKeyBarPrefsChange,
   isMobile = false,
 }: SetupScreenProps) {
   const [locations, setLocations] = useState<LocationRow[]>(() => rowsFromInitial(initialLocations));
@@ -460,6 +505,32 @@ export function SetupScreen({
     const fromIndex: number = ids.indexOf(String(active.id));
     const toIndex: number = ids.indexOf(String(over.id));
     setLocations((previousLocations) => arrayMove(previousLocations, fromIndex, toIndex));
+  };
+
+  const handleKeyBarDragEnd = (event: DragEndEvent): void => {
+    const { active, over } = event;
+    if (over === null || active.id === over.id || keyBarPrefs === undefined || onKeyBarPrefsChange === undefined) {
+      return;
+    }
+    onKeyBarPrefsChange(reorderById(keyBarPrefs, String(active.id) as KeyBarPref["id"], String(over.id) as KeyBarPref["id"]));
+  };
+
+  const toggleKeyBarPref = (id: KeyBarPref["id"]): void => {
+    if (keyBarPrefs === undefined || onKeyBarPrefsChange === undefined) {
+      return;
+    }
+    const enabledCount: number = keyBarPrefs.filter((pref) => pref.enabled).length;
+    onKeyBarPrefsChange(
+      keyBarPrefs.map((pref) => {
+        if (pref.id !== id) {
+          return pref;
+        }
+        if (pref.enabled && enabledCount === 1) {
+          return pref;
+        }
+        return { ...pref, enabled: !pref.enabled };
+      })
+    );
   };
 
   const trimmedValues: string[] = locations.map((row) => row.value.trim());
@@ -550,7 +621,9 @@ export function SetupScreen({
                       onChange={setLocationAt}
                       onRemove={removeLocationAt}
                       onEnter={() => void handleSave()}
-                      autoFocus={index === 0}
+                      // Popping the on-screen keyboard the instant Settings opens is jarring on
+                      // mobile; desktop keeps it since a physical keyboard has no such cost.
+                      autoFocus={!isMobile && index === 0}
                     />
                   ))}
                 </div>
@@ -584,6 +657,44 @@ export function SetupScreen({
                     </button>
                   ))}
                 </div>
+              </div>
+            )}
+
+            {showKeyBarPicker && keyBarPrefs !== undefined && onKeyBarPrefsChange !== undefined && (
+              <div className="flex flex-col gap-[8px] border-t border-border pt-[14px]">
+                <div className="flex flex-col gap-[4px]">
+                  <h2 className="text-[12.5px] font-semibold text-txt-bright">Helper keys</h2>
+                  <p className="text-[11.5px] leading-[1.5] text-txt-secondary">
+                    Keys shown above the on-screen keyboard. At least one must stay enabled.
+                  </p>
+                </div>
+                <DndContext
+                  sensors={sensors}
+                  collisionDetection={closestCenter}
+                  modifiers={[restrictToVerticalAxis]}
+                  onDragEnd={handleKeyBarDragEnd}
+                >
+                  <SortableContext items={keyBarPrefs.map((pref) => pref.id)} strategy={verticalListSortingStrategy}>
+                    <div className="flex flex-col gap-[8px]">
+                      {keyBarPrefs.map((pref) => {
+                        const entry = KEY_BAR_CATALOG.find((catalogEntry) => catalogEntry.id === pref.id);
+                        if (entry === undefined) {
+                          return null;
+                        }
+                        const isLastEnabled: boolean = pref.enabled && keyBarPrefs.filter((p) => p.enabled).length === 1;
+                        return (
+                          <SortableKeyRow
+                            key={pref.id}
+                            pref={pref}
+                            label={`${entry.label} (${entry.title})`}
+                            disabled={isLastEnabled}
+                            onToggle={() => toggleKeyBarPref(pref.id)}
+                          />
+                        );
+                      })}
+                    </div>
+                  </SortableContext>
+                </DndContext>
               </div>
             )}
 

@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdirSync, writeFileSync, appendFileSync, readFileSync } from "node:fs";
+import http from "node:http";
 import path from "node:path";
 
 // Mirrors auth.ts/store.ts's data directory; cloudflared's own stdout+stderr (not just the
@@ -35,17 +36,54 @@ export function getTunnelStatus(): TunnelStatus {
   return { ...status };
 }
 
-export function startTunnel(port: number): Promise<TunnelStatus> {
+// Caddy's HTTP listener (see Caddyfile, started by setup.sh). The tunnel points here, not at
+// the Express server on PORT/3001: Express only ever serves the (possibly stale) web/dist
+// build, while Caddy proxies to Vite, the same upstream the LAN/ai.local path uses. This is
+// what keeps a public tunnel visitor and a LAN visitor looking at identical frontend code.
+const CADDY_HTTP_PORT: number = Number(process.env.CADDY_HTTP_PORT ?? 80);
+const CADDY_PREFLIGHT_TIMEOUT_MS = 2_000;
+
+// If Caddy isn't running, cloudflared still starts and reports a URL happily; the failure
+// only shows up as a 502 once someone actually opens that URL, with nothing in this app's UI
+// pointing at the real cause. Check first so startTunnel can fail with an actionable message
+// instead of a "running" status that lies.
+function checkCaddyReachable(): Promise<boolean> {
+  return new Promise((resolve) => {
+    const request = http.get(
+      { host: "127.0.0.1", port: CADDY_HTTP_PORT, path: "/", headers: { Host: "ai.local" }, timeout: CADDY_PREFLIGHT_TIMEOUT_MS },
+      (response) => {
+        response.resume();
+        resolve(true);
+      }
+    );
+    request.on("timeout", () => {
+      request.destroy();
+      resolve(false);
+    });
+    request.on("error", () => {
+      resolve(false);
+    });
+  });
+}
+
+export async function startTunnel(): Promise<TunnelStatus> {
   if (startPromise !== null) {
     return startPromise;
   }
   if (status.state === "running") {
-    return Promise.resolve(getTunnelStatus());
+    return getTunnelStatus();
   }
 
   status.state = "starting";
   status.url = null;
   status.error = null;
+
+  const caddyReachable: boolean = await checkCaddyReachable();
+  if (!caddyReachable) {
+    status.state = "error";
+    status.error = `Caddy isn't responding on 127.0.0.1:${CADDY_HTTP_PORT}. Start it with: brew services start caddy`;
+    return getTunnelStatus();
+  }
 
   startPromise = new Promise<TunnelStatus>((resolve) => {
     // QUIC (cloudflared's default) is UDP-based and gets silently blocked or throttled by
@@ -57,8 +95,15 @@ export function startTunnel(port: number): Promise<TunnelStatus> {
       "tunnel",
       "--protocol",
       "http2",
+      // Caddy's ai.local block requires that exact Host header (see Caddyfile); without
+      // this, cloudflared forwards its own *.trycloudflare.com Host and falls through to
+      // Caddy's catch-all :80 block instead, which happens to work today only because that
+      // block also rewrites the Host itself. Pinning it here doesn't depend on the
+      // catch-all block continuing to exist.
+      "--http-host-header",
+      "ai.local",
       "--url",
-      `http://localhost:${port}`,
+      `http://localhost:${CADDY_HTTP_PORT}`,
     ]);
     child = cloudflared;
     let stderrTail = "";

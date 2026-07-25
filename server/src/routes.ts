@@ -557,8 +557,7 @@ apiRouter.post(
       response.status(409).json({ error: "Set DASHBOARD_PASSWORD before exposing the dashboard to the internet." });
       return;
     }
-    const port: number = Number(process.env.PORT ?? 3001);
-    response.json(await startTunnel(port));
+    response.json(await startTunnel());
   })
 );
 

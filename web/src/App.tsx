@@ -24,6 +24,7 @@ import {
   type Theme,
   type ThemePreference,
 } from "./theme";
+import { getInitialKeyBarPrefs, persistKeyBarPrefs, type KeyBarPref } from "./keyBar";
 import type {
   CreateInstancePayload,
   DashboardConfig,
@@ -55,6 +56,7 @@ export function App() {
   const autoApplyFiredRef = useRef<boolean>(false);
   const [theme, setTheme] = useState<Theme>(getInitialTheme);
   const [themePreference, setThemePreference] = useState<ThemePreference>(getInitialThemePreference);
+  const [keyBarPrefs, setKeyBarPrefs] = useState<KeyBarPref[]>(getInitialKeyBarPrefs);
   const isMobile: boolean = useIsMobile();
   const [mobileScreen, setMobileScreen] = useState<"home" | "terminal">("home");
   const [activeAtBottom, setActiveAtBottom] = useState<boolean>(true);
@@ -74,6 +76,10 @@ export function App() {
     persistThemePreference(themePreference);
     return applyThemePreference(themePreference, setTheme);
   }, [themePreference]);
+
+  useEffect(() => {
+    persistKeyBarPrefs(keyBarPrefs);
+  }, [keyBarPrefs]);
 
   // Any request hitting a 401 (not just the initial load) flips the app into the
   // password gate; the login page IS the app, so nothing else needs to change here
@@ -367,6 +373,9 @@ export function App() {
         showThemePicker={isMobile}
         themePreference={themePreference}
         onThemePreferenceChange={setThemePreference}
+        showKeyBarPicker={isMobile}
+        keyBarPrefs={keyBarPrefs}
+        onKeyBarPrefsChange={setKeyBarPrefs}
       />
     );
   }
@@ -525,7 +534,7 @@ export function App() {
       </div>
 
       {isMobile && mobileScreen === "terminal" && activeInstance !== undefined && (
-        <MobileKeyBar onSendKey={sendKeyToActiveTerminal} />
+        <MobileKeyBar prefs={keyBarPrefs} onSendKey={sendKeyToActiveTerminal} />
       )}
 
       {isNewInstanceModalOpen && (

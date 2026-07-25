@@ -1,12 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
-
-const ESC = "\x1b";
-const CTRL_C = "\x03";
-const ENTER = "\r";
-const ARROW_UP = "\x1b[A";
-const ARROW_DOWN = "\x1b[B";
-const ARROW_RIGHT = "\x1b[C";
-const ARROW_LEFT = "\x1b[D";
+import { KEY_BAR_CATALOG, type KeyBarKeyId, type KeyBarPref } from "../keyBar";
 
 interface KeyButtonProps {
   label: ReactNode;
@@ -31,10 +24,11 @@ function KeyButton({ label, title, onPress }: KeyButtonProps) {
 }
 
 interface MobileKeyBarProps {
+  prefs: KeyBarPref[];
   onSendKey: (data: string) => void;
 }
 
-export function MobileKeyBar({ onSendKey }: MobileKeyBarProps) {
+export function MobileKeyBar({ prefs, onSendKey }: MobileKeyBarProps) {
   const [pasteAvailable, setPasteAvailable] = useState<boolean>(false);
 
   // navigator.clipboard.readText requires a secure context; hide the button
@@ -54,16 +48,21 @@ export function MobileKeyBar({ onSendKey }: MobileKeyBarProps) {
     }
   };
 
+  const enabledIds = new Set<KeyBarKeyId>(prefs.filter((pref) => pref.enabled).map((pref) => pref.id));
+  const orderedEntries = prefs
+    .filter((pref) => enabledIds.has(pref.id))
+    .map((pref) => KEY_BAR_CATALOG.find((entry) => entry.id === pref.id))
+    .filter((entry): entry is (typeof KEY_BAR_CATALOG)[number] => entry !== undefined);
+
   return (
     <div className="flex shrink-0 items-center justify-center gap-[6px] overflow-x-auto border-t border-border bg-surface px-[8px] py-[4px] pb-[calc(4px+var(--safe-bottom))]">
-      <KeyButton label="Esc" title="Escape" onPress={() => onSendKey(ESC)} />
-      <KeyButton label="^C" title="Interrupt (Ctrl+C)" onPress={() => onSendKey(CTRL_C)} />
-      <KeyButton label="←" title="Left" onPress={() => onSendKey(ARROW_LEFT)} />
-      <KeyButton label="↑" title="Up" onPress={() => onSendKey(ARROW_UP)} />
-      <KeyButton label="↓" title="Down" onPress={() => onSendKey(ARROW_DOWN)} />
-      <KeyButton label="→" title="Right" onPress={() => onSendKey(ARROW_RIGHT)} />
-      {pasteAvailable && <KeyButton label="^V" title="Paste from clipboard" onPress={() => void paste()} />}
-      <KeyButton label="Enter" title="Enter" onPress={() => onSendKey(ENTER)} />
+      {orderedEntries.map((entry) =>
+        entry.id === "ctrlV" ? (
+          pasteAvailable && <KeyButton key={entry.id} label={entry.label} title={entry.title} onPress={() => void paste()} />
+        ) : (
+          <KeyButton key={entry.id} label={entry.label} title={entry.title} onPress={() => onSendKey(entry.sequence!)} />
+        )
+      )}
     </div>
   );
 }

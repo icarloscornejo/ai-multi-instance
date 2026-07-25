@@ -16,7 +16,10 @@ const app = express();
 app.use(express.json());
 app.use("/api", apiRouter);
 
-// In production mode (npm start) the server serves the pre-built frontend
+// Fallback only: LAN traffic and the tunnel both go through Caddy -> Vite (see Caddyfile,
+// server/src/tunnel.ts), so this pre-built web/dist is reached only by hitting this port
+// directly. Kept for that case rather than removed outright; the self-update flow
+// (updater.ts) does not rebuild it, so it can go stale.
 const webDistPath: string = path.resolve(import.meta.dirname, "../../web/dist");
 app.use(express.static(webDistPath));
 
