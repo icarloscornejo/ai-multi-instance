@@ -309,7 +309,7 @@ export function TabBar({
                 ? "Update blocked"
                 : `Updating in ${formatCountdown(countdownMs)}`
               : "Update"}
-            {!updateRequired && (updateStatus?.updateAvailable === true || updateStatus?.pendingRestart === true) && (
+            {!updateRequired && updateStatus?.updateAvailable === true && (
               <span className="absolute -right-[2px] -top-[2px] h-[6px] w-[6px] rounded-full bg-accent" />
             )}
           </button>
