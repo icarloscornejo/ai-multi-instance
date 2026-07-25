@@ -16,6 +16,7 @@ import { TerminalView, type TerminalViewHandle } from "./components/TerminalView
 import { UpdateScreen } from "./components/UpdateScreen";
 import { useIsMobile } from "./hooks/useIsMobile";
 import { useVisualViewport } from "./hooks/useVisualViewport";
+import { useWakeLock } from "./hooks/useWakeLock";
 import {
   applyThemePreference,
   getInitialTheme,
@@ -48,6 +49,10 @@ export function App() {
   const [deleteRequest, setDeleteRequest] = useState<Instance | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [gateOpen, setGateOpen] = useState<boolean>(false);
+  // Mirrors gateOpen for the pageshow handler below, which is registered once and would
+  // otherwise close over the initial (stale) value instead of the live one.
+  const gateOpenRef = useRef<boolean>(false);
+  gateOpenRef.current = gateOpen;
   const [loadRetryMsRemaining, setLoadRetryMsRemaining] = useState<number>(LOAD_RETRY_DELAY_MS);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [applyDeadline, setApplyDeadline] = useState<number | null>(null);
@@ -62,6 +67,7 @@ export function App() {
   const [activeAtBottom, setActiveAtBottom] = useState<boolean>(true);
   const terminalHandlesRef = useRef<Map<string, TerminalViewHandle>>(new Map());
   const { keyboardOpen, height: visualViewportHeight } = useVisualViewport();
+  useWakeLock(isMobile && mobileScreen === "terminal");
   const [mobileUpdateSnackbarOpen, setMobileUpdateSnackbarOpen] = useState<boolean>(false);
   // Mirrors TabBar's popover auto-show: opens once per newly-seen remote commit, and
   // re-dismissing with "Later" does not keep popping it back up for the same commit
@@ -90,11 +96,15 @@ export function App() {
 
   // Mobile back-navigation out of a terminal (history.back()) can land the browser on a
   // bfcache snapshot of this same page frozen from before the post-login reload, replaying
-  // stale in-memory state (e.g. the gate still open) instead of the live one. Forcing a real
-  // reload on restore is the standard fix: it's exactly what a manual refresh already does.
+  // a stale gateOpen=true instead of the live (unlocked) state. Forcing a real reload in
+  // that specific case is the standard fix: it's exactly what a manual refresh already does.
+  // Every other bfcache restore (backgrounding the tab and coming back, the common mobile
+  // case) must NOT reload: the React tree and the terminal's xterm buffer survived in
+  // memory untouched, so reloading here would only throw away real state (which instance/
+  // screen you were on) for no reason.
   useEffect(() => {
     const handlePageShow = (event: PageTransitionEvent): void => {
-      if (event.persisted) {
+      if (event.persisted && gateOpenRef.current) {
         window.location.reload();
       }
     };
@@ -119,9 +129,20 @@ export function App() {
           setConfig(loadedConfig);
           setInstances(loadedInstances);
           const rememberedId: string | null = localStorage.getItem("ccdash.activeInstanceId");
-          const initialInstance: Instance | undefined =
-            loadedInstances.find((candidate) => candidate.id === rememberedId) ?? loadedInstances[0];
+          const rememberedInstance: Instance | undefined = loadedInstances.find(
+            (candidate) => candidate.id === rememberedId
+          );
+          const initialInstance: Instance | undefined = rememberedInstance ?? loadedInstances[0];
           setActiveInstanceId(initialInstance?.id ?? null);
+          // Restore the mobile terminal screen on a real reload (pull-to-refresh, gate
+          // login) so it lands back where the user was instead of the home listing. Only
+          // when the remembered instance still exists: rememberedInstance is undefined
+          // both when nothing was ever saved and when it was since deleted, and either
+          // way home is the right landing spot.
+          if (isMobile && rememberedInstance !== undefined && localStorage.getItem("ccdash.mobileScreen") === "terminal") {
+            setMobileScreen("terminal");
+            window.history.pushState({ mobileScreen: "terminal" }, "");
+          }
         })
         .catch((error: Error) => {
           if (cancelled) {
@@ -237,6 +258,14 @@ export function App() {
       localStorage.setItem("ccdash.activeInstanceId", activeInstanceId);
     }
   }, [activeInstanceId]);
+
+  // Paired with the restore-on-load above, so a real reload while inside a mobile
+  // terminal comes back to the terminal instead of the home listing.
+  useEffect(() => {
+    if (isMobile) {
+      localStorage.setItem("ccdash.mobileScreen", mobileScreen);
+    }
+  }, [isMobile, mobileScreen]);
 
   // Hardware/gesture back and the in-app back button share this one handler:
   // both just call history.back(), so there is a single place that closes the terminal

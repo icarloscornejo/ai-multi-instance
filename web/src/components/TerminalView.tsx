@@ -15,6 +15,9 @@ export interface TerminalViewHandle {
 
 const MIN_FONT_SIZE = 10;
 const MAX_FONT_SIZE = 18;
+// Caps recreation attempts after a WebGL context loss so a genuinely dead GPU/driver falls
+// back to the DOM renderer instead of retrying forever.
+const MAX_WEBGL_CONTEXT_LOSS_RETRIES = 3;
 
 // ANSI palette aligned to the design tokens (xterm's defaults are too saturated)
 const terminalThemeDark: ITheme = {
@@ -221,6 +224,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+  const webglAddonRef = useRef<WebglAddon | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const persistTimerRef = useRef<number | null>(null);
   const isMobile = useIsMobile();
@@ -250,8 +254,14 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   const [fontReady, setFontReady] = useState<boolean>(false);
   useEffect(() => {
     let cancelled = false;
-    document.fonts
-      .load(`${fontSize}px "JetBrains Mono"`)
+    // Also waits on 600 (the weight the terminal renders bold text with, see
+    // fontWeightBold below): if only 400 were awaited here, a bold glyph drawn before 600
+    // finishes downloading would render with synthesized (faux) bold and, under the WebGL
+    // renderer, get baked into its texture atlas with that wrong shape permanently.
+    Promise.all([
+      document.fonts.load(`${fontSize}px "JetBrains Mono"`),
+      document.fonts.load(`600 ${fontSize}px "JetBrains Mono"`),
+    ])
       .catch(() => {
         // Fall through to fallback-font metrics rather than never creating the terminal
       })
@@ -333,6 +343,11 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       // ones it doesn't
       fontFamily: '"JetBrains Mono", "Apple Symbols", ui-monospace, monospace',
       fontSize,
+      // xterm's default bold weight is 700, which main.tsx never imports (only 400/500/600
+      // are); requesting an unloaded weight makes the browser synthesize (faux) bold by
+      // algorithmically thickening the nearest available glyph, which visibly warps curved
+      // letters. 600 is loaded and reads as bold in a monospace terminal.
+      fontWeightBold: 600,
       theme: terminalThemesByMode[theme],
       cursorBlink: true,
       scrollback: 5000,
@@ -357,23 +372,37 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
 
     // DOM renderer repaints the whole pane's DOM nodes on every redraw; on mobile that's
     // the single most expensive step in the touch-scroll round trip. WebGL renders to a
-    // canvas instead, which is cheap enough that it stops being the bottleneck. Falls back
-    // to the DOM renderer (xterm's default) if WebGL is unavailable or the context is lost,
-    // since it's the addon crashing/degrading, not something the terminal can't run without.
-    try {
-      const webglAddon = new WebglAddon();
-      webglAddon.onContextLoss(() => {
-        webglAddon.dispose();
-        // Mobile browsers reclaim the WebGL context when the app is backgrounded; falling
-        // back to the DOM renderer leaves whatever was on the canvas stale until new data
-        // writes a row. If nothing is being written (e.g. a prompt already sitting idle),
-        // the screen stays blank until this forces every row to repaint immediately.
-        terminal.refresh(0, terminal.rows - 1);
-      });
-      terminal.loadAddon(webglAddon);
-    } catch {
-      // no WebGL support; xterm keeps using its default DOM renderer
-    }
+    // canvas instead, which is cheap enough that it stops being the bottleneck. Mobile
+    // browsers reclaim the WebGL context whenever the app is backgrounded, which used to
+    // degrade to the DOM renderer for the rest of the session; the DOM renderer draws text
+    // through the browser's own text engine instead of the WebGL glyph atlas, so the font
+    // visibly changed shape mid-session until the next reload. Recreating the addon on loss
+    // (bounded by MAX_WEBGL_CONTEXT_LOSS_RETRIES, since a real GPU/driver failure would
+    // otherwise retry forever) keeps the renderer, and therefore the glyph shapes, stable.
+    let webglRetries = 0;
+    const attachWebglAddon = (): void => {
+      try {
+        const webglAddon = new WebglAddon();
+        webglAddon.onContextLoss(() => {
+          webglAddon.dispose();
+          webglAddonRef.current = null;
+          if (webglRetries < MAX_WEBGL_CONTEXT_LOSS_RETRIES) {
+            webglRetries += 1;
+            attachWebglAddon();
+          }
+          // Whether the retry above lands on WebGL again or the catch below falls through
+          // to the DOM renderer, the canvas is stale until new data writes a row; if
+          // nothing is being written (e.g. a prompt already sitting idle), force every row
+          // to repaint immediately.
+          terminal.refresh(0, terminal.rows - 1);
+        });
+        terminal.loadAddon(webglAddon);
+        webglAddonRef.current = webglAddon;
+      } catch {
+        // no WebGL support; xterm keeps using its default DOM renderer
+      }
+    };
+    attachWebglAddon();
 
     terminal.onData((typedData: string) => {
       const socket = socketRef.current;
@@ -712,6 +741,26 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fontReady]);
 
+  // fontReady above only gates on the latin subset of 400/600 (the unicode-range that
+  // document.fonts.load's plain-ASCII probe string matches); other subsets (latin-ext,
+  // greek, cyrillic, ...) can still be mid-download when the terminal starts drawing. The
+  // WebGL renderer bakes whatever glyph shape was current into its texture atlas and never
+  // re-checks it, so a glyph drawn from a still-loading subset stays wrong until something
+  // clears the atlas. document.fonts.ready resolves once every requested font this page has
+  // asked for (including those late subsets) has finished, so it is the right point to wipe
+  // the atlas and let the next repaint redraw everything with the fonts actually loaded.
+  useEffect(() => {
+    let cancelled = false;
+    document.fonts.ready.then(() => {
+      if (!cancelled) {
+        webglAddonRef.current?.clearTextureAtlas();
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [fontReady]);
+
   // WebSocket connection to the tmux bridge; connectionEpoch allows manual reconnect.
   // Deferred until hasBeenVisible so the first fit (right below) measures a real,
   // on-screen container instead of a hidden one (see hasBeenVisible's declaration above),
@@ -787,6 +836,34 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectionEpoch, instance.id, hasBeenVisible, fontReady]);
+
+  // A backgrounded tab freezes JS timers, so the socket can die (server ping timeout, OS
+  // reclaiming the connection) without onclose ever running; it only fires once the tab
+  // wakes back up, and from there the effect above still waits the full RECONNECT_DELAY_MS
+  // before retrying. That reads as an avoidable ~3s stall exactly when the user is already
+  // back and waiting. Reconnecting immediately on visibility/pageshow instead of waiting for
+  // that timer to run its course removes the stall while leaving RECONNECT_DELAY_MS in place
+  // for genuine live disconnects (server restart, etc). pageshow is also listened for
+  // because a bfcache restore closes sockets and doesn't reliably fire visibilitychange in
+  // every browser.
+  useEffect(() => {
+    const reconnectIfStale = (): void => {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+      const socket = socketRef.current;
+      if (socket !== null && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) {
+        return;
+      }
+      setConnectionEpoch((previousEpoch) => previousEpoch + 1);
+    };
+    document.addEventListener("visibilitychange", reconnectIfStale);
+    window.addEventListener("pageshow", reconnectIfStale);
+    return () => {
+      document.removeEventListener("visibilitychange", reconnectIfStale);
+      window.removeEventListener("pageshow", reconnectIfStale);
+    };
+  }, []);
 
   // The terminal already exists with the mount-time palette; on theme toggle
   // only the active palette needs reassigning, no need to recreate the session
