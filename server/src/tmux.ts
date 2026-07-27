@@ -75,3 +75,22 @@ export async function killSession(sessionName: string): Promise<void> {
 export async function getPaneCurrentPath(sessionName: string): Promise<string> {
   return runTmux(["display-message", "-p", "-t", sessionName, "#{pane_current_path}"]);
 }
+
+// Scrolling up (mouse wheel or touch) puts the pane into copy-mode; "scroll to bottom"
+// means leaving it. No need to check pane_in_mode first: send-keys -X on a pane that
+// isn't in a mode fails outright ("not in a mode", verified against a live tmux server)
+// rather than being misread as a literal keystroke by whatever the pane is running, so
+// the no-op case is just a rejected command, safe to swallow. "cancel" is bound the same
+// way in both the copy-mode and copy-mode-vi tables, so this doesn't depend on the host's
+// mode-keys setting. Skipping the pre-check also halves this action's latency (one tmux
+// process spawn instead of two sequential ones).
+export async function exitCopyMode(sessionName: string): Promise<void> {
+  try {
+    await runTmux(["send-keys", "-X", "-t", sessionName, "cancel"]);
+  } catch (error) {
+    if (error instanceof TmuxError && error.message.includes("not in a mode")) {
+      return;
+    }
+    throw error;
+  }
+}

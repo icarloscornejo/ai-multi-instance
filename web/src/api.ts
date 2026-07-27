@@ -73,6 +73,9 @@ export const api = {
   getInstanceGit: (instanceId: string): Promise<{ cwd: string; branch?: string }> =>
     requestJson(`/api/instances/${instanceId}/git`),
 
+  scrollTerminalToBottom: (instanceId: string): Promise<{ ok: boolean }> =>
+    requestJson(`/api/instances/${instanceId}/scroll-to-bottom`, { method: "POST" }),
+
   getInstanceLiveStatus: (instanceId: string): Promise<LiveStatus> =>
     requestJson(`/api/instances/${instanceId}/live-status`),
 

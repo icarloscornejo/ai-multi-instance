@@ -9,7 +9,7 @@ import { AUTH_COOKIE_NAME, checkPassword, isAuthEnabled, issueToken, readCookie,
 import { buildLaunchCommand } from "./launch";
 import { isAgentProvider, PROVIDERS, sessionKeyFor } from "./providers";
 import { loadState, saveState } from "./store";
-import { createSession, getPaneCurrentPath, killSession, sendCommandToSession } from "./tmux";
+import { createSession, exitCopyMode, getPaneCurrentPath, killSession, sendCommandToSession } from "./tmux";
 import { getTunnelStatus, readTunnelLog, startTunnel, stopTunnel } from "./tunnel";
 import { applyUpdate, checkForUpdate, getUpdateStatus, resetToRemote } from "./updater";
 import type {
@@ -832,6 +832,21 @@ apiRouter.get(
     const branch: string | null = await currentBranch(cwd);
 
     response.json(branch === null ? { cwd } : { cwd, branch });
+  })
+);
+
+apiRouter.post(
+  "/instances/:id/scroll-to-bottom",
+  wrapAsync(async (request, response) => {
+    const state: DashboardState = await loadState();
+    const instance = state.instances.find((candidate) => candidate.id === request.params.id);
+    if (instance === undefined) {
+      response.status(404).json({ error: "Instance not found." });
+      return;
+    }
+
+    await exitCopyMode(instance.tmuxSession);
+    response.json({ ok: true });
   })
 );
 

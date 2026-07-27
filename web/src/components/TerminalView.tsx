@@ -2,6 +2,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
+import { api } from "../api";
 import { useIsMobile } from "../hooks/useIsMobile";
 import { useWakeRetry } from "../hooks/useWakeRetry";
 import { getHostFontSize, setHostFontSize } from "../hostPrefs";
@@ -13,7 +14,6 @@ import type { Theme } from "../theme";
 
 export interface TerminalViewHandle {
   sendInput: (data: string) => void;
-  scrollToBottom: () => void;
 }
 
 const MIN_FONT_SIZE = 10;
@@ -85,7 +85,6 @@ interface TerminalViewProps {
   // Mobile navigates into the terminal screen without the user having tapped inside
   // the terminal itself; auto-focusing there would pop the native keyboard unprompted
   focusOnVisible?: boolean;
-  onAtBottomChange?: (atBottom: boolean) => void;
 }
 
 // tmux's mouse mode puts xterm's own touch-scroll to sleep (it only runs when
@@ -150,6 +149,25 @@ const FINE_SCROLL_VELOCITY_PX_PER_MS = 0.15;
 const FINE_SCROLL_UP_BYTES = "\u0019"; // C-y
 const FINE_SCROLL_DOWN_BYTES = "\u0005"; // C-e
 
+// Desktop's real mouse wheel never goes through the touch-scroll machinery above; it's
+// forwarded by xterm itself as an SGR mouse report through onData. Button code 64 is
+// wheel-up, the signal that a scroll-to-bottom button should appear.
+const WHEEL_UP_SGR_PATTERN = /\x1b\[<64;/;
+
+// tmux draws this position indicator ("[<line>/<total>]") at the far right of row 0
+// while a pane is in copy-mode (the status bar is off, see server/src/tmux.ts). Reading
+// it back is how the scroll-to-bottom button knows when to hide again, independent of
+// the gesture that triggered the scroll (wheel, touch, or the pane's own keybindings).
+const COPY_MODE_INDICATOR_PATTERN = /\[(\d+)\/\d+\]\s*$/;
+const COPY_MODE_INDICATOR_SCAN_THROTTLE_MS = 100;
+
+// macOS trackpads keep emitting decaying native wheel events for roughly a second after
+// the fingers lift; those trailing ticks arrive after the click already exited copy-mode
+// and drag the pane back into it. This window (renewed on every trailing tick, not one
+// fixed timer) keeps re-issuing the exit instead of showing the button again, until a real
+// gap appears that tells trailing momentum apart from a deliberate new scroll-up.
+const TRAILING_MOMENTUM_SUPPRESS_MS = 400;
+
 function DisconnectedOverlay({ onReconnect }: { onReconnect: () => void }) {
   return (
     <div className="absolute inset-0 flex items-center justify-center bg-app/80">
@@ -181,7 +199,7 @@ function DisconnectedOverlay({ onReconnect }: { onReconnect: () => void }) {
 }
 
 export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(function TerminalView(
-  { instance, visible, theme, focusOnVisible = true, onAtBottomChange },
+  { instance, visible, theme, focusOnVisible = true },
   forwardedRef
 ) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -240,8 +258,18 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  const onAtBottomChangeRef = useRef(onAtBottomChange);
-  onAtBottomChangeRef.current = onAtBottomChange;
+  // Whether the "scroll to bottom" button is shown; see the two signals that drive it
+  // (wheel-up/swipe-up detection to show, tmux's copy-mode position indicator to hide)
+  // in the terminal-creation effect below.
+  const [showScrollToBottom, setShowScrollToBottom] = useState<boolean>(false);
+  // performance.now() timestamp until which a wheel-up SGR report is treated as trailing
+  // native trackpad momentum (re-issue the exit-copy-mode call) instead of a fresh scroll-up
+  // (show the button). Armed by handleScrollToBottomClick, renewed by each trailing tick.
+  const suppressWheelUpUntilRef = useRef<number>(0);
+  // Set inside the terminal-creation effect to that render's stopDraining, so
+  // handleScrollToBottomClick (defined outside the effect) can reach it without depending on
+  // effect internals across re-runs.
+  const stopActiveGestureRef = useRef<() => void>(() => {});
   const touchScrollRef = useRef<{ lastClientY: number; accumulatedPx: number; released: boolean } | null>(null);
   // Set by the WS message handler's terminal.write() callback once a write has actually
   // been parsed; read by the touch-scroll ack gate in the terminal-creation effect below.
@@ -256,7 +284,6 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
           socket.send(JSON.stringify({ type: "input", data }));
         }
       },
-      scrollToBottom: () => terminalRef.current?.scrollToBottom(),
     }),
     []
   );
@@ -370,6 +397,17 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     attachWebglAddon();
 
     terminal.onData((typedData: string) => {
+      if (WHEEL_UP_SGR_PATTERN.test(typedData)) {
+        const now: number = performance.now();
+        if (now < suppressWheelUpUntilRef.current) {
+          // Trailing native trackpad momentum: forwarding this to tmux would re-enter
+          // copy-mode through its own WheelPane binding, undoing the exit the click just
+          // triggered, so it's dropped entirely instead of merely hiding the button.
+          suppressWheelUpUntilRef.current = now + TRAILING_MOMENTUM_SUPPRESS_MS;
+          return;
+        }
+        setShowScrollToBottom(true);
+      }
       const socket = socketRef.current;
       if (socket !== null && socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ type: "input", data: typedData }));
@@ -399,11 +437,6 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
         return false;
       }
       return true;
-    });
-
-    terminal.onScroll(() => {
-      const buffer = terminal.buffer.active;
-      onAtBottomChangeRef.current?.(buffer.viewportY >= buffer.baseY);
     });
 
     // xterm's built-in touch-scroll only runs when no mouse tracking is active, so with
@@ -498,6 +531,10 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       touchScrollRef.current = null;
       resetSlideTransform();
     };
+    // Exposes stopDraining to handleScrollToBottomClick (defined outside this effect), so a
+    // click can immediately kill any in-flight touch-momentum coast instead of letting it
+    // keep firing scroll-up ticks after the button already exited copy-mode.
+    stopActiveGestureRef.current = stopDraining;
 
     const attemptDispatch = (): void => {
       if (awaitingAck) {
@@ -541,6 +578,9 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       }
 
       const direction: number = Math.sign(touchState.accumulatedPx);
+      if (direction < 0) {
+        setShowScrollToBottom(true);
+      }
       touchState.accumulatedPx -= direction * tickPx;
       pendingSlideOffsetPx = direction * tickPx;
       pendingSlideWasFine = useFineScroll;
@@ -602,6 +642,33 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       consecutiveAckTimeouts = 0;
       playSlideCompensation();
       attemptDispatch();
+    });
+
+    // Separate subscription from the ack-gate onRender above (deliberately not merged
+    // into it: that one drives the delicate touch-scroll pacing state machine, this one
+    // only reads the screen). Throttled because onRender fires on every redraw, including
+    // ones unrelated to scrolling (e.g. Claude's output streaming in).
+    let lastIndicatorScanTimestamp = 0;
+    let indicatorEverSeen = false;
+    terminal.onRender(() => {
+      const now: number = performance.now();
+      if (now - lastIndicatorScanTimestamp < COPY_MODE_INDICATOR_SCAN_THROTTLE_MS) {
+        return;
+      }
+      lastIndicatorScanTimestamp = now;
+      const topLine = terminal.buffer.active.getLine(0);
+      const topLineText: string = topLine?.translateToString(true) ?? "";
+      const indicatorMatch: RegExpMatchArray | null = topLineText.match(COPY_MODE_INDICATOR_PATTERN);
+      if (indicatorMatch !== null) {
+        indicatorEverSeen = true;
+        setShowScrollToBottom(Number(indicatorMatch[1]) > 0);
+      } else if (indicatorEverSeen) {
+        // No indicator this render means the pane just left copy-mode (exited, hit the
+        // bottom, or new output arrived); only trust this once the indicator has actually
+        // been observed at least once, otherwise a host tmux that doesn't draw it at all
+        // would hide the button on every render and it could never show.
+        setShowScrollToBottom(false);
+      }
     });
 
     const handleTouchStart = (event: TouchEvent): void => {
@@ -855,6 +922,22 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     setConnectionEpoch((previousEpoch) => previousEpoch + 1);
   };
 
+  const handleScrollToBottomClick = useCallback((): void => {
+    // Hide optimistically; the indicator scan above will resurface it on the next
+    // render if this didn't actually land us at the bottom.
+    setShowScrollToBottom(false);
+    // Kill any in-flight touch-momentum coast immediately, so a mobile swipe-then-tap can't
+    // keep dispatching scroll-up ticks after this call already exited copy-mode.
+    stopActiveGestureRef.current();
+    // Arms the suppression window for trailing native trackpad momentum (see onData above):
+    // any wheel-up SGR report that arrives before this expires re-issues the exit instead of
+    // showing the button again.
+    suppressWheelUpUntilRef.current = performance.now() + TRAILING_MOMENTUM_SUPPRESS_MS;
+    api.scrollTerminalToBottom(instance.id).catch((error: Error) => {
+      console.error("Could not scroll the terminal to the bottom:", error.message);
+    });
+  }, [instance.id]);
+
   return (
     <div className={`flex-1 min-h-0 flex-col ${visible ? "flex" : "hidden"}`}>
       <div
@@ -867,6 +950,17 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
           style={{ touchAction: "none", willChange: "transform" }}
         />
         {disconnected && <DisconnectedOverlay onReconnect={reconnect} />}
+        {showScrollToBottom && (
+          <button
+            type="button"
+            onClick={handleScrollToBottomClick}
+            aria-label="Scroll to bottom"
+            title="Scroll to bottom"
+            className="absolute bottom-[42px] right-[14px] flex h-[30px] w-[30px] items-center justify-center rounded-full border border-border-strong bg-surface text-txt-secondary shadow-lg"
+          >
+            ↓
+          </button>
+        )}
         <div className="absolute bottom-[12px] right-[14px] flex gap-[6px]">
           <button
             type="button"

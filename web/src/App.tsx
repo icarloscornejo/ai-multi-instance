@@ -75,7 +75,6 @@ export function App() {
   const [keyBarPrefs, setKeyBarPrefs] = useState<KeyBarPref[]>(getInitialKeyBarPrefs);
   const isMobile: boolean = useIsMobile();
   const [mobileScreen, setMobileScreen] = useState<"home" | "terminal">("home");
-  const [activeAtBottom, setActiveAtBottom] = useState<boolean>(true);
   const terminalHandlesRef = useRef<Map<string, TerminalViewHandle>>(new Map());
   const { keyboardOpen, height: visualViewportHeight } = useVisualViewport();
   useWakeLock(isMobile && mobileScreen === "terminal");
@@ -357,13 +356,6 @@ export function App() {
     [activeInstanceId]
   );
 
-  const scrollActiveTerminalToBottom = useCallback((): void => {
-    if (activeInstanceId === null) {
-      return;
-    }
-    terminalHandlesRef.current.get(activeInstanceId)?.scrollToBottom();
-  }, [activeInstanceId]);
-
   const createInstance = async (payload: CreateInstancePayload): Promise<void> => {
     const createdInstance: Instance = await api.createInstance(payload);
     setInstances((previousInstances) => [...previousInstances, createdInstance]);
@@ -548,7 +540,6 @@ export function App() {
                 visible={instance.id === activeInstanceId}
                 theme={theme}
                 focusOnVisible={!isMobile}
-                onAtBottomChange={instance.id === activeInstanceId ? setActiveAtBottom : undefined}
               />
             ))
           )}
@@ -595,16 +586,6 @@ export function App() {
           </div>
         )}
 
-        {isMobile && mobileScreen === "terminal" && activeInstance !== undefined && !activeAtBottom && (
-          <button
-            type="button"
-            onClick={scrollActiveTerminalToBottom}
-            className="absolute bottom-[8px] right-[14px] z-20 flex h-[36px] w-[36px] items-center justify-center rounded-full border border-border-strong bg-surface text-txt-secondary shadow-lg"
-            aria-label="Scroll to bottom"
-          >
-            ↓
-          </button>
-        )}
       </div>
 
       {isMobile && mobileScreen === "terminal" && activeInstance !== undefined && (
