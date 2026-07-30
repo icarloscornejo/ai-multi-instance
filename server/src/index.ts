@@ -31,6 +31,40 @@ app.use((error: Error, _request: Request, response: Response, _next: NextFunctio
 const httpServer = http.createServer(app);
 const webSocketServer = new WebSocketServer({ noServer: true });
 
+// Neither side of a terminal WS sent a protocol-level ping before this, so a connection
+// killed at the OS/network layer (mobile backgrounding, a Cloudflare tunnel edge dropping
+// state, a NAT timing out) left the socket "open" from both ends' point of view: readyState
+// stayed OPEN, "close" never fired, and the client's whole reconnect path (which hangs off
+// "close", see TerminalView.tsx) never ran. A dead client also meant the tmux attach process
+// in terminal.ts was never killed by its own "close" handler, leaking it. Pinging every
+// connection here and terminating whichever one didn't pong since the last tick surfaces a
+// real "close" event to the client promptly instead of relying on a TCP timeout that can take
+// minutes (or never happen) over a mobile network.
+const WS_HEARTBEAT_INTERVAL_MS = 15_000;
+const socketIsAlive = new WeakMap<WebSocket, boolean>();
+
+webSocketServer.on("connection", (webSocket: WebSocket) => {
+  socketIsAlive.set(webSocket, true);
+  webSocket.on("pong", () => {
+    socketIsAlive.set(webSocket, true);
+  });
+});
+
+const heartbeatInterval = setInterval(() => {
+  for (const webSocket of webSocketServer.clients) {
+    if (socketIsAlive.get(webSocket) === false) {
+      webSocket.terminate();
+      continue;
+    }
+    socketIsAlive.set(webSocket, false);
+    webSocket.ping();
+  }
+}, WS_HEARTBEAT_INTERVAL_MS);
+
+webSocketServer.on("close", () => {
+  clearInterval(heartbeatInterval);
+});
+
 httpServer.on("upgrade", (request, socket, head) => {
   const requestUrl = new URL(request.url ?? "/", "http://localhost");
   const pathMatch = requestUrl.pathname.match(/^\/ws\/terminal\/([\w-]+)$/);

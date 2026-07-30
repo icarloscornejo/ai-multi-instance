@@ -5,11 +5,17 @@ import { createSession, enableMouseMode, hasSession, sendCommandToSession } from
 import type { InstanceRecord } from "./types";
 
 interface ClientControlMessage {
-  type: "input" | "resize";
+  type: "input" | "resize" | "ping";
   data?: string;
   cols?: number;
   rows?: number;
 }
+
+// Answers the client's application-level liveness ping (see the heartbeat in TerminalView.tsx)
+// with a single empty binary frame. Binary, not text: the client's onmessage only treats
+// string frames as terminal output (see terminal.ts's counterpart), so a binary pong is
+// silently invisible to the pty stream instead of needing its own message-type parsing there.
+const PONG_FRAME = new Uint8Array(0);
 
 interface InitialSize {
   cols: number;
@@ -80,6 +86,8 @@ export async function bridgeTerminal(
       controlMessage.rows > 0
     ) {
       attachProcess.resize(controlMessage.cols, controlMessage.rows);
+    } else if (controlMessage.type === "ping" && socket.readyState === socket.OPEN) {
+      socket.send(PONG_FRAME);
     }
   };
 

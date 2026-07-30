@@ -22,6 +22,25 @@ const MAX_FONT_SIZE = 18;
 // back to the DOM renderer instead of retrying forever.
 const MAX_WEBGL_CONTEXT_LOSS_RETRIES = 3;
 
+// Mobile OSes and flaky networks can kill a socket's underlying TCP connection without
+// either side ever seeing a "close" event: readyState stays OPEN and no error fires, it
+// just silently stops carrying data (a half-open/"zombie" socket). Since the whole reconnect
+// flow below hangs off "close" (see socket.onclose), a zombie socket used to strand the user
+// on the disconnected overlay's manual "Reconnect now" button. This app-level ping/pong (the
+// server answers with a binary frame the client's onmessage below already ignores as terminal
+// output) plus the liveness check give the client its own signal that a socket claiming to be
+// OPEN is actually dead, so it can force a real close and let the existing backoff take over.
+const HEARTBEAT_INTERVAL_MS = 10_000;
+// If neither real output, a resize ack side effect, nor a heartbeat pong has updated
+// lastActivityAtRef within this window while the socket claims to be OPEN, treat it as dead.
+// Set comfortably above HEARTBEAT_INTERVAL_MS so one slow tick isn't mistaken for a zombie.
+const LIVENESS_TIMEOUT_MS = 25_000;
+// A reconnect attempt whose handshake never resolves (network changed mid-connect, a tunnel
+// hop not yet re-routed) would otherwise sit in CONNECTING forever: no "close" fires, so
+// nothing retries. Force-closing it past this point feeds it back into the same onclose-driven
+// backoff instead of hanging indefinitely.
+const CONNECT_TIMEOUT_MS = 8_000;
+
 // ANSI palette aligned to the design tokens (xterm's defaults are too saturated)
 const terminalThemeDark: ITheme = {
   background: "#17181a",
@@ -227,6 +246,14 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   // Lives outside the connection effect (which reruns on every connectionEpoch bump) so the
   // backoff keeps counting across reconnect attempts instead of resetting each time.
   const reconnectAttemptRef = useRef<number>(0);
+  // performance.now() of the last sign of life on the current socket while OPEN (real output,
+  // a heartbeat pong); read by both the heartbeat interval below and the wake-retry override
+  // to tell a genuinely live socket apart from a zombie one still reporting OPEN.
+  const lastActivityAtRef = useRef<number>(0);
+  // performance.now() when the current connection attempt started; read by the connect
+  // timeout below and by wake-retry to tell a fresh CONNECTING handshake from one that has
+  // been hanging past CONNECT_TIMEOUT_MS.
+  const connectStartedAtRef = useRef<number>(0);
   const isMobile = useIsMobile();
   // Mobile screens are small enough that the server's default (tuned for desktop) reads
   // cramped-in-a-good-way but wastes space here; default to the smallest zoom on mobile
@@ -855,9 +882,35 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     const wsProtocol: string = window.location.protocol === "https:" ? "wss" : "ws";
     const socket = new WebSocket(`${wsProtocol}://${window.location.host}/ws/terminal/${instance.id}${sizeQuery}`);
     socketRef.current = socket;
+    connectStartedAtRef.current = performance.now();
+    lastActivityAtRef.current = performance.now();
+
+    // See CONNECT_TIMEOUT_MS above: without this a handshake that never resolves (readyState
+    // stuck at CONNECTING) never fires "close" and so never enters the reconnect path below.
+    const connectTimeoutId = window.setTimeout(() => {
+      if (socket.readyState === WebSocket.CONNECTING) {
+        socket.close();
+      }
+    }, CONNECT_TIMEOUT_MS);
+
+    // See HEARTBEAT_INTERVAL_MS/LIVENESS_TIMEOUT_MS above: proactively catches a zombie OPEN
+    // socket even while the tab stays foregrounded the whole time (so useWakeRetry's visibility
+    // events never fire to catch it), e.g. toggling DevTools' offline mode.
+    const heartbeatIntervalId = window.setInterval(() => {
+      if (socket.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      if (performance.now() - lastActivityAtRef.current > LIVENESS_TIMEOUT_MS) {
+        socket.close();
+        return;
+      }
+      socket.send(JSON.stringify({ type: "ping" }));
+    }, HEARTBEAT_INTERVAL_MS);
 
     socket.onopen = () => {
+      window.clearTimeout(connectTimeoutId);
       reconnectAttemptRef.current = 0;
+      lastActivityAtRef.current = performance.now();
       setDisconnected(false);
       safeFit();
       const terminal = terminalRef.current;
@@ -870,6 +923,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       }
     };
     socket.onmessage = (event: MessageEvent) => {
+      lastActivityAtRef.current = performance.now();
       if (typeof event.data === "string") {
         // Apple Color Emoji has no art at all for U+23F5 (auto-accept), so without this
         // swap iOS draws nothing there, not even a fallback emoji. U+25B6/U+25CF are
@@ -882,6 +936,8 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
           writeCommittedForAckRef.current = true;
         });
       }
+      // A binary frame is the server's heartbeat pong (see terminal.ts): it carries no
+      // terminal output, updating lastActivityAtRef above is its entire purpose.
     };
     // A real disconnect (server restart from tsx watch, self-update, etc.) keeps retrying
     // on a growing backoff instead of stranding the user on the manual Reconnect button
@@ -898,23 +954,42 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       socket.onclose = null;
       socket.close();
       window.clearTimeout(reconnectTimeoutId);
+      window.clearTimeout(connectTimeoutId);
+      window.clearInterval(heartbeatIntervalId);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectionEpoch, instance.id, hasBeenVisible, fontReady]);
 
-  // A backgrounded tab freezes JS timers, so the socket can die (server ping timeout, OS
-  // reclaiming the connection) without onclose ever running; it only fires once the tab
-  // wakes back up, and from there the effect above still waits out the rest of the current
-  // backoff delay before retrying. That reads as an avoidable stall exactly when the user is
-  // already back and waiting. Reconnecting immediately (and resetting the backoff) instead of
-  // waiting for that timer to run its course removes the stall while leaving the backoff in
-  // place for genuine live disconnects (server restart, etc).
+  // A backgrounded tab freezes JS timers, so the socket can die (a zombie half-open
+  // connection, see HEARTBEAT_INTERVAL_MS above, or a genuine server restart) without the
+  // in-effect heartbeat/connect-timeout getting a chance to catch it while backgrounded; this
+  // only runs once the tab wakes back up. Trusting readyState alone here used to be the bug:
+  // CONNECTING and OPEN both read as "leave it alone", which is exactly wrong for a socket
+  // that has been hanging in CONNECTING past its own timeout or sitting OPEN-but-dead past the
+  // liveness window the whole time it was backgrounded. Checking the same timestamps the
+  // in-effect watchdog uses instead of the raw readyState tells a genuinely fresh/live socket
+  // apart from a stuck one, and resetting the backoff on every wake (not just on eventual
+  // reconnect) means coming back to the app never inherits whatever delay had built up while
+  // it was hidden.
   useWakeRetry(() => {
     const socket = socketRef.current;
-    if (socket !== null && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) {
-      return;
+    const now = performance.now();
+    if (socket !== null) {
+      if (socket.readyState === WebSocket.CONNECTING && now - connectStartedAtRef.current < CONNECT_TIMEOUT_MS) {
+        return;
+      }
+      if (socket.readyState === WebSocket.OPEN && now - lastActivityAtRef.current < LIVENESS_TIMEOUT_MS) {
+        return;
+      }
     }
     reconnectAttemptRef.current = 0;
+    if (socket !== null && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) {
+      // Past its own timeout/liveness window: force a real "close" so the effect's
+      // onclose-driven backoff (now reset to attempt 0, so it fires almost immediately)
+      // picks it up, instead of silently doing nothing because readyState looked fine.
+      socket.close();
+      return;
+    }
     setConnectionEpoch((previousEpoch) => previousEpoch + 1);
   });
 
