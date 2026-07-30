@@ -168,6 +168,22 @@ const COPY_MODE_INDICATOR_SCAN_THROTTLE_MS = 100;
 // gap appears that tells trailing momentum apart from a deliberate new scroll-up.
 const TRAILING_MOMENTUM_SUPPRESS_MS = 400;
 
+// xterm-addon-webgl keeps ONE glyph texture atlas per render config (font/size/theme/dpr)
+// shared across every terminal that matches it, not one atlas per terminal (see
+// acquireTextureAtlas in @xterm/addon-webgl's source). Every instance in this app mounts
+// at once and stays mounted (see App.tsx's terminal pool), so with a shared font/size they
+// all share the same atlas object. clearTextureAtlas() wipes that shared atlas's texture but
+// only re-queues a redraw for the terminal that called it; every other terminal is left with
+// its glyph model pointing at texture coordinates that are now stale or hold a different
+// glyph, which reads as corrupted/shifted characters. This registry lets the one-time font-
+// ready wipe (below) reach every live terminal, not just the one that triggered it.
+const liveWebglAddons = new Set<WebglAddon>();
+const liveTerminals = new Set<Terminal>();
+// Guards the atlas wipe below to run exactly once per page load: a terminal mounted after
+// fonts have already finished loading has nothing to wipe, and wiping again would just
+// re-trigger the same cross-terminal corruption this fix is for.
+let fontsAtlasWipeDone = false;
+
 function DisconnectedOverlay({ onReconnect }: { onReconnect: () => void }) {
   return (
     <div className="absolute inset-0 flex items-center justify-center bg-app/80">
@@ -361,6 +377,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     terminal.open(container);
     terminalRef.current = terminal;
     fitAddonRef.current = fitAddon;
+    liveTerminals.add(terminal);
 
     // DOM renderer repaints the whole pane's DOM nodes on every redraw; on mobile that's
     // the single most expensive step in the touch-scroll round trip. WebGL renders to a
@@ -376,6 +393,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       try {
         const webglAddon = new WebglAddon();
         webglAddon.onContextLoss(() => {
+          liveWebglAddons.delete(webglAddon);
           webglAddon.dispose();
           webglAddonRef.current = null;
           if (webglRetries < MAX_WEBGL_CONTEXT_LOSS_RETRIES) {
@@ -390,6 +408,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
         });
         terminal.loadAddon(webglAddon);
         webglAddonRef.current = webglAddon;
+        liveWebglAddons.add(webglAddon);
       } catch {
         // no WebGL support; xterm keeps using its default DOM renderer
       }
@@ -760,6 +779,10 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
         window.clearTimeout(persistTimerRef.current);
       }
       socketRef.current?.close();
+      liveTerminals.delete(terminal);
+      if (webglAddonRef.current !== null) {
+        liveWebglAddons.delete(webglAddonRef.current);
+      }
       try {
         terminal.dispose();
       } catch {
@@ -781,11 +804,27 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   // clears the atlas. document.fonts.ready resolves once every requested font this page has
   // asked for (including those late subsets) has finished, so it is the right point to wipe
   // the atlas and let the next repaint redraw everything with the fonts actually loaded.
+  //
+  // This must run exactly once for the whole page, not once per instance: the atlas is a
+  // single object shared by every terminal with the same render config (see liveWebglAddons
+  // above), so clearing it from one instance's effect already invalidates every other live
+  // terminal's glyph model. Wiping every live atlas (there can be more than one if instances
+  // differ in font size, see hostPrefs) and then force-refreshing every live terminal keeps
+  // all of them in sync with the clear instead of just the one that triggered it. A terminal
+  // that mounts after this has already run has nothing to fix: fonts finished loading before
+  // its own atlas was ever populated.
   useEffect(() => {
     let cancelled = false;
     document.fonts.ready.then(() => {
-      if (!cancelled) {
-        webglAddonRef.current?.clearTextureAtlas();
+      if (cancelled || fontsAtlasWipeDone) {
+        return;
+      }
+      fontsAtlasWipeDone = true;
+      for (const addon of liveWebglAddons) {
+        addon.clearTextureAtlas();
+      }
+      for (const liveTerminal of liveTerminals) {
+        liveTerminal.refresh(0, liveTerminal.rows - 1);
       }
     });
     return () => {
