@@ -3,5 +3,3 @@ data/
 web/dist/
 *.log
 .DS_Store
-certs/
-Caddyfile.https

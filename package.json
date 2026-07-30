@@ -1,6 +1,6 @@
 {
   "name": "ai-multi-instance",
-  "version": "1.12.2",
+  "version": "1.13.0",
   "private": true,
   "description": "Local dashboard for running Claude Code, Codex, Cursor Agent, and custom CLI sessions in parallel with tmux persistence",
   "workspaces": [
@@ -8,7 +8,7 @@
     "web"
   ],
   "scripts": {
-    "dev": "concurrently -n server,web -c blue,magenta \"npm run dev -w server\" \"npm run dev -w web\"",
+    "dev": "concurrently --kill-others-on-fail -n server,web -c blue,magenta \"npm run dev -w server\" \"npm run dev -w web\"",
     "build": "npm run build -w web",
     "start": "npm run start -w server",
     "test": "npm run test -w server && npm run test -w web"

@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { extractTunnelUrl } from "./tunnel";
+import { classifyPreflight, extractTunnelUrl } from "./tunnel";
+
+const APP_SHELL_BODY = '<html><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>';
 
 describe("extractTunnelUrl", () => {
   it("extracts the trycloudflare URL from a stderr chunk", () => {
@@ -22,5 +24,31 @@ describe("extractTunnelUrl", () => {
       "|  https://another-example.trycloudflare.com                                                  |\n" +
       "+--------------------------------------------------------------------------------------------+\n";
     expect(extractTunnelUrl(chunk)).toBe("https://another-example.trycloudflare.com");
+  });
+});
+
+describe("classifyPreflight", () => {
+  it("classifies a 200 with the app-shell markers as ok", () => {
+    expect(classifyPreflight(200, APP_SHELL_BODY)).toBe("ok");
+  });
+
+  it("classifies a 200 without the app-shell markers as wrong-origin", () => {
+    expect(classifyPreflight(200, "<html><body>Hello from some other server</body></html>")).toBe("wrong-origin");
+  });
+
+  it("classifies a 404 as wrong-origin", () => {
+    expect(classifyPreflight(404, "Not Found")).toBe("wrong-origin");
+  });
+
+  it("classifies a 502 as upstream-down", () => {
+    expect(classifyPreflight(502, "")).toBe("upstream-down");
+  });
+
+  it("classifies a 503 as upstream-down", () => {
+    expect(classifyPreflight(503, "")).toBe("upstream-down");
+  });
+
+  it("classifies Vite's host-check rejection as wrong-origin", () => {
+    expect(classifyPreflight(403, "Blocked request. This host is not allowed.")).toBe("wrong-origin");
   });
 });

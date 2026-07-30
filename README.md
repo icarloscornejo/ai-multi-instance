@@ -1,6 +1,6 @@
 # AI Multi-Instance
 
-**Version:** 1.12.2
+**Version:** 1.13.0
 
 Local dashboard for running Claude Code, Codex CLI, Cursor Agent, custom commands, and shell sessions in parallel. Every instance is a real tmux-backed terminal, so it survives browser and dashboard restarts. Works well from a phone browser too, with its own password-protected home, terminal, and settings screens.
 
@@ -44,12 +44,11 @@ On a phone or narrow viewport the dashboard switches to a dedicated mobile shell
 - **Theme**: Light/Dark/System preference, applied live.
 - **Password gate**: when a password is set (see Remote access below), a lock screen guards both the API and the WebSocket connection before any instance data loads.
 
-## Remote access (HTTPS + tunnel)
+## Remote access (tunnel)
 
-Two independent ways to reach the dashboard beyond `http://ai.local` on the same machine:
+A way to reach the dashboard beyond `http://ai.local` on the same machine:
 
-- **Local HTTPS (mkcert)**: `setup.sh` generates a locally-trusted certificate covering `ai.local`, `claude.local`, `localhost`, and this machine's LAN IP, writing it to `certs/` and a generated `Caddyfile.https` (imported by the main `Caddyfile`) so Caddy serves HTTPS on `:443` alongside the existing `:80`. Useful for reaching the dashboard by LAN IP from a phone without certificate warnings.
-- **Cloudflare tunnel**: start a `cloudflared tunnel --url` from the dashboard's Setup screen to get a temporary public `*.trycloudflare.com` URL, no port forwarding or account needed. The tunnel points at Caddy, not directly at the server, so it serves the exact same Vite dev frontend as `ai.local` (see How it works below); it requires Caddy to be running and fails with an actionable error if it isn't. The tunnel is only ever useful alongside the password gate: set a password first (stored hashed with scrypt in `data/auth-password.json`, or via the `DASHBOARD_PASSWORD` env var) so the public URL isn't wide open. Note that Vite's dev server exposes source files under `/@fs/*` to anyone with the tunnel URL, not just the password-gated app; `web/vite.config.ts`'s `server.fs.deny` keeps `data/` and `certs/` out of reach, but the rest of the source tree is intentionally readable, on the assumption that this repo's source isn't sensitive.
+- **Cloudflare tunnel**: start a `cloudflared tunnel --url` from the dashboard's Setup screen to get a temporary public `*.trycloudflare.com` URL, no port forwarding or account needed. The tunnel points at Caddy, not directly at the server, so it serves the exact same Vite dev frontend as `ai.local` (see How it works below); it requires Caddy to be running and fails with an actionable error if it isn't. The tunnel is only ever useful alongside the password gate: set a password first (stored hashed with scrypt in `data/auth-password.json`, or via the `DASHBOARD_PASSWORD` env var) so the public URL isn't wide open. Note that Vite's dev server exposes source files under `/@fs/*` to anyone with the tunnel URL, not just the password-gated app; `web/vite.config.ts`'s `server.fs.deny` keeps `data/` out of reach, but the rest of the source tree is intentionally readable, on the assumption that this repo's source isn't sensitive.
 
 ## How it works
 
@@ -65,7 +64,7 @@ Two independent ways to reach the dashboard beyond `http://ai.local` on the same
 
 ## Requirements
 
-macOS with tmux, jq, node 20.11+, and Caddy. At least one AI CLI is optional; shell-only and custom-command instances work without one. `mkcert` (for local HTTPS) and `cloudflared` (for the remote tunnel) are optional, install them only if you want those features.
+macOS with tmux, jq, node 20.11+, and Caddy. At least one AI CLI is optional; shell-only and custom-command instances work without one. `cloudflared` (for the remote tunnel) is optional, install it only if you want that feature.
 
 Supported executable defaults:
 

@@ -1,5 +1,8 @@
 http://ai.local, http://claude.local {
 	reverse_proxy 127.0.0.1:5173
+	handle_errors {
+		respond "Caddy can't reach the dashboard's dev server (status {err.status_code}). Start it with: npm run dev" {err.status_code}
+	}
 }
 
 # Same-LAN access by raw IP (e.g. from a phone on home WiFi, without touching its DNS):
@@ -9,9 +12,7 @@ http://ai.local, http://claude.local {
 	reverse_proxy 127.0.0.1:5173 {
 		header_up Host ai.local
 	}
+	handle_errors {
+		respond "Caddy can't reach the dashboard's dev server (status {err.status_code}). Start it with: npm run dev" {err.status_code}
+	}
 }
-
-# HTTPS local (mkcert): setup.sh generates Caddyfile.https with the absolute paths to
-# the generated cert. The glob makes the import optional for clones where setup hasn't
-# run yet.
-import Caddyfile.https*

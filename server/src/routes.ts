@@ -46,7 +46,7 @@ function getLanUrl(): string | null {
           address.address.startsWith("10.") ||
           /^172\.(1[6-9]|2\d|3[01])\./.test(address.address))
       ) {
-        return `https://${address.address}`;
+        return `http://${address.address}`;
       }
     }
   }
@@ -298,23 +298,6 @@ apiRouter.post(
       maxAge: maxAgeMs,
     });
     response.json({ ok: true });
-  })
-);
-
-// Public on purpose: a phone needs this to trust the local mkcert CA before it can load
-// anything else over HTTPS, and the root cert only contains a public key (see setup.sh's
-// mkcert block, which writes it to certs/rootCA.pem).
-apiRouter.get(
-  "/ca.pem",
-  wrapAsync(async (_request, response) => {
-    const caPath: string = path.resolve(import.meta.dirname, "../../certs/rootCA.pem");
-    if (!(await pathExists(caPath))) {
-      response.status(404).json({ error: "No local certificate found. Run setup.sh to generate one." });
-      return;
-    }
-    response.set("Content-Type", "application/x-pem-file");
-    response.set("Content-Disposition", 'attachment; filename="rootCA.pem"');
-    response.sendFile(caPath);
   })
 );
 

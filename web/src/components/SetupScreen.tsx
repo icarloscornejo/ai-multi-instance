@@ -217,14 +217,6 @@ function LanAccessSection() {
           {url}
         </a>
       </div>
-      <p className="text-[11.5px] leading-[1.5] text-txt-secondary">
-        First time on this phone?{" "}
-        <a href="/api/ca.pem" className="font-medium text-accent">
-          Download the local certificate
-        </a>{" "}
-        and trust it (iOS: Settings &gt; General &gt; VPN &amp; Device Management, then General &gt; About &gt;
-        Certificate Trust Settings. Android: install as a CA certificate).
-      </p>
     </div>
   );
 }
@@ -249,7 +241,24 @@ function TunnelSection() {
       .getTunnel()
       .then(setStatus)
       .catch(() => undefined);
-  }, []);
+  }, [isAllowedHost]);
+
+  // A single fetch on mount misses everything that happens after: cloudflared dying on its
+  // own (network blip), or a "running" tunnel that only just finished edge verification.
+  // Poll while there's something that could still change; stop for "stopped"/"error" so a
+  // closed tunnel doesn't keep hitting the API forever.
+  useEffect(() => {
+    if (!isAllowedHost || (status?.state !== "starting" && status?.state !== "running")) {
+      return;
+    }
+    const interval = setInterval(() => {
+      api
+        .getTunnel()
+        .then(setStatus)
+        .catch(() => undefined);
+    }, 5_000);
+    return () => clearInterval(interval);
+  }, [isAllowedHost, status?.state]);
 
   const attemptStart = async (): Promise<void> => {
     setErrorMessage(null);
