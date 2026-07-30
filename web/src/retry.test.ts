@@ -8,10 +8,11 @@ describe("retryDelayMs", () => {
     expect(retryDelayMs(2)).toBe(1_000);
     expect(retryDelayMs(3)).toBe(2_000);
     expect(retryDelayMs(4)).toBe(4_000);
-    expect(retryDelayMs(5)).toBe(8_000);
   });
 
   it("caps at RETRY_MAX_DELAY_MS once doubling would exceed it", () => {
+    // attempt 5 is the first one where doubling (8_000) would overshoot the cap
+    expect(retryDelayMs(5)).toBe(RETRY_MAX_DELAY_MS);
     expect(retryDelayMs(6)).toBe(RETRY_MAX_DELAY_MS);
     expect(retryDelayMs(7)).toBe(RETRY_MAX_DELAY_MS);
   });

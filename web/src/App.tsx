@@ -37,6 +37,12 @@ import type {
   UpdateStatus,
 } from "./types";
 
+// Most load failures (tsx watch restarting the server during a self-update) resolve on the
+// very next retry, well under this delay, so the full-screen ConnectionLostScreen/
+// ServerErrorScreen is held back instead of shown immediately: flashing it for a blip that
+// clears in a few hundred ms is just noise. A real outage still surfaces it soon enough.
+const LOAD_FAILURE_DISPLAY_DELAY_MS = 1_500;
+
 export function App() {
   const [config, setConfig] = useState<DashboardConfig | null>(null);
   const [instances, setInstances] = useState<Instance[]>([]);
@@ -53,6 +59,9 @@ export function App() {
   loadFailureRef.current = loadFailure;
   const loadRetryAttemptRef = useRef<number>(0);
   const loadRetryTimeoutIdRef = useRef<number | undefined>(undefined);
+  // See LOAD_FAILURE_DISPLAY_DELAY_MS: holds the pending "show the failure screen" timer so
+  // a retry that succeeds before it fires can cancel it instead of the screen flashing on.
+  const loadFailureDisplayTimeoutIdRef = useRef<number | undefined>(undefined);
   const loadRef = useRef<() => void>(() => undefined);
   const [gateOpen, setGateOpen] = useState<boolean>(false);
   // Mirrors gateOpen for the pageshow handler below, which is registered once and would
@@ -138,6 +147,8 @@ export function App() {
             return;
           }
           loadRetryAttemptRef.current = 0;
+          window.clearTimeout(loadFailureDisplayTimeoutIdRef.current);
+          loadFailureDisplayTimeoutIdRef.current = undefined;
           setLoadFailure(null);
           setConfig(loadedConfig);
           setInstances(loadedInstances);
@@ -168,7 +179,17 @@ export function App() {
           }
           // An ApiError means the server responded (even if with a 4xx/5xx); anything else
           // (fetch's TypeError) means the server never answered at all
-          setLoadFailure(error instanceof ApiError ? "server" : "connection");
+          const failureType: "connection" | "server" = error instanceof ApiError ? "server" : "connection";
+          if (loadFailureRef.current !== null) {
+            // Already on-screen (retries have been failing past the delay below): reflect
+            // the current failure type immediately instead of waiting out another delay.
+            setLoadFailure(failureType);
+          } else if (loadFailureDisplayTimeoutIdRef.current === undefined) {
+            loadFailureDisplayTimeoutIdRef.current = window.setTimeout(() => {
+              loadFailureDisplayTimeoutIdRef.current = undefined;
+              setLoadFailure(failureType);
+            }, LOAD_FAILURE_DISPLAY_DELAY_MS);
+          }
           loadRetryTimeoutIdRef.current = window.setTimeout(load, retryDelayMs(loadRetryAttemptRef.current));
           loadRetryAttemptRef.current += 1;
         });
@@ -179,6 +200,7 @@ export function App() {
     return () => {
       cancelled = true;
       window.clearTimeout(loadRetryTimeoutIdRef.current);
+      window.clearTimeout(loadFailureDisplayTimeoutIdRef.current);
     };
   }, []);
 

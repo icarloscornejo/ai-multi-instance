@@ -40,6 +40,11 @@ const LIVENESS_TIMEOUT_MS = 25_000;
 // nothing retries. Force-closing it past this point feeds it back into the same onclose-driven
 // backoff instead of hanging indefinitely.
 const CONNECT_TIMEOUT_MS = 8_000;
+// Most drops (tsx watch restarting the server, a brief mobile network blip) resolve well
+// under this, so the overlay is delayed instead of shown immediately: flashing "Session
+// disconnected" for a reconnect that completes in a few hundred ms is just noise. A real
+// outage still shows it soon enough to matter.
+const DISCONNECTED_OVERLAY_DELAY_MS = 1_500;
 
 // ANSI palette aligned to the design tokens (xterm's defaults are too saturated)
 const terminalThemeDark: ITheme = {
@@ -254,6 +259,10 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   // timeout below and by wake-retry to tell a fresh CONNECTING handshake from one that has
   // been hanging past CONNECT_TIMEOUT_MS.
   const connectStartedAtRef = useRef<number>(0);
+  // See DISCONNECTED_OVERLAY_DELAY_MS: holds the pending "show the overlay" timer so a
+  // reconnect that lands before it fires can cancel it instead of the overlay flashing on
+  // and immediately off.
+  const disconnectedOverlayTimeoutIdRef = useRef<number | undefined>(undefined);
   const isMobile = useIsMobile();
   // Mobile screens are small enough that the server's default (tuned for desktop) reads
   // cramped-in-a-good-way but wastes space here; default to the smallest zoom on mobile
@@ -909,6 +918,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
 
     socket.onopen = () => {
       window.clearTimeout(connectTimeoutId);
+      window.clearTimeout(disconnectedOverlayTimeoutIdRef.current);
       reconnectAttemptRef.current = 0;
       lastActivityAtRef.current = performance.now();
       setDisconnected(false);
@@ -943,7 +953,9 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     // on a growing backoff instead of stranding the user on the manual Reconnect button
     let reconnectTimeoutId: number | undefined;
     socket.onclose = () => {
-      setDisconnected(true);
+      disconnectedOverlayTimeoutIdRef.current = window.setTimeout(() => {
+        setDisconnected(true);
+      }, DISCONNECTED_OVERLAY_DELAY_MS);
       reconnectTimeoutId = window.setTimeout(() => {
         setConnectionEpoch((previousEpoch) => previousEpoch + 1);
       }, retryDelayMs(reconnectAttemptRef.current));
@@ -955,6 +967,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       socket.close();
       window.clearTimeout(reconnectTimeoutId);
       window.clearTimeout(connectTimeoutId);
+      window.clearTimeout(disconnectedOverlayTimeoutIdRef.current);
       window.clearInterval(heartbeatIntervalId);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
