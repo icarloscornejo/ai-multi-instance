@@ -45,6 +45,10 @@ const CONNECT_TIMEOUT_MS = 8_000;
 // disconnected" for a reconnect that completes in a few hundred ms is just noise. A real
 // outage still shows it soon enough to matter.
 const DISCONNECTED_OVERLAY_DELAY_MS = 1_500;
+// Close codes the server only sends for conditions that will not clear on their own (see
+// index.ts): the instance was removed from the registry, the server ran out of ptys, or the
+// instance's folder is gone. Auto-retrying against these just repeats the same failure.
+const NON_RECOVERABLE_CLOSE_CODES = new Set<number>([4004, 4005]);
 
 // ANSI palette aligned to the design tokens (xterm's defaults are too saturated)
 const terminalThemeDark: ITheme = {
@@ -208,11 +212,21 @@ const liveTerminals = new Set<Terminal>();
 // re-trigger the same cross-terminal corruption this fix is for.
 let fontsAtlasWipeDone = false;
 
-function DisconnectedOverlay({ onReconnect }: { onReconnect: () => void }) {
+function DisconnectedOverlay({
+  onReconnect,
+  fatalReason,
+}: {
+  onReconnect: () => void;
+  // Present only for a close code that will not clear on retry (see NON_RECOVERABLE_CLOSE_CODES):
+  // swaps the tone to danger, stops the ring spinning (nothing is actually in progress), and
+  // shows the server's actual reason instead of the generic auto-retry copy.
+  fatalReason: string | null;
+}) {
+  const tone: "accent" | "danger" = fatalReason !== null ? "danger" : "accent";
   return (
     <div className="absolute inset-0 flex items-center justify-center bg-app/80">
       <div className="flex w-[280px] flex-col items-center gap-[14px] rounded-lg border border-border bg-surface p-[26px] shadow-modal">
-        <RetryRing size={38} tone="accent">
+        <RetryRing size={38} tone={tone} spinning={fatalReason === null}>
           <svg
             viewBox="0 0 24 24"
             fill="none"
@@ -228,7 +242,9 @@ function DisconnectedOverlay({ onReconnect }: { onReconnect: () => void }) {
         </RetryRing>
         <div className="flex flex-col items-center gap-[3px] text-center">
           <span className="text-[13px] font-semibold text-txt-bright">Session disconnected</span>
-          <span className="text-[11.5px] text-txt-dim">Retrying automatically...</span>
+          <span className="text-[11.5px] text-txt-dim">
+            {fatalReason ?? "Retrying automatically..."}
+          </span>
         </div>
         <button type="button" onClick={onReconnect} className={`${btnGhost} px-[14px] py-[6px] text-[11.5px]`}>
           Reconnect now
@@ -271,6 +287,11 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     getHostFontSize(instance.id, isMobile ? MIN_FONT_SIZE : instance.fontSize)
   );
   const [disconnected, setDisconnected] = useState<boolean>(false);
+  // Non-null only for close codes the server sends when retrying can never succeed on its
+  // own (4004 unknown instance, 4005 out-of-ptys/missing folder, see index.ts). The reason
+  // string, when the server sent one, is what DisconnectedOverlay shows instead of "Retrying
+  // automatically..."; retry scheduling is skipped entirely for these.
+  const [fatalDisconnectReason, setFatalDisconnectReason] = useState<string | null>(null);
   const [connectionEpoch, setConnectionEpoch] = useState<number>(0);
   // On mobile every instance mounts hidden (display: none) in the always-rendered pool, so
   // fit() measures a zero-width container and the socket would open with xterm's 80x24
@@ -922,6 +943,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       reconnectAttemptRef.current = 0;
       lastActivityAtRef.current = performance.now();
       setDisconnected(false);
+      setFatalDisconnectReason(null);
       safeFit();
       const terminal = terminalRef.current;
       if (terminal !== null) {
@@ -952,7 +974,14 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     // A real disconnect (server restart from tsx watch, self-update, etc.) keeps retrying
     // on a growing backoff instead of stranding the user on the manual Reconnect button
     let reconnectTimeoutId: number | undefined;
-    socket.onclose = () => {
+    socket.onclose = (event: CloseEvent) => {
+      if (NON_RECOVERABLE_CLOSE_CODES.has(event.code)) {
+        // No point debouncing behind DISCONNECTED_OVERLAY_DELAY_MS: this is a final state,
+        // not a drop that might resolve itself in the next few hundred ms.
+        setFatalDisconnectReason(event.reason || "This session cannot be restored.");
+        setDisconnected(true);
+        return;
+      }
       disconnectedOverlayTimeoutIdRef.current = window.setTimeout(() => {
         setDisconnected(true);
       }, DISCONNECTED_OVERLAY_DELAY_MS);
@@ -1076,7 +1105,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
           className="flex h-full w-full justify-center"
           style={{ touchAction: "none", willChange: "transform" }}
         />
-        {disconnected && <DisconnectedOverlay onReconnect={reconnect} />}
+        {disconnected && <DisconnectedOverlay onReconnect={reconnect} fatalReason={fatalDisconnectReason} />}
         {showScrollToBottom && (
           <button
             type="button"

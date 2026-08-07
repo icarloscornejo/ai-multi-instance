@@ -8,6 +8,7 @@ import express, { type Request, type Response, type NextFunction, type Router } 
 import { AUTH_COOKIE_NAME, checkPassword, isAuthEnabled, issueToken, readCookie, requireAuth, setStoredPassword, verifyToken } from "./auth";
 import { buildLaunchCommand } from "./launch";
 import { isAgentProvider, PROVIDERS, sessionKeyFor } from "./providers";
+import { pathExists } from "./paths";
 import { loadState, saveState } from "./store";
 import { createSession, exitCopyMode, getPaneCurrentPath, killSession, sendCommandToSession } from "./tmux";
 import { getTunnelStatus, readTunnelLog, startTunnel, stopTunnel } from "./tunnel";
@@ -51,15 +52,6 @@ function getLanUrl(): string | null {
     }
   }
   return null;
-}
-
-async function pathExists(candidatePath: string): Promise<boolean> {
-  try {
-    await fs.access(candidatePath);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 const execFileAsync = promisify(execFile);

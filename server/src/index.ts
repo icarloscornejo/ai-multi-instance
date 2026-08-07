@@ -7,7 +7,7 @@ import { AUTH_COOKIE_NAME, isAuthEnabled, readCookie, verifyToken } from "./auth
 import { registerHeartbeat, startHeartbeat } from "./heartbeat";
 import { apiRouter } from "./routes";
 import { loadState } from "./store";
-import { bridgeTerminal } from "./terminal";
+import { bridgeTerminal, LocationMissingError, TooManyPtysError } from "./terminal";
 import type { DashboardState } from "./types";
 
 const serverPort: number = Number(process.env.PORT ?? 3001);
@@ -104,7 +104,12 @@ httpServer.on("upgrade", (request, socket, head) => {
         );
       })().catch((error: Error) => {
         console.error(`[server] failed to attach instance ${instanceId}:`, error.message);
-        webSocket.close(4000, error.message.slice(0, 120));
+        // 4005: a condition that will not clear itself on retry (server out of ptys, or the
+        // instance's folder is gone). The client stops auto-retrying on this code instead of
+        // hammering an attach that can only succeed after user or operator action.
+        const closeCode: number =
+          error instanceof TooManyPtysError || error instanceof LocationMissingError ? 4005 : 4000;
+        webSocket.close(closeCode, error.message.slice(0, 120));
       });
     });
   }
