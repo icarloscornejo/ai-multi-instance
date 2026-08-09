@@ -349,14 +349,20 @@ export async function startTunnel(): Promise<TunnelStatus> {
         return;
       }
       // Was running (or edge-verifying) and died on its own (network blip, killed externally,
-      // ha-connections:1 dropping on a flaky network, etc.). Keep the reason instead of
-      // discarding stderrTail: with only one edge connection, this is the expected way a
-      // hotspot disconnect shows up, and the UI has nowhere else to show why.
+      // ha-connections:1 dropping on a flaky network, etc.). Code 0 means cloudflared gave up
+      // retrying and shut itself down cleanly, not a crash; surfacing its stderr tail as an
+      // "error" in that case is just noise that outlives the process it describes (the tunnel
+      // is already fully stopped by the time anyone reads it). Keep the reason for a non-zero
+      // exit: with only one edge connection, that's the expected way a hotspot disconnect or
+      // an actual crash shows up, and the UI has nowhere else to show why.
       child = null;
       status.state = "stopped";
       status.phase = null;
       status.url = null;
-      status.error = stderrTail.trim().length > 0 ? `cloudflared exited unexpectedly (code ${code}). ${stderrTail.slice(-300)}` : null;
+      status.error =
+        code !== 0 && stderrTail.trim().length > 0
+          ? `cloudflared exited unexpectedly (code ${code}). ${stderrTail.slice(-300)}`
+          : null;
       status.warning = null;
     });
   });
