@@ -12,10 +12,20 @@ const logFilePath: string = path.join(dataDirectory, "cloudflared.log");
 
 export type TunnelState = "stopped" | "starting" | "running" | "error";
 
+// Only meaningful while state === "starting"; every terminal transition (running, error,
+// stopped) resets this to null so the UI's step list never shows a stale step.
+export type TunnelPhase = "checking-caddy" | "launching" | "verifying";
+
 export interface TunnelStatus {
   state: TunnelState;
+  phase: TunnelPhase | null;
   url: string | null;
   error: string | null;
+  // Set only for the inconclusive edge-verify outcome (see finishRunning): the tunnel is
+  // "running" and this is not an error, just something the UI should say without the red
+  // error styling. Kept separate from `error` so a real failure and a shrug can't collide
+  // in the same field.
+  warning: string | null;
 }
 
 const TRYCLOUDFLARE_URL_PATTERN = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/;
@@ -28,7 +38,7 @@ export function extractTunnelUrl(output: string): string | null {
 
 const START_TIMEOUT_MS = 20_000;
 
-const status: TunnelStatus = { state: "stopped", url: null, error: null };
+const status: TunnelStatus = { state: "stopped", phase: null, url: null, error: null, warning: null };
 let child: ChildProcess | null = null;
 let startPromise: Promise<TunnelStatus> | null = null;
 
@@ -118,10 +128,13 @@ function checkCaddyReachable(): Promise<CaddyPreflight> {
 // After cloudflared prints a URL, fetch it back before ever reporting "running": the URL is
 // registered with the edge as soon as it's printed, but that says nothing about whether the
 // edge can actually reach Caddy through this specific tunnel, only that cloudflared connected
-// somewhere. Backoff sums to ~15s, on top of (not instead of) each attempt's own timeout, to
-// absorb the trycloudflare.com hostname's own propagation delay.
-const EDGE_VERIFY_ATTEMPT_TIMEOUT_MS = 5_000;
-const EDGE_VERIFY_BACKOFFS_MS = [1_000, 2_000, 3_000, 4_000, 5_000];
+// somewhere. Two attempts, not more: cloudflared.log shows the connection can still be
+// registering ~1s after the URL is printed, so a single retry absorbs that race, but on a
+// machine where this fetch fails (confirmed: 6x "fetch failed" back to back in that same log),
+// every extra attempt just re-confirms the same transport error at the cost of real wall-clock
+// time on every tunnel start.
+const EDGE_VERIFY_ATTEMPT_TIMEOUT_MS = 3_000;
+const EDGE_VERIFY_BACKOFFS_MS = [1_500];
 
 type EdgeVerifyResult =
   | { outcome: "ok" }
@@ -184,25 +197,32 @@ export async function startTunnel(): Promise<TunnelStatus> {
   }
 
   status.state = "starting";
+  status.phase = "checking-caddy";
   status.url = null;
   status.error = null;
+  status.warning = null;
 
   const caddyPreflight: CaddyPreflight = await checkCaddyReachable();
   if (caddyPreflight.result === "caddy-down") {
     status.state = "error";
+    status.phase = null;
     status.error = `Caddy isn't responding on 127.0.0.1:${CADDY_HTTP_PORT}. Start it with: brew services start caddy`;
     return getTunnelStatus();
   }
   if (caddyPreflight.result === "upstream-down") {
     status.state = "error";
+    status.phase = null;
     status.error = "Caddy is running but the dashboard's dev server isn't responding behind it. Start it with: npm run dev";
     return getTunnelStatus();
   }
   if (caddyPreflight.result === "wrong-origin") {
     status.state = "error";
+    status.phase = null;
     status.error = `Caddy on 127.0.0.1:${CADDY_HTTP_PORT} isn't serving this app (status ${caddyPreflight.status ?? "?"}): ${caddyPreflight.bodySnippet.slice(0, 200)}`;
     return getTunnelStatus();
   }
+
+  status.phase = "launching";
 
   startPromise = new Promise<TunnelStatus>((resolve) => {
     // QUIC (cloudflared's default) is UDP-based and gets silently blocked or throttled by
@@ -248,6 +268,7 @@ export async function startTunnel(): Promise<TunnelStatus> {
       if (settled) return;
       settled = true;
       status.state = "error";
+      status.phase = null;
       status.url = null;
       status.error = message;
       // cloudflared has no reason to keep running once startTunnel reports error: without
@@ -261,13 +282,16 @@ export async function startTunnel(): Promise<TunnelStatus> {
 
     // warning is set when edge verification hit a transport error (can't reach the public
     // edge from this machine) rather than a bad response: inconclusive, not a failure, so the
-    // tunnel stays running and the warning just surfaces in the same error slot the UI already renders.
+    // tunnel stays running and the warning goes in its own field, not status.error, so the UI
+    // can render it as informational instead of red.
     const finishRunning = (url: string, warning: string | null = null): void => {
       if (settled) return;
       settled = true;
       status.state = "running";
+      status.phase = null;
       status.url = url;
-      status.error = warning;
+      status.error = null;
+      status.warning = warning;
       startPromise = null;
       resolve(getTunnelStatus());
     };
@@ -283,6 +307,11 @@ export async function startTunnel(): Promise<TunnelStatus> {
       if (url === null) return;
       urlSeen = true;
       clearTimeout(timer);
+      // Publish the URL as soon as it's known, before verification finishes: the UI can show
+      // it (and the QR) during the "verifying" phase instead of waiting for the whole
+      // start/verify round trip, and getTunnelStatus() already returns a fresh copy per call.
+      status.url = url;
+      status.phase = "verifying";
       appendLogLine(`--- tunnel URL detected: ${url}, verifying it actually serves the app ---`);
       void verifyEdge(url, appendLogLine).then((result) => {
         if (settled) return;
@@ -293,7 +322,7 @@ export async function startTunnel(): Promise<TunnelStatus> {
         if (result.outcome === "transport-error") {
           finishRunning(
             url,
-            `Could not confirm the tunnel from this machine (${result.message}); it may still work from other devices.`
+            "The tunnel is active, but this machine could not verify the public URL. It may still work from your phone or another device."
           );
           return;
         }
@@ -325,8 +354,10 @@ export async function startTunnel(): Promise<TunnelStatus> {
       // hotspot disconnect shows up, and the UI has nowhere else to show why.
       child = null;
       status.state = "stopped";
+      status.phase = null;
       status.url = null;
       status.error = stderrTail.trim().length > 0 ? `cloudflared exited unexpectedly (code ${code}). ${stderrTail.slice(-300)}` : null;
+      status.warning = null;
     });
   });
 
@@ -348,8 +379,10 @@ export function stopTunnel(): TunnelStatus {
   }
   startPromise = null;
   status.state = "stopped";
+  status.phase = null;
   status.url = null;
   status.error = null;
+  status.warning = null;
   return getTunnelStatus();
 }
 

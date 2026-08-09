@@ -22,8 +22,17 @@ import { copyText } from "./Sidebar";
 import { PROVIDER_OPTIONS } from "../providerOptions";
 import type { ThemePreference } from "../theme";
 import { KEY_BAR_CATALOG, reorderById, type KeyBarPref } from "../keyBar";
-import type { AgentProvider, DashboardConfig, TunnelStatus } from "../types";
-import { btnGhost, btnOutline, btnPrimary, cardClassName, errorTextClassName, inputClassName, inputErrorClassName } from "../ui";
+import type { AgentProvider, DashboardConfig, TunnelPhase, TunnelStatus } from "../types";
+import {
+  btnGhost,
+  btnOutline,
+  btnPrimary,
+  cardClassName,
+  errorTextClassName,
+  hintTextClassName,
+  inputClassName,
+  inputErrorClassName,
+} from "../ui";
 
 const THEME_OPTIONS: { value: ThemePreference; label: string }[] = [
   { value: "light", label: "Light" },
@@ -221,6 +230,14 @@ function LanAccessSection() {
   );
 }
 
+// Mirrors server/src/tunnel.ts's phase transitions, in order, so the UI can show which steps
+// are done, which is in progress, and which are still ahead while state === "starting".
+const TUNNEL_PHASES: { phase: TunnelPhase; label: string }[] = [
+  { phase: "checking-caddy", label: "Checking the local server" },
+  { phase: "launching", label: "Starting cloudflared" },
+  { phase: "verifying", label: "Verifying the public URL" },
+];
+
 function TunnelSection() {
   const isAllowedHost: boolean = window.location.hostname === TUNNEL_SECTION_ALLOWED_HOSTNAME;
   const [status, setStatus] = useState<TunnelStatus | null>(null);
@@ -246,27 +263,39 @@ function TunnelSection() {
   // A single fetch on mount misses everything that happens after: cloudflared dying on its
   // own (network blip), or a "running" tunnel that only just finished edge verification.
   // Poll while there's something that could still change; stop for "stopped"/"error" so a
-  // closed tunnel doesn't keep hitting the API forever.
+  // closed tunnel doesn't keep hitting the API forever. Tighter interval while starting so the
+  // step list (phase/url) advances close to live instead of catching up in 5s jumps.
   useEffect(() => {
     if (!isAllowedHost || (status?.state !== "starting" && status?.state !== "running")) {
       return;
     }
+    let cancelled = false;
+    const pollMs = status.state === "starting" ? 1_000 : 5_000;
     const interval = setInterval(() => {
       api
         .getTunnel()
-        .then(setStatus)
+        .then((result) => {
+          // A slow response landing after this effect's own cleanup (state already moved on,
+          // e.g. via handleStop or a fresher poll tick) would otherwise stomp a newer status.
+          if (!cancelled) {
+            setStatus(result);
+          }
+        })
         .catch(() => undefined);
-    }, 5_000);
-    return () => clearInterval(interval);
+    }, pollMs);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [isAllowedHost, status?.state]);
 
   const attemptStart = async (): Promise<void> => {
     setErrorMessage(null);
-    setStatus((previous) => (previous === null ? null : { ...previous, state: "starting" }));
+    setStatus({ state: "starting", phase: "checking-caddy", url: null, error: null, warning: null });
     try {
       setStatus(await api.startTunnel());
     } catch (error) {
-      setStatus((previous) => (previous === null ? null : { ...previous, state: "stopped" }));
+      setStatus({ state: "stopped", phase: null, url: null, error: null, warning: null });
       if (error instanceof ApiError && error.status === 409) {
         setNeedsPassword(true);
         return;
@@ -371,6 +400,27 @@ function TunnelSection() {
         </div>
       )}
 
+      {!needsPassword && status?.state === "starting" && (
+        <ol className="flex flex-col gap-[4px]">
+          {TUNNEL_PHASES.map(({ phase, label }, index) => {
+            const currentIndex: number = TUNNEL_PHASES.findIndex((entry) => entry.phase === status.phase);
+            const isDone: boolean = currentIndex !== -1 && index < currentIndex;
+            const isCurrent: boolean = phase === status.phase;
+            return (
+              <li key={phase} className={`text-[11.5px] ${isCurrent ? "text-txt-bright" : "text-txt-dimmer"}`}>
+                {isDone ? "✓" : isCurrent ? "…" : "○"} {label}
+              </li>
+            );
+          })}
+        </ol>
+      )}
+
+      {!needsPassword && status?.phase === "verifying" && status.url !== null && (
+        <a href={status.url} target="_blank" rel="noreferrer" className="break-all text-[12px] font-medium text-accent">
+          {status.url}
+        </a>
+      )}
+
       {status?.state === "running" && status.url !== null && (
         <div className="flex flex-col items-start gap-[10px]">
           <TunnelQr url={status.url} />
@@ -378,6 +428,10 @@ function TunnelSection() {
             {status.url}
           </a>
         </div>
+      )}
+
+      {!needsPassword && status?.warning !== null && status?.warning !== undefined && (
+        <div className={hintTextClassName}>{status.warning}</div>
       )}
 
       {!needsPassword && (status?.error ?? errorMessage) !== null && (
@@ -394,7 +448,7 @@ function TunnelSection() {
             <button
               type="button"
               onClick={() => void attemptStart()}
-              disabled={status === null || status.state === "starting"}
+              disabled={status?.state === "starting"}
               className={btnOutline}
             >
               {status?.state === "starting" ? "Starting…" : "Start tunnel"}

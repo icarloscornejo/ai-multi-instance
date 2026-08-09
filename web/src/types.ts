@@ -86,10 +86,17 @@ export interface UpdateStatus {
 
 export type TunnelState = "stopped" | "starting" | "running" | "error";
 
+// Mirrors server/src/tunnel.ts's TunnelPhase; only meaningful while state === "starting".
+export type TunnelPhase = "checking-caddy" | "launching" | "verifying";
+
 export interface TunnelStatus {
   state: TunnelState;
+  phase: TunnelPhase | null;
   url: string | null;
   error: string | null;
+  // Informational only (e.g. edge verification was inconclusive from this machine); rendered
+  // distinctly from `error`, which is a real failure.
+  warning: string | null;
 }
 
 export interface LanAddress {
