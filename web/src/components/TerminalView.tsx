@@ -124,6 +124,34 @@ interface TerminalViewProps {
 // 3 lines per tick, so we accumulate drag distance in 3-line steps to track the finger.
 const SYNTHETIC_WHEEL_TICK_LINES = 3;
 
+// When the pane's mouse tracking is owned by an app rather than tmux (confirmed by the
+// absence of tmux's copy-mode indicator after a real wheel report landed, see
+// gestureModeRef), there is no server-side wheel rebind to lean on: a WheelEvent's deltaY
+// is discarded by xterm's own mouse encoder (it always emits exactly one mouse report per
+// event, see @xterm/xterm's Terminal.ts wheel handler) and the app decides its own scroll
+// step per report. Measured against Claude Code's own fullscreen TUI by feel: 1 was too
+// slow, 3 (tmux's own WheelPane convention, see SYNTHETIC_WHEEL_TICK_LINES above) too fast.
+// Tune this if a given app turns out to use a different step per wheel report.
+const APP_OWNED_TICK_LINES = 2;
+// Floor between dispatch passes while draining an app-owned gesture; there is no ack to
+// pace against (see gestureModeRef), so this is a plain rate limit instead.
+const APP_OWNED_REPORT_INTERVAL_MS = 16;
+// A single touchmove or momentum tick can accumulate several lines' worth of finger
+// movement; without a cap here a fast swipe would fall further and further behind since
+// each pass only advances the timer by one report. This still self-limits report rate
+// (multiplied by APP_OWNED_REPORT_INTERVAL_MS between passes) instead of firing unboundedly.
+const APP_OWNED_MAX_REPORTS_PER_DISPATCH = 4;
+// Separate from MOMENTUM_DECAY_PER_TICK on purpose. That constant is calibrated for
+// copy-mode's actual call cadence while dispatching real ticks, which rides the ack round
+// trip (see the ack-gate onRender handler) and in practice lands slower than the 20ms idle
+// re-arm, only converging to the 20ms cadence once the coast has already slowed into gaps
+// between ticks. App-owned has no ack to ride: every call while coasting is spaced at a
+// flat MOMENTUM_TICK_INTERVAL_MS (see dispatchAppOwnedTicks), so applying the same 0.95
+// from the very first decay step made the coast die out noticeably faster than the
+// copy-mode-riding-network-latency feel this app was tuned around. Higher value = slower
+// decay = longer coast; tune by feel.
+const APP_OWNED_MOMENTUM_DECAY_PER_TICK = 0.98;
+
 // Ticks are paced by ack instead of a fixed timer: the next tick is only dispatched once
 // the previous one's redraw has actually landed (see the ack machinery above the touch
 // listeners in TerminalView), so the client never queues up more redraws than the real
@@ -170,10 +198,15 @@ const FINE_SCROLL_VELOCITY_PX_PER_MS = 0.15;
 // table (reduceScrollStep only rebinds the 3-line WheelPane entries, these are untouched)
 // is only active while mode-keys is "vi", which this app never sets itself, it's whatever
 // the host's tmux config has. If mode-keys were ever "emacs" here, C-e resolves to
-// end-of-line in that table instead of scroll. To stay safe without reading tmux options
-// from the client, this is only sent once a wheel tick has already landed a real ack this
-// gesture (hasAckedThisGesture below), which is only possible from inside copy-mode,
-// never speculatively.
+// end-of-line in that table instead of scroll. Sending these blind is also unsafe in
+// another way: if the app currently owning the pane requests its own mouse tracking (e.g.
+// Claude Code's own fullscreen TUI), tmux forwards wheel ticks straight to that app instead
+// of entering copy-mode, so a redraw landing proves nothing about copy-mode being active,
+// only that the app repainted. C-y in that case reaches the app as a literal keystroke,
+// which in a readline-style input is "yank" (paste), not scroll. To stay safe, this is only
+// sent once this gesture has been classified "copy-mode" by actually observing tmux's own
+// copy-mode position indicator right after a real tick landed (see gestureModeRef and
+// readCopyModeIndicator below), never merely because some render happened.
 const FINE_SCROLL_UP_BYTES = "\u0019"; // C-y
 const FINE_SCROLL_DOWN_BYTES = "\u0005"; // C-e
 
@@ -339,6 +372,22 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   // native trackpad momentum (re-issue the exit-copy-mode call) instead of a fresh scroll-up
   // (show the button). Armed by handleScrollToBottomClick, renewed by each trailing tick.
   const suppressWheelUpUntilRef = useRef<number>(0);
+  // True once the tmux copy-mode position indicator (COPY_MODE_INDICATOR_PATTERN) has
+  // actually been observed, i.e. tmux really entered copy-mode rather than forwarding the
+  // wheel straight through to an app with its own mouse tracking (e.g. Claude Code's own
+  // fullscreen TUI). Persists across gestures so the button and its exit action stay in
+  // sync with tmux's real state even between swipes; see gestureModeRef below for the
+  // per-gesture classification used while a touch is in flight.
+  const copyModeActiveRef = useRef<boolean>(false);
+  // Classifies the touch gesture currently in flight. "unconfirmed" until the first real
+  // redraw lands, at which point the copy-mode indicator scan (unthrottled while a gesture
+  // is active, see the onRender subscription below) resolves it to "copy-mode" or
+  // "app-owned". The two need very different handling: copy-mode gets tmux's own 3-line
+  // WheelPane rebind, ack pacing and slide compensation; app-owned (nothing forwarded the
+  // wheel into copy-mode, so some other app is consuming it directly) gets 1-line-per-report
+  // sends with no ack and no slide, since there's no way to know how much that app actually
+  // scrolled per report.
+  const gestureModeRef = useRef<"unconfirmed" | "copy-mode" | "app-owned">("unconfirmed");
   // Set inside the terminal-creation effect to that render's stopDraining, so
   // handleScrollToBottomClick (defined outside the effect) can reach it without depending on
   // effect internals across re-runs.
@@ -472,6 +521,20 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     };
     attachWebglAddon();
 
+    // Reads tmux's copy-mode position indicator ("[<line>/<total>]", drawn at the far right
+    // of row 0 while a pane is actually in copy-mode) straight off the buffer. This is the
+    // only client-side signal that tells apart a real tmux copy-mode from an app (e.g.
+    // Claude Code's own fullscreen TUI) consuming the wheel itself: tmux runs the whole
+    // attach inside the alternate screen buffer regardless of what's running inside it (see
+    // SYNTHETIC_WHEEL_TICK_LINES above), so xterm's own buffer.active.type can't tell them
+    // apart. Returns the current line position, or null if the indicator isn't present.
+    const readCopyModeIndicator = (): number | null => {
+      const topLine = terminal.buffer.active.getLine(0);
+      const topLineText: string = topLine?.translateToString(true) ?? "";
+      const indicatorMatch: RegExpMatchArray | null = topLineText.match(COPY_MODE_INDICATOR_PATTERN);
+      return indicatorMatch !== null ? Number(indicatorMatch[1]) : null;
+    };
+
     terminal.onData((typedData: string) => {
       if (WHEEL_UP_SGR_PATTERN.test(typedData)) {
         const now: number = performance.now();
@@ -482,7 +545,9 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
           suppressWheelUpUntilRef.current = now + TRAILING_MOMENTUM_SUPPRESS_MS;
           return;
         }
-        setShowScrollToBottom(true);
+        // No optimistic show here: the indicator scan below is the only reliable evidence
+        // that this wheel-up actually landed tmux in copy-mode rather than being forwarded
+        // to whatever app owns the pane's mouse tracking.
       }
       const socket = socketRef.current;
       if (socket !== null && socket.readyState === WebSocket.OPEN) {
@@ -554,9 +619,6 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     let pendingSlideWasFine = false;
     let lastAckLandTimestamp = 0;
     let slideIntervalEmaMs = SLIDE_MIN_DURATION_MS;
-    // Flips true the first time a real ack (not a timeout) lands for this gesture, which
-    // is only possible from inside copy-mode; gates the 1-line C-y/C-e fine-scroll path.
-    let hasAckedThisGesture = false;
 
     const clearTimers = (): void => {
       if (ackTimeoutId !== null) {
@@ -612,10 +674,87 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     // keep firing scroll-up ticks after the button already exited copy-mode.
     stopActiveGestureRef.current = stopDraining;
 
-    const attemptDispatch = (): void => {
-      if (awaitingAck) {
+    // Shared by both dispatch paths below: advances the coast's velocity/accumulated
+    // distance for one momentum step. Returns false when the coast has decayed below the
+    // stop threshold (caller should stopDraining()); a no-op (returns true) while the finger
+    // is still down, since an active drag is driven by handleTouchMove's own accumulation.
+    const advanceMomentumIfReleased = (
+      touchState: { accumulatedPx: number; released: boolean },
+      decayPerTick: number = MOMENTUM_DECAY_PER_TICK
+    ): boolean => {
+      if (!touchState.released) {
+        return true;
+      }
+      const now: number = performance.now();
+      const elapsedMs: number = lastMomentumTimestamp === 0 ? 0 : now - lastMomentumTimestamp;
+      lastMomentumTimestamp = now;
+      if (Math.abs(dragVelocityPxPerMs) < MOMENTUM_MIN_VELOCITY_PX_PER_MS) {
+        return false;
+      }
+      touchState.accumulatedPx += dragVelocityPxPerMs * elapsedMs;
+      dragVelocityPxPerMs *= decayPerTick;
+      return true;
+    };
+
+    // Gesture classified "app-owned" (see gestureModeRef): the pane's mouse tracking is
+    // owned by whatever app is running, not tmux, so there's no ack to pace against and no
+    // known per-report scroll amount to slide-compensate for (see APP_OWNED_TICK_LINES
+    // above). Sends plain wheel reports at a flat rate instead, draining as much of the
+    // accumulated finger distance as it can each pass.
+    //
+    // Tried and reverted: animating the container by the assumed offset right after sending
+    // (mirroring playSlideCompensation). That assumed the redraw was local/instant; it isn't,
+    // the WheelEvent still round-trips over the socket to the server and back same as any
+    // other input, just without an ack to time against. The fake animation played and
+    // settled back to 0 well before the real redraw arrived, which read as the content
+    // sliding back and re-stabilizing, then jump-cutting separately once the real data
+    // landed, worse than the plain jump-cut this was meant to fix.
+    const dispatchAppOwnedTicks = (
+      activeTerminal: Terminal,
+      touchState: { lastClientY: number; accumulatedPx: number; released: boolean }
+    ): void => {
+      if (momentumTimeoutId !== null) {
+        window.clearTimeout(momentumTimeoutId);
+        momentumTimeoutId = null;
+      }
+      if (touchState.released && !advanceMomentumIfReleased(touchState, APP_OWNED_MOMENTUM_DECAY_PER_TICK)) {
+        stopDraining();
         return;
       }
+      const lineHeightPx: number = container.clientHeight / Math.max(1, activeTerminal.rows);
+      const tickPx: number = APP_OWNED_TICK_LINES * lineHeightPx;
+      let reportsSent = 0;
+      while (Math.abs(touchState.accumulatedPx) >= tickPx && reportsSent < APP_OWNED_MAX_REPORTS_PER_DISPATCH) {
+        const direction: number = Math.sign(touchState.accumulatedPx);
+        touchState.accumulatedPx -= direction * tickPx;
+        activeTerminal.element?.dispatchEvent(
+          new WheelEvent("wheel", {
+            deltaY: direction * tickPx,
+            deltaMode: WheelEvent.DOM_DELTA_PIXEL,
+            bubbles: true,
+            cancelable: true,
+          })
+        );
+        reportsSent += 1;
+      }
+      // Re-arm whenever there's more coasting to do (release) or this pass hit the burst
+      // cap with distance still left over (active drag outrunning the cap); an active drag
+      // still under the cap needs nothing further, the next handleTouchMove drives it.
+      const hasLeftoverDistance: boolean = Math.abs(touchState.accumulatedPx) >= tickPx;
+      if (touchState.released || hasLeftoverDistance) {
+        // While coasting, re-arm at MOMENTUM_TICK_INTERVAL_MS, not APP_OWNED_REPORT_INTERVAL_MS:
+        // MOMENTUM_DECAY_PER_TICK is calibrated per call, not per elapsed time (see its
+        // definition), assuming the ~50 calls/sec that constant produces. Re-arming faster
+        // here would call advanceMomentumIfReleased more often per real second, decaying
+        // velocity away quicker than intended and cutting the coast short. Only the leftover-
+        // distance case (active drag outrunning the burst cap) needs the tighter interval, to
+        // keep up with a fast finger instead of falling behind it.
+        const rearmDelayMs: number = touchState.released ? MOMENTUM_TICK_INTERVAL_MS : APP_OWNED_REPORT_INTERVAL_MS;
+        momentumTimeoutId = window.setTimeout(() => dispatchAppOwnedTicks(activeTerminal, touchState), rearmDelayMs);
+      }
+    };
+
+    const attemptDispatch = (): void => {
       const activeTerminal = terminalRef.current;
       const touchState = touchScrollRef.current;
       if (activeTerminal === null || touchState === null) {
@@ -623,24 +762,29 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
         return;
       }
 
-      if (touchState.released) {
-        const now: number = performance.now();
-        const elapsedMs: number = lastMomentumTimestamp === 0 ? 0 : now - lastMomentumTimestamp;
-        lastMomentumTimestamp = now;
-        if (Math.abs(dragVelocityPxPerMs) < MOMENTUM_MIN_VELOCITY_PX_PER_MS) {
-          stopDraining();
-          return;
-        }
-        touchState.accumulatedPx += dragVelocityPxPerMs * elapsedMs;
-        dragVelocityPxPerMs *= MOMENTUM_DECAY_PER_TICK;
+      if (gestureModeRef.current === "app-owned") {
+        dispatchAppOwnedTicks(activeTerminal, touchState);
+        return;
+      }
+
+      if (awaitingAck) {
+        return;
+      }
+
+      if (touchState.released && !advanceMomentumIfReleased(touchState)) {
+        stopDraining();
+        return;
       }
 
       const lineHeightPx: number = container.clientHeight / Math.max(1, activeTerminal.rows);
-      // Once this gesture has already proven copy-mode is active (a prior tick landed a
-      // real ack) and the coast has slowed into its tail, switch to 1-line raw key sends
-      // instead of 3-line synthetic wheel ticks (see FINE_SCROLL_VELOCITY_PX_PER_MS above).
+      // Once this gesture has actually been classified "copy-mode" (see gestureModeRef) and
+      // the coast has slowed into its tail, switch to 1-line raw key sends instead of 3-line
+      // synthetic wheel ticks (see FINE_SCROLL_VELOCITY_PX_PER_MS above).
       const useFineScroll: boolean =
-        touchState.released && hasAckedThisGesture && Math.abs(dragVelocityPxPerMs) < FINE_SCROLL_VELOCITY_PX_PER_MS;
+        touchState.released &&
+        gestureModeRef.current === "copy-mode" &&
+        copyModeActiveRef.current &&
+        Math.abs(dragVelocityPxPerMs) < FINE_SCROLL_VELOCITY_PX_PER_MS;
       const tickLines: number = useFineScroll ? 1 : SYNTHETIC_WHEEL_TICK_LINES;
       const tickPx: number = tickLines * lineHeightPx;
       if (Math.abs(touchState.accumulatedPx) < tickPx) {
@@ -654,9 +798,6 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       }
 
       const direction: number = Math.sign(touchState.accumulatedPx);
-      if (direction < 0) {
-        setShowScrollToBottom(true);
-      }
       touchState.accumulatedPx -= direction * tickPx;
       pendingSlideOffsetPx = direction * tickPx;
       pendingSlideWasFine = useFineScroll;
@@ -714,8 +855,15 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
         ackTimeoutId = null;
       }
       awaitingAck = false;
-      hasAckedThisGesture = true;
       consecutiveAckTimeouts = 0;
+      // Classify the gesture off the freshest possible read, right as the tick's own redraw
+      // lands, rather than waiting for the (possibly throttled) scan below: this is the one
+      // redraw we know for certain resulted from our own wheel report, so its indicator
+      // state is authoritative for what this gesture is. Sticky for the rest of the gesture
+      // (checked in attemptDispatch above), never re-evaluated once set.
+      if (gestureModeRef.current === "unconfirmed") {
+        gestureModeRef.current = readCopyModeIndicator() !== null ? "copy-mode" : "app-owned";
+      }
       playSlideCompensation();
       attemptDispatch();
     });
@@ -723,26 +871,29 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     // Separate subscription from the ack-gate onRender above (deliberately not merged
     // into it: that one drives the delicate touch-scroll pacing state machine, this one
     // only reads the screen). Throttled because onRender fires on every redraw, including
-    // ones unrelated to scrolling (e.g. Claude's output streaming in).
+    // ones unrelated to scrolling (e.g. Claude's output streaming in), except while a touch
+    // gesture is in flight: then the button and copyModeActiveRef must track tmux's real
+    // state without lag, since the gesture's own dispatch pacing depends on it being current.
     let lastIndicatorScanTimestamp = 0;
     let indicatorEverSeen = false;
     terminal.onRender(() => {
       const now: number = performance.now();
-      if (now - lastIndicatorScanTimestamp < COPY_MODE_INDICATOR_SCAN_THROTTLE_MS) {
+      const gestureActive: boolean = touchScrollRef.current !== null;
+      if (!gestureActive && now - lastIndicatorScanTimestamp < COPY_MODE_INDICATOR_SCAN_THROTTLE_MS) {
         return;
       }
       lastIndicatorScanTimestamp = now;
-      const topLine = terminal.buffer.active.getLine(0);
-      const topLineText: string = topLine?.translateToString(true) ?? "";
-      const indicatorMatch: RegExpMatchArray | null = topLineText.match(COPY_MODE_INDICATOR_PATTERN);
-      if (indicatorMatch !== null) {
+      const indicatorValue: number | null = readCopyModeIndicator();
+      if (indicatorValue !== null) {
         indicatorEverSeen = true;
-        setShowScrollToBottom(Number(indicatorMatch[1]) > 0);
+        copyModeActiveRef.current = true;
+        setShowScrollToBottom(indicatorValue > 0);
       } else if (indicatorEverSeen) {
         // No indicator this render means the pane just left copy-mode (exited, hit the
         // bottom, or new output arrived); only trust this once the indicator has actually
         // been observed at least once, otherwise a host tmux that doesn't draw it at all
         // would hide the button on every render and it could never show.
+        copyModeActiveRef.current = false;
         setShowScrollToBottom(false);
       }
     });
@@ -754,9 +905,9 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       }
       clearTimers();
       awaitingAck = false;
-      hasAckedThisGesture = false;
       consecutiveAckTimeouts = 0;
       pendingSlideOffsetPx = 0;
+      gestureModeRef.current = "unconfirmed";
       resetSlideTransform();
       touchScrollRef.current = { lastClientY: event.touches[0].clientY, accumulatedPx: 0, released: false };
       dragVelocityPxPerMs = 0;
