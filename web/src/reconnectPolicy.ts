@@ -1,15 +1,30 @@
 import { RETRY_MAX_DELAY_MS, SLOW_RETRY_MAX_DELAY_MS, retryDelayMs } from "./retry";
 
-// Close codes the server sends for conditions that will never clear on their own: the
-// instance was removed from the registry, or its folder is gone. Auto-retrying against
-// these just repeats the same failure, so the UI stops and asks for a manual reconnect.
-const FATAL_CLOSE_CODES = new Set<number>([4004, 4005]);
+// Close code the server sends for the one condition that genuinely never comes back on its
+// own: the instance was removed from the registry. instanceId is a uuid, so a deleted
+// instance can never return under the same id - auto-retrying against it forever would just
+// open a socket every 30s against something that by definition cannot exist again.
+//
+// 4005 (the instance's folder is missing) used to be fatal too, on the theory that a deleted/
+// unmounted/renamed folder "never comes back without user action". That theory was wrong: the
+// folder DOES come back the instant the user remounts the drive or undoes the rename, and
+// until this changed, the client just sat there refusing to retry while the fix was one
+// Finder action away. The current server (closeCodeForAttachError in server/src/attachErrors.ts)
+// no longer sends 4005 at all - every pre-bridge failure, LocationMissingError included, comes
+// through as plain 4006 now. It stays listed alongside 4006 below purely for
+// forward/backward compatibility across a rolling restart of the dashboard itself (an older
+// server binary briefly still emitting it against a newer client, or vice versa) - it must
+// keep meaning "pre-bridge attach failure, slow retry" even if no currently-running server
+// version actually produces it.
+const FATAL_CLOSE_CODES = new Set<number>([4004]);
 
-// A pre-bridge attach failure (server/src/index.ts's closeCodeForAttachError, e.g. the
-// pty spawn failing because macOS's system-wide pty pool is exhausted). Distinct from a
-// plain drop because retrying it at the normal 250ms-5s cadence would just hammer a
-// resource that is under pressure from OUTSIDE this one connection; see attachStreak below.
-const ATTACH_FAILURE_CLOSE_CODE = 4006;
+// Pre-bridge attach failure close codes (server/src/index.ts's closeCodeForAttachError, e.g.
+// the pty spawn failing because macOS's system-wide pty pool is exhausted). Distinct from a
+// plain drop because retrying at the normal 250ms-5s cadence would just hammer a resource
+// that is under pressure from OUTSIDE this one connection; see attachStreak below. 4005 is
+// included for the compatibility reason documented on FATAL_CLOSE_CODES above, even though no
+// currently-running server version sends it.
+const ATTACH_FAILURE_CLOSE_CODES = new Set<number>([4006, 4005]);
 
 // The server discarded buffered pre-bridge input because it grew past its cap (see
 // server/src/attachBuffer.ts). This is NOT an attach failure: the attach itself may well
@@ -50,6 +65,16 @@ export interface ReconnectState {
   // clear it - clearing it on "open" would let a fast successive overflow erase the first
   // notice before it was ever rendered.
   transientNotice: string | null;
+  // The last non-empty close reason from an ATTACH_FAILURE (4006) or otherwise-uncategorized
+  // close, surfaced so the UI can show WHY it's retrying instead of just a bare spinner (see
+  // TerminalView.tsx's compact reconnect indicator). Deliberately NOT cleared on "open", for
+  // the exact same reason attachStreak isn't: the handshake completes before the server's
+  // attach can fail, so clearing this on "open" would erase the message right as the user is
+  // about to read it. Only "bridgeReady" (real proof the connection recovered) or
+  // "manualReconnect" clear it. A 4007 (input overflow) close explicitly clears it instead of
+  // setting it - see reduceClose below - so a stale attach-failure message can never sit
+  // alongside transientNotice's own, unrelated "input was discarded" text at the same time.
+  lastErrorReason: string | null;
 }
 
 export interface ReconnectEffect {
@@ -63,6 +88,7 @@ export const INITIAL_RECONNECT_STATE: ReconnectState = {
   attachStreak: 0,
   fatalReason: null,
   transientNotice: null,
+  lastErrorReason: null,
 };
 
 const NO_EFFECT: ReconnectEffect = { retryDelayMs: null };
@@ -111,10 +137,19 @@ function reduceClose(
     };
   }
 
-  if (code === ATTACH_FAILURE_CLOSE_CODE) {
+  if (ATTACH_FAILURE_CLOSE_CODES.has(code)) {
     const delayMs = retryDelayMs(state.attachStreak, SLOW_RETRY_MAX_DELAY_MS);
     return {
-      state: { ...state, attachStreak: state.attachStreak + 1, fatalReason: null },
+      state: {
+        ...state,
+        attachStreak: state.attachStreak + 1,
+        fatalReason: null,
+        // reason is effectively always non-empty here (the server truncates but never sends
+        // an empty attach-failure message, see closeSocketSafely in server/src/terminal.ts),
+        // but the `|| state.lastErrorReason` fallback is kept anyway so a reason-less 4006
+        // (should one ever happen) doesn't blank out a message the user hasn't seen yet.
+        lastErrorReason: reason || state.lastErrorReason,
+      },
       effect: { retryDelayMs: delayMs },
     };
   }
@@ -130,16 +165,26 @@ function reduceClose(
         normalAttempt: state.normalAttempt + 1,
         fatalReason: null,
         transientNotice: reason || DEFAULT_OVERFLOW_REASON,
+        // An overflow is not an attach failure and has its own dedicated notice above; a
+        // stale attach-failure message from an earlier 4006 must not keep showing alongside
+        // it, which is exactly what would happen if this were left untouched like
+        // transientNotice itself is on every other branch.
+        lastErrorReason: null,
       },
       effect: { retryDelayMs: delayMs },
     };
   }
 
-  // Everything else (4000, 1006, a plain server restart, ...): today's normal backoff.
-  // transientNotice, if any, is intentionally left untouched here too.
+  // Everything else (4000, 1006, a plain server restart, a locally-forced close from the
+  // connect-timeout/liveness-timeout/wake-stale watchdogs in TerminalView.tsx, ...): today's
+  // normal backoff. transientNotice, if any, is intentionally left untouched here too.
+  // `reason` for a locally-forced close is populated by TerminalView.tsx BEFORE it calls
+  // socket.close() (a plain 1006/no-status close from the browser itself carries no reason at
+  // all) - this is what makes it possible to show something more useful than a bare spinner
+  // for the most common disconnect of all, one this process caused itself.
   const delayMs = retryDelayMs(state.normalAttempt, RETRY_MAX_DELAY_MS);
   return {
-    state: { ...state, normalAttempt: state.normalAttempt + 1, fatalReason: null },
+    state: { ...state, normalAttempt: state.normalAttempt + 1, fatalReason: null, lastErrorReason: reason || state.lastErrorReason },
     effect: { retryDelayMs: delayMs },
   };
 }

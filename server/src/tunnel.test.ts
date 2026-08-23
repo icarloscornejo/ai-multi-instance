@@ -162,6 +162,181 @@ describe("startTunnel state machine", () => {
     expect(stopped.warning).toBeNull();
     expect(getTunnelStatus().url).toBeNull();
   });
+
+  // D1: single-flight ownership via a generation counter, established before the first await
+  // (the Caddy preflight) rather than after it - see attemptStart in tunnel.ts.
+  describe("generation-owned single-flight and auto-restart (D1/D2)", () => {
+    // spawnMock in the outer beforeEach always returns the SAME fakeChild; these tests need a
+    // distinct child per spawn (to simulate the old one dying and a new one taking over), so
+    // each test that needs it overrides the implementation to push onto this array instead.
+    function trackSpawnedChildren(): FakeChildProcess[] {
+      const children: FakeChildProcess[] = [];
+      spawnMock.mockImplementation(() => {
+        const newChild = new FakeChildProcess();
+        children.push(newChild);
+        return newChild;
+      });
+      return children;
+    }
+
+    function emitUrlOn(target: FakeChildProcess, url: string): void {
+      target.stderr.emit("data", Buffer.from(`  |  ${url}  |\n`));
+    }
+
+    it("concurrent startTunnel() calls spawn only a single cloudflared child", async () => {
+      const { startTunnel } = await import("./tunnel");
+      fetchMock.mockImplementation(() => Promise.resolve(new Response(APP_SHELL_BODY, { status: 200 })));
+
+      const [firstCall, secondCall, thirdCall] = [startTunnel(), startTunnel(), startTunnel()];
+      await vi.waitFor(() => expect(spawnMock).toHaveBeenCalled());
+      emitUrl("https://random-words-here.trycloudflare.com");
+
+      const [first, second, third] = await Promise.all([firstCall, secondCall, thirdCall]);
+      expect(spawnMock).toHaveBeenCalledTimes(1);
+      expect(first.state).toBe("running");
+      expect(second).toEqual(first);
+      expect(third).toEqual(first);
+    });
+
+    it("stopping during the Caddy preflight prevents cloudflared from ever being spawned", async () => {
+      const { startTunnel, stopTunnel, getTunnelStatus } = await import("./tunnel");
+      fetchMock.mockImplementation(() => Promise.resolve(new Response(APP_SHELL_BODY, { status: 200 })));
+
+      const startPromise = startTunnel();
+      // No await between startTunnel() and here: races stopTunnel against the preflight's
+      // own queued microtasks (see mockHttpGetOk), exactly the "stop during preflight" case
+      // the audit flagged as unguarded before generation checks existed.
+      stopTunnel();
+      await startPromise;
+
+      expect(spawnMock).not.toHaveBeenCalled();
+      expect(getTunnelStatus().state).toBe("stopped");
+    });
+
+    it("stopping during edge verification does not let the stale attempt resurrect a cleared status", async () => {
+      const { startTunnel, stopTunnel, getTunnelStatus } = await import("./tunnel");
+      let resolveFetch: ((value: Response) => void) | undefined;
+      fetchMock.mockImplementation(() => new Promise<Response>((resolve) => (resolveFetch = resolve)));
+
+      const startPromise = startTunnel();
+      await vi.waitFor(() => expect(spawnMock).toHaveBeenCalled());
+      emitUrl("https://random-words-here.trycloudflare.com");
+      await vi.waitFor(() => expect(getTunnelStatus().phase).toBe("verifying"));
+
+      stopTunnel();
+      resolveFetch?.(new Response(APP_SHELL_BODY, { status: 200 }));
+      await startPromise;
+
+      const status = getTunnelStatus();
+      expect(status.state).toBe("stopped");
+      expect(status.url).toBeNull();
+    });
+
+    it("restarts with backoff after an unexpected non-zero exit while the tunnel is still desired", async () => {
+      const children = trackSpawnedChildren();
+      const { startTunnel, getTunnelStatus } = await import("./tunnel");
+      fetchMock.mockImplementation(() => Promise.resolve(new Response(APP_SHELL_BODY, { status: 200 })));
+
+      const startPromise = startTunnel();
+      await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledTimes(1));
+      emitUrlOn(children[0], "https://first.trycloudflare.com");
+      await startPromise;
+      expect(getTunnelStatus().state).toBe("running");
+
+      children[0].emit("exit", 1);
+      expect(getTunnelStatus().state).toBe("stopped");
+      // Not yet: the restart is scheduled behind the first backoff step, not immediate.
+      expect(spawnMock).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledTimes(2));
+      emitUrlOn(children[1], "https://second.trycloudflare.com");
+      await vi.waitFor(() => expect(getTunnelStatus().state).toBe("running"));
+      expect(getTunnelStatus().url).toBe("https://second.trycloudflare.com");
+    });
+
+    // D2's core requirement: restart is driven by desiredRunning, not by the exit code. Code
+    // 0 only used to suppress the displayed error text - it must never also suppress recovery,
+    // or cloudflared giving up cleanly would leave the tunnel dead forever despite the user
+    // still wanting it running.
+    it("also restarts after a clean exit code 0, not just a non-zero one", async () => {
+      const children = trackSpawnedChildren();
+      const { startTunnel, getTunnelStatus } = await import("./tunnel");
+      fetchMock.mockImplementation(() => Promise.resolve(new Response(APP_SHELL_BODY, { status: 200 })));
+
+      const startPromise = startTunnel();
+      await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledTimes(1));
+      emitUrlOn(children[0], "https://first.trycloudflare.com");
+      await startPromise;
+
+      children[0].emit("exit", 0);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledTimes(2));
+    });
+
+    it("an explicit stopTunnel cancels a pending auto-restart", async () => {
+      const children = trackSpawnedChildren();
+      const { startTunnel, stopTunnel, getTunnelStatus } = await import("./tunnel");
+      fetchMock.mockImplementation(() => Promise.resolve(new Response(APP_SHELL_BODY, { status: 200 })));
+
+      const startPromise = startTunnel();
+      await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledTimes(1));
+      emitUrlOn(children[0], "https://first.trycloudflare.com");
+      await startPromise;
+
+      children[0].emit("exit", 1); // schedules a restart
+      stopTunnel(); // must cancel it
+
+      await vi.advanceTimersByTimeAsync(60_000); // exhaust every possible backoff step
+      expect(spawnMock).toHaveBeenCalledTimes(1);
+      expect(getTunnelStatus().state).toBe("stopped");
+    });
+
+    it("calling startTunnel again during a pending restart backoff starts immediately instead of waiting", async () => {
+      const children = trackSpawnedChildren();
+      const { startTunnel, getTunnelStatus } = await import("./tunnel");
+      fetchMock.mockImplementation(() => Promise.resolve(new Response(APP_SHELL_BODY, { status: 200 })));
+
+      const firstStart = startTunnel();
+      await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledTimes(1));
+      emitUrlOn(children[0], "https://first.trycloudflare.com");
+      await firstStart;
+
+      children[0].emit("exit", 1); // schedules a restart ~1s out
+      const secondStart = startTunnel(); // must not wait for the backoff
+      await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledTimes(2));
+      emitUrlOn(children[1], "https://second.trycloudflare.com");
+      await secondStart;
+      expect(getTunnelStatus().url).toBe("https://second.trycloudflare.com");
+    });
+
+    // The exact hazard finding 5 (round 2 of the audit) flagged: every child's exit handler
+    // must verify it still belongs to the CURRENT generation before mutating shared status -
+    // otherwise a slow-to-die superseded child can stomp a brand new, healthy tunnel back to
+    // "stopped".
+    it("a stale child's late exit, after a restart has already replaced it, does not overwrite the current status", async () => {
+      const children = trackSpawnedChildren();
+      const { startTunnel, getTunnelStatus } = await import("./tunnel");
+      fetchMock.mockImplementation(() => Promise.resolve(new Response(APP_SHELL_BODY, { status: 200 })));
+
+      const startPromise = startTunnel();
+      await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledTimes(1));
+      emitUrlOn(children[0], "https://first.trycloudflare.com");
+      await startPromise;
+
+      children[0].emit("exit", 1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledTimes(2));
+      emitUrlOn(children[1], "https://second.trycloudflare.com");
+      await vi.waitFor(() => expect(getTunnelStatus().state).toBe("running"));
+      expect(getTunnelStatus().url).toBe("https://second.trycloudflare.com");
+
+      // The OLD (already-superseded) child finally reports its own exit, late.
+      children[0].emit("exit", 1);
+      expect(getTunnelStatus().state).toBe("running");
+      expect(getTunnelStatus().url).toBe("https://second.trycloudflare.com");
+    });
+  });
 });
 
 describe("extractTunnelUrl", () => {

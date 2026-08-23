@@ -31,15 +31,20 @@ export class PtySpawnError extends Error {
 // notify and nothing to log (a cancelled attach isn't a failure of anything).
 export class AttachCancelledError extends Error {}
 
-// Maps an error thrown out of the attach pipeline (bridgeTerminal and everything it calls)
-// to a WebSocket close code. The split is by PHASE, not by error type: a LocationMissingError
-// is the one case that will never resolve itself (the folder isn't coming back on retry), so
-// it alone gets the non-recoverable code. Every other pre-bridge failure - PtySpawnError,
-// TooManyPtysError, or anything unforeseen - gets the recoverable slow-retry code, because
+// Maps an error thrown out of the attach pipeline (bridgeTerminal and everything it calls) to
+// a WebSocket close code. Every pre-bridge failure - LocationMissingError, PtySpawnError,
+// TooManyPtysError, or anything unforeseen - gets the SAME recoverable slow-retry code, because
 // the WebSocket handshake always completes before the attach can fail (see index.ts:
 // handleUpgrade finishes before bridgeTerminal runs), so ANY pre-bridge error hits the same
 // "onopen already reset the fast counter" hazard, not just pty-related ones. See
 // web/src/reconnectPolicy.ts for the client side of this split.
+//
+// LocationMissingError used to get its own non-recoverable code (4005): the reasoning was that
+// a folder deleted/unmounted/renamed "never comes back without user action". That reasoning
+// was wrong - the folder DOES come back the moment the user remounts the drive or undoes the
+// rename, and until this changed, the client just sat there refusing to retry while the fix
+// was one Finder action away. LocationMissingError as a TYPE is kept (terminal.ts still throws
+// it with a readable message), it just no longer branches the close code.
 //
 // Tradeoff accepted deliberately: an unforeseen, genuinely permanent bug also falls into the
 // recoverable bucket and retries silently instead of surfacing as a hard failure. The
@@ -49,10 +54,7 @@ export class AttachCancelledError extends Error {}
 // failure is never silent: recordAttachFailure below still logs it (with its message) once
 // per minute, including its stack via the caller, so a real bug is visible in the log even
 // though the user's terminal keeps quietly retrying instead of getting stuck.
-export function closeCodeForAttachError(error: Error): number {
-  if (error instanceof LocationMissingError) {
-    return 4005;
-  }
+export function closeCodeForAttachError(_error: Error): number {
   return 4006;
 }
 
@@ -196,4 +198,42 @@ export function recordAttachSuccess(instanceId: string, clock: Clock = systemClo
 // reset rather than re-importing the module.
 export function _resetAttachLogStateForTests(): void {
   logStates.clear();
+}
+
+// The one hard limit ws.close() enforces: the close-frame payload (status code + reason) is
+// capped by the WebSocket spec at 125 bytes total, and ws's own Sender.close subtracts the
+// 2-byte status code itself, so the reason text's real budget is 123 bytes - see
+// ws/lib/sender.js's `if (length > 123) throw new RangeError(...)`. A reason that exceeds it
+// makes socket.close() throw, which used to happen INSIDE the same catch block that exists to
+// report the original error - turning a recoverable attach failure into an unhandled
+// rejection that could take the whole process down. This was hit for real with any error
+// message containing a multi-byte path segment (accents, an emoji in a folder name): slicing
+// by JS string length (UTF-16 code units) undercounts real byte size for exactly those
+// characters, so a 120-*character* slice can still be well over 123 *bytes*.
+//
+// `Buffer` is a Node global, not an import, so using it here does not break this file's
+// deliberate no-dependencies rule (see the header comment) - it still needs no import and
+// stays testable without opening a socket.
+const MAX_CLOSE_REASON_BYTES = 123;
+
+export function truncateCloseReason(reason: string, maxBytes: number = MAX_CLOSE_REASON_BYTES): string {
+  if (Buffer.byteLength(reason, "utf8") <= maxBytes) {
+    return reason;
+  }
+  // Binary-search the largest character-length prefix whose UTF-8 encoding still fits.
+  // Character-by-character trimming would also work but is O(n) rescans of a growing buffer
+  // for long reasons; this is a handful of iterations regardless of input size. Cutting by
+  // JS string index (not raw bytes) guarantees we never split a multi-byte code point, which
+  // slicing the encoded Buffer directly could do and produce invalid UTF-8 on the wire.
+  let low = 0;
+  let high = reason.length;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(reason.slice(0, mid), "utf8") <= maxBytes) {
+      low = mid;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return reason.slice(0, low);
 }

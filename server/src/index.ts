@@ -9,7 +9,7 @@ import { createAttachBuffer } from "./attachBuffer";
 import { registerHeartbeat, startHeartbeat } from "./heartbeat";
 import { apiRouter } from "./routes";
 import { loadState } from "./store";
-import { bridgeTerminal } from "./terminal";
+import { bridgeTerminal, closeSocketSafely, validateTerminalSize } from "./terminal";
 import type { DashboardState } from "./types";
 
 // Close code for "the pre-attach input buffer overflowed" (see attachBuffer.ts). Deliberately
@@ -39,8 +39,30 @@ app.use((error: Error, _request: Request, response: Response, _next: NextFunctio
   response.status(500).json({ error: error.message });
 });
 
+// Default is 100 MiB (ws has no cap of its own by default); a single connected tab could
+// otherwise allocate an arbitrarily large frame and exhaust the process's memory well before
+// any application-level buffering (attachBuffer.ts) even gets a chance to look at it. 1 MiB is
+// generous for terminal I/O and JSON control messages - real traffic here is orders of
+// magnitude smaller - while bounding the worst case per frame.
+const MAX_WS_PAYLOAD_BYTES = 1024 * 1024;
+
 const httpServer = http.createServer(app);
-const webSocketServer = new WebSocketServer({ noServer: true });
+const webSocketServer = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_PAYLOAD_BYTES });
+
+// EventEmitter contract: an "error" event with no listener throws as an uncaught exception
+// instead of just emitting (see Node's EventEmitter docs). Neither of these two servers had
+// one, so a bind failure (EADDRINUSE) or an internal ws server error used to be able to crash
+// the whole process outright. httpServer's failure mode gets an explicit policy instead of
+// silent tolerance: a process that failed to bind its port but kept running would look alive
+// to a supervisor (or npm run dev) while serving nothing, which is worse than a clean crash a
+// supervisor can actually restart from.
+httpServer.on("error", (error: Error) => {
+  console.error("[server] fatal http server error:", error.message);
+  process.exit(1);
+});
+webSocketServer.on("error", (error: Error) => {
+  console.error("[server] websocket server error:", error.message);
+});
 
 // See heartbeat.ts for what this does and why it MUST be called from the upgrade site below
 // (completeUpgrade's handleUpgrade callback) rather than a webSocketServer.on("connection", ...)
@@ -59,12 +81,14 @@ httpServer.on("upgrade", (request, socket, head) => {
     return;
   }
   const instanceId: string = pathMatch[1];
-  const requestedCols: number = Number(requestUrl.searchParams.get("cols"));
-  const requestedRows: number = Number(requestUrl.searchParams.get("rows"));
-  const initialSize =
-    Number.isInteger(requestedCols) && Number.isInteger(requestedRows) && requestedCols > 0 && requestedRows > 0
-      ? { cols: requestedCols, rows: requestedRows }
-      : null;
+  // Shared with every live "resize" message (see validateTerminalSize in terminal.ts): this
+  // used to only reject non-finite values (Number.isInteger(Infinity) is false, so that half
+  // was already safe) but had no upper bound at all, so an attacker/buggy client could still
+  // request an enormous initial pty geometry straight into nodePty.spawn.
+  const initialSize = validateTerminalSize(
+    Number(requestUrl.searchParams.get("cols")),
+    Number(requestUrl.searchParams.get("rows"))
+  );
 
   void (async () => {
     // The WS upgrade is the real attack surface (it reads/writes the terminal
@@ -88,6 +112,22 @@ httpServer.on("upgrade", (request, socket, head) => {
   function completeUpgrade(): void {
     webSocketServer.handleUpgrade(request, socket, head, (webSocket: WebSocket) => {
       registerHeartbeat(webSocket);
+      // ws's own EventEmitter throws an uncaught exception for an "error" event with no
+      // listener (see MAX_WS_PAYLOAD_BYTES's comment above and Node's EventEmitter docs).
+      // Registered here, at the earliest point a socket is guaranteed to exist (same
+      // reasoning as registerHeartbeat right above), so it covers failures during the whole
+      // rest of this callback, not just once bridgeTerminal is running. This handler does
+      // NOT attempt its own recovery: ws already emits "close" right after any "error" (see
+      // emitErrorAndClose in ws/lib/websocket.js), and that "close" is what already drives
+      // stopBuffering above and pty release inside bridgeTerminal - its only job is to exist,
+      // so the event has a listener and Node does not escalate it to a process crash, plus
+      // leave one throttled log line so a real bug is still visible.
+      webSocket.on("error", (error: Error) => {
+        const failureMessage = recordAttachFailure(instanceId, error.message);
+        if (failureMessage !== null) {
+          console.error(`[server] ${failureMessage}`);
+        }
+      });
       // bridgeTerminal performs several awaits (loadState here, and ensureSessionReady/
       // spawnWithRetry inside) before it can hook into live messages; the client may send
       // its initial "resize" (and even type, and its immediate onopen ping - see
@@ -116,7 +156,7 @@ httpServer.on("upgrade", (request, socket, head) => {
         const accepted = attachBuffer.add(rawMessage);
         if (!accepted) {
           stopBuffering();
-          webSocket.close(INPUT_OVERFLOW_CLOSE_CODE, INPUT_OVERFLOW_REASON);
+          closeSocketSafely(webSocket, INPUT_OVERFLOW_CLOSE_CODE, INPUT_OVERFLOW_REASON);
         }
       };
       webSocket.on("message", bufferMessage);
@@ -126,7 +166,7 @@ httpServer.on("upgrade", (request, socket, head) => {
         const instance = state.instances.find((candidate) => candidate.id === instanceId);
         if (instance === undefined) {
           stopBuffering();
-          webSocket.close(4004, "Unknown instance");
+          closeSocketSafely(webSocket, 4004, "Unknown instance");
           return;
         }
         await bridgeTerminal(webSocket, instance, initialSize, attachBuffer, stopBuffering);
@@ -149,7 +189,11 @@ httpServer.on("upgrade", (request, socket, head) => {
           console.error(`[server] ${failureMessage}`);
         }
         const closeCode = closeCodeForAttachError(error);
-        webSocket.close(closeCode, error.message.slice(0, 120));
+        // closeSocketSafely truncates by UTF-8 bytes, not JS string length - see its comment
+        // in attachErrors.ts for why a plain slice() here used to be able to make close()
+        // itself throw (RangeError from ws) for any error message containing a multi-byte
+        // path segment, turning this recoverable-failure handler into an unhandled rejection.
+        closeSocketSafely(webSocket, closeCode, error.message);
       });
     });
   }

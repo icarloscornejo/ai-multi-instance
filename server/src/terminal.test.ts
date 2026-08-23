@@ -1,16 +1,117 @@
+import os from "node:os";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { InstanceRecord } from "./types";
 
 vi.mock("./tmux", () => ({
+  // A real (if minimal) Error subclass, not a vi.fn(): terminal.ts's ensureSessionReady does
+  // `new TmuxError(...)` and `error instanceof TmuxError`-style narrowing, neither of which a
+  // mock function stand-in could satisfy.
+  TmuxError: class TmuxError extends Error {
+    constructor(
+      message: string,
+      public readonly killed = false,
+      public readonly code: number | null = null,
+      public readonly signal: string | null = null
+    ) {
+      super(message);
+      this.name = "TmuxError";
+    }
+  },
   hasSession: vi.fn(),
   createSession: vi.fn(),
   enableMouseMode: vi.fn(),
   sendCommandToSession: vi.fn(),
   killSession: vi.fn(),
+  getSessionPresence: vi.fn(),
+  isSessionInitIncomplete: vi.fn(),
+  markSessionInitComplete: vi.fn(),
 }));
 
+vi.mock("@lydell/node-pty", () => ({
+  spawn: vi.fn(),
+}));
+
+import * as nodePty from "@lydell/node-pty";
 import * as tmux from "./tmux";
-import { AttachCancelledError, PtySpawnError, ensureSessionReady, spawnWithRetry } from "./terminal";
+import {
+  AttachCancelledError,
+  PtySpawnError,
+  bridgeTerminal,
+  closeSocketSafely,
+  ensureSessionReady,
+  spawnWithRetry,
+  validateTerminalSize,
+} from "./terminal";
+import type { AttachBuffer } from "./attachBuffer";
+
+// Minimal stand-in for node-pty's IPty, exposing only what terminal.ts actually calls, plus
+// `_emit*` helpers the tests use to drive it - onData/onExit are node-pty's own IEvent
+// wrappers (subscribe-only), and the raw "error" listener is registered via the same
+// EventEmitter-style `.on()` terminal.ts uses (see terminal.ts's cast comment for why).
+function makeFakePty() {
+  const dataListeners: Array<(chunk: string) => void> = [];
+  const exitListeners: Array<() => void> = [];
+  const errorListeners: Array<(error: Error) => void> = [];
+  return {
+    onData: vi.fn((callback: (chunk: string) => void) => {
+      dataListeners.push(callback);
+    }),
+    onExit: vi.fn((callback: () => void) => {
+      exitListeners.push(callback);
+    }),
+    on: vi.fn((event: string, callback: (error: Error) => void) => {
+      if (event === "error") {
+        errorListeners.push(callback);
+      }
+    }),
+    write: vi.fn(),
+    resize: vi.fn(),
+    kill: vi.fn(),
+    destroy: vi.fn(),
+    _emitData(chunk: string): void {
+      dataListeners.forEach((callback) => callback(chunk));
+    },
+    _emitExit(): void {
+      exitListeners.forEach((callback) => callback());
+    },
+    _emitError(error: Error): void {
+      errorListeners.forEach((callback) => callback(error));
+    },
+  };
+}
+
+// Minimal stand-in for a `ws` WebSocket: only readyState/send/close/terminate/on("message"|
+// "close") are exercised by bridgeTerminal.
+function makeFakeSocket() {
+  const messageListeners: Array<(raw: unknown) => void> = [];
+  const closeListeners: Array<() => void> = [];
+  return {
+    OPEN: 1,
+    CONNECTING: 0,
+    CLOSED: 3,
+    readyState: 1,
+    send: vi.fn(),
+    close: vi.fn(),
+    terminate: vi.fn(),
+    on: vi.fn((event: string, callback: (...args: never[]) => void) => {
+      if (event === "message") {
+        messageListeners.push(callback as (raw: unknown) => void);
+      } else if (event === "close") {
+        closeListeners.push(callback as () => void);
+      }
+    }),
+    _emitMessage(raw: unknown): void {
+      messageListeners.forEach((callback) => callback(raw));
+    },
+  };
+}
+
+function makeNoopAttachBuffer(): AttachBuffer {
+  return {
+    add: () => true,
+    drain: () => [],
+  };
+}
 
 function makeInstance(overrides: Partial<InstanceRecord> = {}): InstanceRecord {
   return {
@@ -45,6 +146,10 @@ beforeEach(() => {
   vi.mocked(tmux.enableMouseMode).mockReset();
   vi.mocked(tmux.sendCommandToSession).mockReset();
   vi.mocked(tmux.killSession).mockReset();
+  vi.mocked(tmux.getSessionPresence).mockReset();
+  vi.mocked(tmux.isSessionInitIncomplete).mockReset();
+  vi.mocked(tmux.markSessionInitComplete).mockReset();
+  vi.mocked(nodePty.spawn).mockReset();
 });
 
 describe("spawnWithRetry", () => {
@@ -111,83 +216,344 @@ describe("spawnWithRetry", () => {
 });
 
 describe("ensureSessionReady", () => {
-  it("only enables mouse mode when the session already exists, without touching createSession", async () => {
-    vi.mocked(tmux.hasSession).mockResolvedValue(true);
+  it("preserves an existing session with a 'not-confirmed-incomplete' marker (the legacy/already-ready case), touching only enableMouseMode", async () => {
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("present");
+    vi.mocked(tmux.isSessionInitIncomplete).mockResolvedValue("not-confirmed-incomplete");
     await ensureSessionReady(makeInstance());
     expect(tmux.enableMouseMode).toHaveBeenCalledWith("ccdash-abc123");
     expect(tmux.createSession).not.toHaveBeenCalled();
     expect(tmux.sendCommandToSession).not.toHaveBeenCalled();
+    expect(tmux.killSession).not.toHaveBeenCalled();
   });
 
-  it("creates the session and launches the provider when it does not exist yet", async () => {
-    vi.mocked(tmux.hasSession).mockResolvedValue(false);
+  // This is the regression test for the disaster the second design attempt would have
+  // caused: a session that already existed before the init marker was introduced has no
+  // marker at all, which reads as "not-confirmed-incomplete" - same as a legacy session -
+  // and must be preserved exactly like one, never destroyed on that basis alone.
+  it("never touches an existing session merely because its init-completeness could not be confirmed", async () => {
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("present");
+    vi.mocked(tmux.isSessionInitIncomplete).mockResolvedValue("not-confirmed-incomplete");
+    await ensureSessionReady(makeInstance());
+    expect(tmux.killSession).not.toHaveBeenCalled();
+    expect(tmux.createSession).not.toHaveBeenCalled();
+  });
+
+  it("creates the session and launches the provider, then marks init complete, when it does not exist yet", async () => {
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("absent");
     vi.mocked(tmux.createSession).mockResolvedValue(undefined);
     vi.mocked(tmux.sendCommandToSession).mockResolvedValue(undefined);
     await ensureSessionReady(makeInstance({ shellOnly: false }));
     expect(tmux.createSession).toHaveBeenCalledWith("ccdash-abc123", "/tmp/test-instance");
     expect(tmux.sendCommandToSession).toHaveBeenCalledTimes(1);
+    expect(tmux.markSessionInitComplete).toHaveBeenCalledWith("ccdash-abc123");
   });
 
-  it("skips the provider launch for a shell-only instance", async () => {
-    vi.mocked(tmux.hasSession).mockResolvedValue(false);
+  it("skips the provider launch for a shell-only instance but still marks init complete", async () => {
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("absent");
     vi.mocked(tmux.createSession).mockResolvedValue(undefined);
     await ensureSessionReady(makeInstance({ shellOnly: true }));
     expect(tmux.sendCommandToSession).not.toHaveBeenCalled();
+    expect(tmux.markSessionInitComplete).toHaveBeenCalledWith("ccdash-abc123");
   });
 
-  // The round-4 review finding this guards against: a timeout (or any failure) firing
-  // between new-session and the provider launch used to leave a session that "exists" but
-  // was never handed a provider, and every future attach would see hasSession=true and
-  // silently accept the empty session forever.
+  // The original finding this guards against: a timeout (or any failure) firing between
+  // new-session and the provider launch used to leave a session that "exists" but was never
+  // handed a provider, and every future attach would silently accept the empty session
+  // forever. Now: initializeSession only reaches markSessionInitComplete on full success, so
+  // this failure leaves the marker at "1" and the NEXT ensureSessionReady call sees
+  // "confirmed-incomplete" and recreates it instead of accepting it.
   it("kills a session that failed mid-initialization, so the next attempt recreates it fully instead of finding it half-done", async () => {
-    vi.mocked(tmux.hasSession).mockResolvedValue(false);
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("absent");
     vi.mocked(tmux.createSession).mockResolvedValue(undefined);
     vi.mocked(tmux.sendCommandToSession).mockRejectedValueOnce(new Error("tmux command timed out"));
 
     await expect(ensureSessionReady(makeInstance({ shellOnly: false }))).rejects.toThrow("tmux command timed out");
     expect(tmux.killSession).toHaveBeenCalledWith("ccdash-abc123");
+    expect(tmux.markSessionInitComplete).not.toHaveBeenCalled();
 
-    // Simulate the kill having worked: hasSession now reports the session gone, and the
-    // next attempt succeeds cleanly, recreating it (and this time launching the provider)
-    // from scratch rather than inheriting the half-initialized state.
+    // Simulate the kill having worked and the process retrying: getSessionPresence now
+    // reports the session gone again, and the next attempt succeeds cleanly, recreating it
+    // (and this time launching the provider, and marking it complete) from scratch.
     vi.mocked(tmux.sendCommandToSession).mockResolvedValueOnce(undefined);
     await ensureSessionReady(makeInstance({ shellOnly: false }));
     expect(tmux.createSession).toHaveBeenCalledTimes(2);
     expect(tmux.sendCommandToSession).toHaveBeenCalledTimes(2);
+    expect(tmux.markSessionInitComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it("recreates a session confirmed incomplete (marker reads '1'), killing it first", async () => {
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("present");
+    vi.mocked(tmux.isSessionInitIncomplete).mockResolvedValue("confirmed-incomplete");
+    vi.mocked(tmux.killSession).mockResolvedValue(undefined);
+    vi.mocked(tmux.createSession).mockResolvedValue(undefined);
+
+    await ensureSessionReady(makeInstance({ shellOnly: true }));
+
+    expect(tmux.killSession).toHaveBeenCalledWith("ccdash-abc123");
+    expect(tmux.createSession).toHaveBeenCalledWith("ccdash-abc123", "/tmp/test-instance");
+    expect(tmux.markSessionInitComplete).toHaveBeenCalledWith("ccdash-abc123");
+  });
+
+  it("still recreates a confirmed-incomplete session even if it vanished on its own before the kill (killSession throwing is tolerated)", async () => {
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("present");
+    vi.mocked(tmux.isSessionInitIncomplete).mockResolvedValue("confirmed-incomplete");
+    vi.mocked(tmux.killSession).mockRejectedValueOnce(new Error("no such session"));
+    vi.mocked(tmux.createSession).mockResolvedValue(undefined);
+
+    await expect(ensureSessionReady(makeInstance({ shellOnly: true }))).resolves.toBeUndefined();
+    expect(tmux.createSession).toHaveBeenCalledTimes(1);
+  });
+
+  // The core safety invariant this whole mechanism exists to protect: a probe that could not
+  // definitively confirm the session's state must NEVER be treated as license to destroy it -
+  // this is what the first (rejected) design attempt got wrong, and it must surface as an
+  // ordinary recoverable attach failure instead (the caller retries; see closeCodeForAttachError).
+  it("never kills or recreates when session presence itself could not be confirmed - surfaces as a recoverable error instead", async () => {
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("unknown");
+
+    await expect(ensureSessionReady(makeInstance())).rejects.toThrow();
+    expect(tmux.killSession).not.toHaveBeenCalled();
+    expect(tmux.createSession).not.toHaveBeenCalled();
   });
 
   it("best-effort cleanup: a killSession failure after an init failure does not mask the original error", async () => {
-    vi.mocked(tmux.hasSession).mockResolvedValue(false);
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("absent");
     vi.mocked(tmux.createSession).mockRejectedValueOnce(new Error("new-session failed"));
     vi.mocked(tmux.killSession).mockRejectedValueOnce(new Error("kill-session also failed"));
 
     await expect(ensureSessionReady(makeInstance())).rejects.toThrow("new-session failed");
   });
 
-  it("a second concurrent call for the same tmux session joins the first instead of re-running hasSession/createSession", async () => {
-    vi.mocked(tmux.hasSession).mockResolvedValue(false);
+  it("a second concurrent call for the same tmux session joins the first instead of re-running getSessionPresence/createSession", async () => {
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("absent");
     const createDeferredResult = createDeferred<void>();
     vi.mocked(tmux.createSession).mockReturnValue(createDeferredResult.promise);
 
     const instance = makeInstance({ shellOnly: true });
     const first = ensureSessionReady(instance);
-    // Fired synchronously, before hasSession/createSession's promises have even resolved:
-    // this is exactly the race the in-flight map (set synchronously, before any await) has
-    // to survive.
+    // Fired synchronously, before getSessionPresence/createSession's promises have even
+    // resolved: this is exactly the race the in-flight map (set synchronously, before any
+    // await) has to survive.
     const second = ensureSessionReady(instance);
 
     createDeferredResult.resolve();
     await Promise.all([first, second]);
 
-    expect(tmux.hasSession).toHaveBeenCalledTimes(1);
+    expect(tmux.getSessionPresence).toHaveBeenCalledTimes(1);
     expect(tmux.createSession).toHaveBeenCalledTimes(1);
   });
 
   it("a call after the in-flight one has settled starts a fresh check, not a stale join", async () => {
-    vi.mocked(tmux.hasSession).mockResolvedValue(true);
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("present");
+    vi.mocked(tmux.isSessionInitIncomplete).mockResolvedValue("not-confirmed-incomplete");
     const instance = makeInstance();
     await ensureSessionReady(instance);
     await ensureSessionReady(instance);
-    expect(tmux.hasSession).toHaveBeenCalledTimes(2);
+    expect(tmux.getSessionPresence).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("validateTerminalSize", () => {
+  it("accepts ordinary positive integer dimensions", () => {
+    expect(validateTerminalSize(120, 32)).toEqual({ cols: 120, rows: 32 });
+  });
+
+  it("accepts a large but realistic xterm.js viewport", () => {
+    // A 4K display at a very small font is still nowhere close to the per-axis or
+    // cell-count cap; this is the case A4's fix must not regress while closing off Infinity.
+    expect(validateTerminalSize(600, 200)).toEqual({ cols: 600, rows: 200 });
+  });
+
+  // This is the exact exploit: typeof Infinity === "number" and Infinity > 0 both pass a
+  // naive check, and node-pty's UnixTerminal.prototype.resize throws explicitly for it -
+  // an exception any connected tab could previously trigger on demand, uncontained.
+  it("rejects Infinity on either axis", () => {
+    expect(validateTerminalSize(Infinity, 24)).toBeNull();
+    expect(validateTerminalSize(80, Infinity)).toBeNull();
+  });
+
+  it("rejects NaN, zero, negative, and non-integer values", () => {
+    expect(validateTerminalSize(NaN, 24)).toBeNull();
+    expect(validateTerminalSize(80, 0)).toBeNull();
+    expect(validateTerminalSize(-10, 24)).toBeNull();
+    expect(validateTerminalSize(80.5, 24)).toBeNull();
+  });
+
+  it("rejects non-number types", () => {
+    expect(validateTerminalSize("80", 24)).toBeNull();
+    expect(validateTerminalSize(undefined, 24)).toBeNull();
+    expect(validateTerminalSize(null, 24)).toBeNull();
+  });
+
+  it("rejects a single axis over the per-axis cap even when the other axis is tiny", () => {
+    expect(validateTerminalSize(1_000_000, 1)).toBeNull();
+  });
+
+  // The bound this specifically guards against: two individually-plausible axes whose
+  // PRODUCT is still enormous (100 million cells), which axis-only caps would let through
+  // straight into tmux's own grid allocation and redraw cost.
+  it("rejects a geometry whose cell count exceeds the budget even when both axes individually pass", () => {
+    expect(validateTerminalSize(1_999, 1_999)).toBeNull();
+  });
+});
+
+describe("closeSocketSafely", () => {
+  function fakeSocket(overrides: Partial<{ readyState: number; close: () => void; terminate: () => void }> = {}) {
+    return {
+      OPEN: 1,
+      CONNECTING: 0,
+      CLOSED: 3,
+      readyState: 1,
+      close: vi.fn(),
+      terminate: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  it("closes an open socket with the given code and reason", () => {
+    const socket = fakeSocket();
+    closeSocketSafely(socket as never, 4001, "tmux session ended");
+    expect(socket.close).toHaveBeenCalledWith(4001, "tmux session ended");
+    expect(socket.terminate).not.toHaveBeenCalled();
+  });
+
+  it("does nothing to a socket that is already closed", () => {
+    const socket = fakeSocket({ readyState: 3 });
+    closeSocketSafely(socket as never, 4001, "reason");
+    expect(socket.close).not.toHaveBeenCalled();
+    expect(socket.terminate).not.toHaveBeenCalled();
+  });
+
+  // The bug this exists to prevent: `ws` throws a RangeError from close() when the reason
+  // exceeds its 123-byte budget (see truncateCloseReason in attachErrors.ts), which used to
+  // happen INSIDE the catch block that existed to report the original failure, turning a
+  // recoverable attach error into an unhandled rejection capable of crashing the process.
+  it("truncates an oversized reason so close() never throws on the reason's length", () => {
+    const socket = fakeSocket({
+      close: vi.fn(() => {
+        throw new RangeError("The message must not be greater than 123 bytes");
+      }),
+    });
+    expect(() => closeSocketSafely(socket as never, 4006, "x".repeat(500))).not.toThrow();
+    expect(socket.terminate).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to terminate() when close() throws for any other reason, and swallows a terminate() failure too", () => {
+    const socket = fakeSocket({
+      close: vi.fn(() => {
+        throw new Error("already closing");
+      }),
+      terminate: vi.fn(() => {
+        throw new Error("terminate also failed");
+      }),
+    });
+    // Must never throw out to the caller: this is the last line of defense against a single
+    // broken socket taking down the whole process.
+    expect(() => closeSocketSafely(socket as never, 1011, "reason")).not.toThrow();
+    expect(socket.terminate).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("bridgeTerminal", () => {
+  // A session that already exists and is not confirmed incomplete is the simplest path
+  // through bridgeTerminal: it skips createSession/sendCommandToSession entirely and goes
+  // straight to spawning the pty, which is all these tests care about. locationPath must be a
+  // real, existing directory - pathExists() is not mocked here (unlike ./tmux and
+  // @lydell/node-pty), so os.tmpdir() stands in for "the folder exists" without needing a
+  // filesystem mock.
+  function makeReadyInstance(overrides: Partial<InstanceRecord> = {}): InstanceRecord {
+    return makeInstance({ locationPath: os.tmpdir(), shellOnly: true, ...overrides });
+  }
+
+  beforeEach(() => {
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("present");
+    vi.mocked(tmux.isSessionInitIncomplete).mockResolvedValue("not-confirmed-incomplete");
+    vi.mocked(tmux.enableMouseMode).mockResolvedValue(undefined);
+  });
+
+  // This is the regression test the audit called out by name (round 2, finding "the proposed
+  // integration test does not actually exercise the PTY error requirement"): the crash this
+  // guards against originates from node-pty's OWN internal stream-error rethrow (see
+  // unixTerminal.js), not from anything socket-related, so forcing a socket-level error would
+  // pass even with the pty "error" listener missing entirely. This drives the pty's real
+  // internal error path instead.
+  it("contains a post-bridge pty stream error: closes only this socket, releases the pty, survives", async () => {
+    const fakePty = makeFakePty();
+    vi.mocked(nodePty.spawn).mockReturnValue(fakePty as never);
+    const socket = makeFakeSocket();
+    const instance = makeReadyInstance();
+
+    await bridgeTerminal(socket as never, instance, null, makeNoopAttachBuffer(), () => {});
+
+    fakePty._emitError(new Error("EIO: input/output error, read"));
+
+    expect(socket.close).toHaveBeenCalledWith(1011, "EIO: input/output error, read");
+    expect(fakePty.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("contains a malformed live resize (Infinity) instead of letting it reach node-pty's resize()", async () => {
+    const fakePty = makeFakePty();
+    vi.mocked(nodePty.spawn).mockReturnValue(fakePty as never);
+    const socket = makeFakeSocket();
+    const instance = makeReadyInstance();
+
+    await bridgeTerminal(socket as never, instance, null, makeNoopAttachBuffer(), () => {});
+
+    // The exact exploit: typeof Infinity === "number" and Infinity > 0 both passed the old
+    // guard, and node-pty's resize() throws explicitly for infinite dimensions.
+    socket._emitMessage(JSON.stringify({ type: "resize", cols: Infinity, rows: 24 }));
+
+    // Silently rejected by validateTerminalSize before ever reaching attachProcess.resize():
+    // the terminal is neither resized nor torn down over an invalid resize message alone.
+    expect(fakePty.resize).not.toHaveBeenCalled();
+    expect(socket.close).not.toHaveBeenCalled();
+  });
+
+  it("contains a throw from attachProcess.resize() itself without crashing the process", async () => {
+    const fakePty = makeFakePty();
+    fakePty.resize.mockImplementation(() => {
+      throw new Error("resizing must be done using positive cols and rows");
+    });
+    vi.mocked(nodePty.spawn).mockReturnValue(fakePty as never);
+    const socket = makeFakeSocket();
+    const instance = makeReadyInstance();
+
+    await bridgeTerminal(socket as never, instance, null, makeNoopAttachBuffer(), () => {});
+
+    expect(() => socket._emitMessage(JSON.stringify({ type: "resize", cols: 80, rows: 24 }))).not.toThrow();
+    expect(socket.close).toHaveBeenCalledWith(1011, "resizing must be done using positive cols and rows");
+    expect(fakePty.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("contains a throw from socket.send() inside the pty's onData callback", async () => {
+    const fakePty = makeFakePty();
+    vi.mocked(nodePty.spawn).mockReturnValue(fakePty as never);
+    const socket = makeFakeSocket();
+    socket.send.mockImplementation(() => {
+      throw new Error("write after end");
+    });
+    const instance = makeReadyInstance();
+
+    await bridgeTerminal(socket as never, instance, null, makeNoopAttachBuffer(), () => {});
+
+    expect(() => fakePty._emitData("output chunk")).not.toThrow();
+    expect(socket.close).toHaveBeenCalledWith(1011, "write after end");
+    expect(fakePty.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("delivers ordinary input and a valid resize normally, unaffected by the new guards", async () => {
+    const fakePty = makeFakePty();
+    vi.mocked(nodePty.spawn).mockReturnValue(fakePty as never);
+    const socket = makeFakeSocket();
+    const instance = makeReadyInstance();
+
+    await bridgeTerminal(socket as never, instance, null, makeNoopAttachBuffer(), () => {});
+
+    socket._emitMessage(JSON.stringify({ type: "input", data: "ls\n" }));
+    socket._emitMessage(JSON.stringify({ type: "resize", cols: 100, rows: 40 }));
+
+    expect(fakePty.write).toHaveBeenCalledWith("ls\n");
+    expect(fakePty.resize).toHaveBeenCalledWith(100, 40);
+    expect(socket.close).not.toHaveBeenCalled();
   });
 });

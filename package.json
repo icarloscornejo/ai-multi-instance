@@ -1,6 +1,6 @@
 {
   "name": "ai-multi-instance",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "private": true,
   "description": "Local dashboard for running Claude Code, Codex, Cursor Agent, and custom CLI sessions in parallel with tmux persistence",
   "workspaces": [

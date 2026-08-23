@@ -288,7 +288,7 @@ function DisconnectedOverlay({
         </RetryRing>
         <div className="flex flex-col items-center gap-[3px] text-center">
           <span className="text-[13px] font-semibold text-txt-bright">Session disconnected</span>
-          <span className="text-[11.5px] text-txt-dim">
+          <span className="break-words text-[11.5px] text-txt-dim">
             {fatalReason ?? "Retrying automatically..."}
           </span>
         </div>
@@ -296,6 +296,29 @@ function DisconnectedOverlay({
           Reconnect now
         </button>
       </div>
+    </div>
+  );
+}
+
+// The fix for the plan's explicit requirement that the error message be visible "from the
+// first failure, alongside the retry spinner": DisconnectedOverlay alone cannot satisfy that.
+// It is delayed by DISCONNECTED_OVERLAY_DELAY_MS (1.5s) on purpose, to avoid flashing "Session
+// disconnected" for a reconnect that resolves in a few hundred ms - but the first several
+// retry attempts (250/500/1000ms) all land well inside that window, so simply adding the
+// reason to the overlay would have left the first ~4 failures completely invisible. This is a
+// second, independent, non-blocking element that shows reason+spinner together from the very
+// first close through bridgeReady, is never subject to the 1.5s debounce, and is not hidden by
+// a subsequent "open" (an open is not proof of recovery - see lastErrorReason's comment in
+// reconnectPolicy.ts). It intentionally does not render while fatalDisconnectReason is set:
+// the fatal overlay already shows that reason with its spinner stopped, and this indicator
+// spinning at the same time would visually contradict "this will not resolve on its own".
+function ReconnectIndicator({ reason }: { reason: string }) {
+  return (
+    <div className="flex items-center gap-[8px] rounded-md border border-border-strong bg-surface px-[12px] py-[6px] shadow-lg">
+      <RetryRing size={13} tone="accent">
+        <span />
+      </RetryRing>
+      <span className="max-w-[280px] break-words text-[11.5px] text-txt-dim">{reason}</span>
     </div>
   );
 }
@@ -331,6 +354,15 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   // reconnect that lands before it fires can cancel it instead of the overlay flashing on
   // and immediately off.
   const disconnectedOverlayTimeoutIdRef = useRef<number | undefined>(undefined);
+  // Set by the connect-timeout/liveness-timeout watchdogs (inside the connection effect
+  // below) and by useWakeRetry (a separate hook/effect) IMMEDIATELY BEFORE each calls
+  // socket.close() itself, so onclose can read WHY this process forced the close instead of
+  // trusting event.reason - which for exactly these three cases is always empty (a plain
+  // client-initiated close carries no reason of its own; only the SERVER can set one). This
+  // is the only way "why is it retrying" is knowable at all for the most common disconnect of
+  // all: one this process caused itself. A plain ref (not React state) because it is written
+  // and read entirely within the synchronous onclose handler's own turn, never rendered.
+  const pendingLocalCloseReasonRef = useRef<string | null>(null);
   const isMobile = useIsMobile();
   // Mobile screens are small enough that the server's default (tuned for desktop) reads
   // cramped-in-a-good-way but wastes space here; default to the smallest zoom on mobile
@@ -350,6 +382,14 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   // from fatalDisconnectReason: the connection keeps retrying normally, this only tells the
   // user some typed input never made it to the server.
   const [transientNotice, setTransientNotice] = useState<string | null>(null);
+  // Mirrors reconnectStateRef.current.lastErrorReason (see reconnectPolicy.ts): the last
+  // known reason a non-fatal close happened, shown alongside a spinner in the compact
+  // ReconnectIndicator below from the very first failure - unlike the full DisconnectedOverlay,
+  // which is deliberately delayed by DISCONNECTED_OVERLAY_DELAY_MS to avoid flashing for a
+  // reconnect that resolves in a few hundred ms. Null whenever fatalDisconnectReason is set:
+  // the fatal overlay already shows the terminal reason with its spinner stopped, and this
+  // indicator's own spinning would visually contradict "this will not resolve on its own".
+  const [lastErrorReason, setLastErrorReason] = useState<string | null>(null);
   const [connectionEpoch, setConnectionEpoch] = useState<number>(0);
   // On mobile every instance mounts hidden (display: none) in the always-rendered pool, so
   // fit() measures a zero-width container and the socket would open with xterm's 80x24
@@ -445,6 +485,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     reconnectStateRef.current = state;
     setFatalDisconnectReason(state.fatalReason);
     setTransientNotice(state.transientNotice);
+    setLastErrorReason(state.lastErrorReason);
     return effect;
   }, []);
 
@@ -1108,6 +1149,10 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     // stuck at CONNECTING) never fires "close" and so never enters the reconnect path below.
     const connectTimeoutId = window.setTimeout(() => {
       if (socket.readyState === WebSocket.CONNECTING) {
+        // See pendingLocalCloseReasonRef's declaration: a plain socket.close() carries no
+        // reason of its own, so this is the only place that can ever know WHY this
+        // particular close is about to happen.
+        pendingLocalCloseReasonRef.current = "Connection attempt timed out.";
         socket.close();
       }
     }, CONNECT_TIMEOUT_MS);
@@ -1120,6 +1165,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
         return;
       }
       if (performance.now() - lastActivityAtRef.current > LIVENESS_TIMEOUT_MS) {
+        pendingLocalCloseReasonRef.current = "Connection went silent (no response from the server).";
         socket.close();
         return;
       }
@@ -1183,10 +1229,16 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     // on a growing backoff instead of stranding the user on the manual Reconnect button
     let reconnectTimeoutId: number | undefined;
     socket.onclose = (event: CloseEvent) => {
+      // A locally-forced close (connect-timeout/liveness-timeout/wake-stale) always carries
+      // an empty event.reason - only the SERVER can set one - so this is what lets the
+      // reducer show something more useful than a bare spinner for a disconnect this process
+      // caused itself. Read once and cleared immediately: it describes only THIS close.
+      const localReason = pendingLocalCloseReasonRef.current;
+      pendingLocalCloseReasonRef.current = null;
       const { retryDelayMs: delayMs } = applyConnectionEvent({
         kind: "close",
         code: event.code,
-        reason: event.reason,
+        reason: localReason ?? event.reason,
       });
       if (delayMs === null) {
         // Fatal (4004/4005, see reconnectPolicy.ts): no point debouncing behind
@@ -1240,7 +1292,9 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     if (socket !== null && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) {
       // Past its own timeout/liveness window: force a real "close" so the effect's
       // onclose-driven backoff (now reset to attempt 0, so it fires almost immediately)
-      // picks it up, instead of silently doing nothing because readyState looked fine.
+      // picks it up, instead of silently doing nothing because readyState looked fine. See
+      // pendingLocalCloseReasonRef's declaration for why this must be set before close().
+      pendingLocalCloseReasonRef.current = "Reconnecting after the tab was inactive.";
       socket.close();
       return;
     }
@@ -1336,15 +1390,27 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
           style={{ touchAction: "none", willChange: "transform" }}
         />
         {disconnected && <DisconnectedOverlay onReconnect={reconnect} fatalReason={fatalDisconnectReason} />}
-        {/* Non-blocking: a 4007 close (see reconnectPolicy.ts) means some input was dropped
-            but the connection is still retrying normally, possibly without ever showing the
-            full DisconnectedOverlay at all (see DISCONNECTED_OVERLAY_DELAY_MS). Shown
-            independently of `disconnected` so the user actually sees it. */}
-        {transientNotice !== null && (
-          <div className="absolute top-[10px] left-1/2 -translate-x-1/2 rounded-md border border-border-strong bg-surface px-[12px] py-[6px] text-[11.5px] text-txt-dim shadow-lg">
-            {transientNotice}
-          </div>
-        )}
+        {/* Both notices share one top-center stack (rather than each being independently
+            absolutely-positioned at the same spot) because they CAN legitimately both be
+            non-null at once: transientNotice (4007) deliberately survives a subsequent 4006
+            close (see reconnectPolicy.test.ts), which is exactly when lastErrorReason gets
+            set again - without stacking, the two would render on top of each other. */}
+        <div className="absolute top-[10px] left-1/2 flex -translate-x-1/2 flex-col items-center gap-[6px]">
+          {/* Non-blocking: a 4007 close (see reconnectPolicy.ts) means some input was dropped
+              but the connection is still retrying normally, possibly without ever showing the
+              full DisconnectedOverlay at all (see DISCONNECTED_OVERLAY_DELAY_MS). Shown
+              independently of `disconnected` so the user actually sees it. */}
+          {transientNotice !== null && (
+            <div className="rounded-md border border-border-strong bg-surface px-[12px] py-[6px] text-[11.5px] text-txt-dim shadow-lg">
+              {transientNotice}
+            </div>
+          )}
+          {/* See ReconnectIndicator's own comment: visible from the first failure, unlike
+              DisconnectedOverlay's 1.5s-delayed full-screen version below. Hidden while fatal
+              (fatalDisconnectReason set) since that overlay already shows the terminal reason
+              with its spinner stopped. */}
+          {lastErrorReason !== null && fatalDisconnectReason === null && <ReconnectIndicator reason={lastErrorReason} />}
+        </div>
         {showScrollToBottom && (
           <button
             type="button"

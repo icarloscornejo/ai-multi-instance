@@ -70,12 +70,23 @@ describe("reduceConnection", () => {
     expect(state).toEqual(INITIAL_RECONNECT_STATE);
   });
 
-  it("4004 and 4005 set a fatal reason and schedule no retry", () => {
-    for (const code of [4004, 4005]) {
-      const result = reduceConnection(INITIAL_RECONNECT_STATE, closeEvent(code, "Unknown instance"));
-      expect(result.effect.retryDelayMs).toBeNull();
-      expect(result.state.fatalReason).toBe("Unknown instance");
-    }
+  it("4004 sets a fatal reason and schedules no retry (a deleted instance's uuid never returns)", () => {
+    const result = reduceConnection(INITIAL_RECONNECT_STATE, closeEvent(4004, "Unknown instance"));
+    expect(result.effect.retryDelayMs).toBeNull();
+    expect(result.state.fatalReason).toBe("Unknown instance");
+  });
+
+  // 4005 (missing folder) used to be fatal too, on the assumption a deleted/unmounted/renamed
+  // folder never comes back. That assumption was wrong: remounting the drive or undoing the
+  // rename fixes it with zero client-side action. The current server never actually sends
+  // 4005 anymore (see reconnectPolicy.ts's FATAL_CLOSE_CODES comment), but the client still
+  // treats it exactly like 4006 - the slow attach-streak backoff, not fatal - for
+  // compatibility across a rolling restart.
+  it("4005 retries via the slow attach-streak backoff instead of being fatal", () => {
+    const result = reduceConnection(INITIAL_RECONNECT_STATE, closeEvent(4005, "Folder no longer exists"));
+    expect(result.effect.retryDelayMs).toBe(250);
+    expect(result.state.fatalReason).toBeNull();
+    expect(result.state.attachStreak).toBe(1);
   });
 
   it("a fatal reason is cleared once a fresh attempt opens", () => {
@@ -132,5 +143,63 @@ describe("reduceConnection", () => {
     expect(attachDelay1).toBe(250); // attachStreak was 0
     expect(overflowDelay1).toBe(250); // normalAttempt was 0, independent of attachStreak=1
     expect(attachDelay2).toBe(500); // attachStreak was 1, unaffected by the 4007 in between
+  });
+
+  describe("lastErrorReason", () => {
+    it("is set from a 4006 close's reason", () => {
+      const { state } = reduceConnection(INITIAL_RECONNECT_STATE, closeEvent(4006, "posix_spawnp failed."));
+      expect(state.lastErrorReason).toBe("posix_spawnp failed.");
+    });
+
+    it("is set from an uncategorized close's reason too (e.g. a locally-forced close)", () => {
+      const { state } = reduceConnection(INITIAL_RECONNECT_STATE, closeEvent(1006, "Connection went silent."));
+      expect(state.lastErrorReason).toBe("Connection went silent.");
+    });
+
+    // The critical timing property: the handshake ("open") always completes before the
+    // server's attach can fail, so clearing lastErrorReason on "open" would erase the message
+    // right as the user is about to read it - the exact same hazard attachStreak's own
+    // comment documents.
+    it("survives a subsequent 'open' event", () => {
+      let state = reduceConnection(INITIAL_RECONNECT_STATE, closeEvent(4006, "attach failed")).state;
+      ({ state } = reduceConnection(state, { kind: "open" }));
+      expect(state.lastErrorReason).toBe("attach failed");
+    });
+
+    it("is cleared only by bridgeReady or manualReconnect, not by open", () => {
+      let state = reduceConnection(INITIAL_RECONNECT_STATE, closeEvent(4006, "attach failed")).state;
+      ({ state } = reduceConnection(state, { kind: "open" }));
+      expect(state.lastErrorReason).not.toBeNull();
+      ({ state } = reduceConnection(state, { kind: "bridgeReady" }));
+      expect(state.lastErrorReason).toBeNull();
+    });
+
+    it("a reason-less close does not blank out a previous message", () => {
+      let state = reduceConnection(INITIAL_RECONNECT_STATE, closeEvent(4006, "posix_spawnp failed.")).state;
+      ({ state } = reduceConnection(state, closeEvent(1006, "")));
+      expect(state.lastErrorReason).toBe("posix_spawnp failed.");
+    });
+
+    // C2: precedence between a stale attach-failure message and a fresh, unrelated 4007
+    // notice - the two must never show at once (see reduceClose's 4007 branch).
+    it("a 4007 (input overflow) clears a previous lastErrorReason instead of leaving it stale", () => {
+      let state = reduceConnection(INITIAL_RECONNECT_STATE, closeEvent(4006, "attach failed")).state;
+      expect(state.lastErrorReason).toBe("attach failed");
+      ({ state } = reduceConnection(state, closeEvent(4007, "some input was dropped")));
+      expect(state.lastErrorReason).toBeNull();
+      expect(state.transientNotice).toBe("some input was dropped");
+    });
+
+    it("manualReconnect clears lastErrorReason along with everything else", () => {
+      let state = reduceConnection(INITIAL_RECONNECT_STATE, closeEvent(4006, "attach failed")).state;
+      ({ state } = reduceConnection(state, { kind: "manualReconnect" }));
+      expect(state.lastErrorReason).toBeNull();
+    });
+
+    it("wake does not touch lastErrorReason - a wake is not proof the pending attach recovered", () => {
+      let state = reduceConnection(INITIAL_RECONNECT_STATE, closeEvent(4006, "attach failed")).state;
+      ({ state } = reduceConnection(state, { kind: "wake" }));
+      expect(state.lastErrorReason).toBe("attach failed");
+    });
   });
 });

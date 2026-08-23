@@ -42,6 +42,30 @@ const status: TunnelStatus = { state: "stopped", phase: null, url: null, error: 
 let child: ChildProcess | null = null;
 let startPromise: Promise<TunnelStatus> | null = null;
 
+// Monotonic, bumped at the top of every real attempt (attemptStart, below) and by
+// stopTunnel(). Every async continuation this module owns - the Caddy preflight's await, the
+// URL-detection stderr handler, verifyEdge's .then(), and every child process event (error,
+// exit) - closes over the generation number it was created under and checks it against this
+// before mutating `child`/`status`/`startPromise`; a mismatch means a newer attempt or an
+// explicit stop has already superseded it, so it's a no-op. Each attempt owns exactly one
+// child process (spawned synchronously, no await in between - see attemptStart), so
+// generation alone is equivalent to checking child identity, without needing to store and
+// compare the child reference separately at every one of those sites.
+let generation = 0;
+// True from the moment startTunnel() is first called until an explicit stopTunnel() - the
+// ONLY thing that sets it back to false. This is what drives auto-restart after an unexpected
+// exit (see attemptStart's exit handler), and deliberately NOT the exit code: code 0 means
+// cloudflared gave up retrying and shut down cleanly, not that the USER wants the tunnel gone
+// (see finishRunning/exit-handler's own comment on that distinction) - basing restart on the
+// exit code would silently stop restarting on exactly the exit that most needs it.
+let desiredRunning = false;
+let restartTimeoutId: NodeJS.Timeout | null = null;
+// Reset to 0 on every successful finishRunning; grows the backoff on each consecutive
+// unexpected exit so a tunnel that keeps dying immediately (misconfiguration, cloudflared
+// itself broken) doesn't spin-restart in a tight loop.
+let consecutiveUnexpectedExits = 0;
+const RESTART_BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
+
 export function getTunnelStatus(): TunnelStatus {
   return { ...status };
 }
@@ -189,12 +213,35 @@ async function verifyEdge(url: string, log: (line: string) => void): Promise<Edg
 }
 
 export async function startTunnel(): Promise<TunnelStatus> {
+  desiredRunning = true;
+  // An explicit start request always wins over a pending auto-restart backoff: the user
+  // asking for the tunnel right now should not have to wait out a delay that exists purely to
+  // avoid hammering a tunnel that keeps failing on its own.
+  if (restartTimeoutId !== null) {
+    clearTimeout(restartTimeoutId);
+    restartTimeoutId = null;
+  }
   if (startPromise !== null) {
     return startPromise;
   }
   if (status.state === "running") {
     return getTunnelStatus();
   }
+  startPromise = attemptStart();
+  return startPromise;
+}
+
+// One full start attempt: Caddy preflight, spawn cloudflared, wire its handlers. Used both by
+// the public startTunnel() (the first attempt) and, directly, by the auto-restart timer below
+// (a background attempt nobody may be awaiting) - the exact same generation-guarded logic
+// applies to both, so a stop or a newer attempt can never be misapplied regardless of which
+// path started it.
+async function attemptStart(): Promise<TunnelStatus> {
+  // Bumped BEFORE the first await, closing the race where two overlapping start attempts
+  // (two concurrent startTunnel() calls that got past the startPromise check, or a manual
+  // start racing an auto-restart) could otherwise both reach the spawn call below and end up
+  // with two live cloudflared children, only one of which this module could still track.
+  const myGeneration = ++generation;
 
   status.state = "starting";
   status.phase = "checking-caddy";
@@ -203,28 +250,36 @@ export async function startTunnel(): Promise<TunnelStatus> {
   status.warning = null;
 
   const caddyPreflight: CaddyPreflight = await checkCaddyReachable();
+  if (myGeneration !== generation) {
+    // A stop (or a newer attempt) happened while this one was preflighting - it no longer
+    // owns anything and must not spawn a process the current intent no longer wants.
+    return getTunnelStatus();
+  }
   if (caddyPreflight.result === "caddy-down") {
     status.state = "error";
     status.phase = null;
     status.error = `Caddy isn't responding on 127.0.0.1:${CADDY_HTTP_PORT}. Start it with: brew services start caddy`;
+    startPromise = null;
     return getTunnelStatus();
   }
   if (caddyPreflight.result === "upstream-down") {
     status.state = "error";
     status.phase = null;
     status.error = "Caddy is running but the dashboard's dev server isn't responding behind it. Start it with: npm run dev";
+    startPromise = null;
     return getTunnelStatus();
   }
   if (caddyPreflight.result === "wrong-origin") {
     status.state = "error";
     status.phase = null;
     status.error = `Caddy on 127.0.0.1:${CADDY_HTTP_PORT} isn't serving this app (status ${caddyPreflight.status ?? "?"}): ${caddyPreflight.bodySnippet.slice(0, 200)}`;
+    startPromise = null;
     return getTunnelStatus();
   }
 
   status.phase = "launching";
 
-  startPromise = new Promise<TunnelStatus>((resolve) => {
+  return new Promise<TunnelStatus>((resolve) => {
     // QUIC (cloudflared's default) is UDP-based and gets silently blocked or throttled by
     // a lot of mobile-hotspot/carrier NATs; the tunnel then reports a URL but never actually
     // connects, with no error surfaced anywhere (see the finishError/finishRunning split
@@ -244,6 +299,9 @@ export async function startTunnel(): Promise<TunnelStatus> {
       "--url",
       `http://localhost:${CADDY_HTTP_PORT}`,
     ]);
+    // No await between spawn() and here, so there is no window for stopTunnel() to
+    // interleave: the generation check right after the preflight await above is what
+    // actually matters, this assignment always safely belongs to myGeneration.
     child = cloudflared;
     let stderrTail = "";
     let settled = false;
@@ -267,6 +325,14 @@ export async function startTunnel(): Promise<TunnelStatus> {
     const finishError = (message: string): void => {
       if (settled) return;
       settled = true;
+      if (myGeneration !== generation) {
+        // Superseded by a stop or a newer attempt; that path already owns child/status/
+        // startPromise, so this stale attempt must not touch any of them - just let its own
+        // child die on its own terms below.
+        cloudflared.kill();
+        resolve(getTunnelStatus());
+        return;
+      }
       status.state = "error";
       status.phase = null;
       status.url = null;
@@ -287,12 +353,18 @@ export async function startTunnel(): Promise<TunnelStatus> {
     const finishRunning = (url: string, warning: string | null = null): void => {
       if (settled) return;
       settled = true;
+      if (myGeneration !== generation) {
+        cloudflared.kill();
+        resolve(getTunnelStatus());
+        return;
+      }
       status.state = "running";
       status.phase = null;
       status.url = url;
       status.error = null;
       status.warning = warning;
       startPromise = null;
+      consecutiveUnexpectedExits = 0;
       resolve(getTunnelStatus());
     };
 
@@ -301,6 +373,7 @@ export async function startTunnel(): Promise<TunnelStatus> {
     }, START_TIMEOUT_MS);
 
     cloudflared.stderr?.on("data", (chunk: Buffer) => {
+      if (myGeneration !== generation) return;
       stderrTail = (stderrTail + chunk.toString()).slice(-4000);
       if (urlSeen) return;
       const url: string | null = extractTunnelUrl(stderrTail);
@@ -343,6 +416,14 @@ export async function startTunnel(): Promise<TunnelStatus> {
 
     cloudflared.on("exit", (code: number | null) => {
       clearTimeout(timer);
+      if (myGeneration !== generation) {
+        // This child was already superseded (a stop, or a newer attempt) by the time it
+        // finally exited - its death is old news and must not overwrite the CURRENT
+        // attempt's status. This is exactly the "stale old-child exit after the replacement
+        // is running" hazard: without this guard, a slow-to-die old process could stomp a
+        // brand new, healthy tunnel back to "stopped".
+        return;
+      }
       if (!settled) {
         // Died before ever reporting a URL
         finishError(`cloudflared exited before starting the tunnel (code ${code}). ${stderrTail.slice(-300)}`);
@@ -364,10 +445,26 @@ export async function startTunnel(): Promise<TunnelStatus> {
           ? `cloudflared exited unexpectedly (code ${code}). ${stderrTail.slice(-300)}`
           : null;
       status.warning = null;
+
+      // Auto-restart, driven by desiredRunning alone (see its own comment) - NOT by the exit
+      // code above, which only decided what error text to show. An explicit stopTunnel()
+      // already set desiredRunning to false and would have killed this child itself, so
+      // reaching here with desiredRunning still true always means an unexpected death the
+      // user still wants recovered from.
+      if (desiredRunning) {
+        consecutiveUnexpectedExits += 1;
+        const backoffMs = RESTART_BACKOFF_MS[Math.min(consecutiveUnexpectedExits - 1, RESTART_BACKOFF_MS.length - 1)];
+        restartTimeoutId = setTimeout(() => {
+          restartTimeoutId = null;
+          if (!desiredRunning) {
+            // stopTunnel() ran during the backoff wait; nothing to restart.
+            return;
+          }
+          startPromise = attemptStart();
+        }, backoffMs);
+      }
     });
   });
-
-  return startPromise;
 }
 
 export function readTunnelLog(): string {
@@ -379,6 +476,20 @@ export function readTunnelLog(): string {
 }
 
 export function stopTunnel(): TunnelStatus {
+  // The only place desiredRunning becomes false: an explicit stop is the sole expression of
+  // "the user wants this gone" (see desiredRunning's own comment) - it must therefore cancel
+  // every form of automatic recovery this module can have in flight, not just kill the child.
+  desiredRunning = false;
+  // Bumped so any pre-spawn work still in flight (an awaited Caddy preflight, a pending
+  // START_TIMEOUT_MS timer, a verifyEdge in progress) reads itself as superseded the moment
+  // it resumes, instead of resurrecting a status this call just cleared - see attemptStart's
+  // generation checks.
+  generation += 1;
+  if (restartTimeoutId !== null) {
+    clearTimeout(restartTimeoutId);
+    restartTimeoutId = null;
+  }
+  consecutiveUnexpectedExits = 0;
   if (child !== null) {
     child.kill();
     child = null;

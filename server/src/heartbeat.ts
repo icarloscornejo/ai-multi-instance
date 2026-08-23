@@ -34,14 +34,31 @@ export function registerHeartbeat(webSocket: WebSocket): void {
 export function startHeartbeat(server: WebSocketServer, intervalMs: number): () => void {
   const interval = setInterval(() => {
     for (const webSocket of server.clients) {
-      // Only terminate a socket this loop itself marked "didn't answer" last tick; a socket
-      // with no entry yet (mid-upgrade, not registered) is left alone rather than read as dead.
-      if (socketIsAlive.get(webSocket) === false) {
-        webSocket.terminate();
-        continue;
+      // Each client's ping()/terminate() is wrapped individually: a throw from one bad
+      // socket (a race with its own close, an already-destroyed underlying connection) used
+      // to escape this setInterval callback uncaught, which would not just crash the process
+      // but do so via a callback that ALSO stops every other socket in this sweep from ever
+      // being pinged/checked again - one bad terminal previously meant every terminal's
+      // liveness detection silently died with it.
+      try {
+        // Only terminate a socket this loop itself marked "didn't answer" last tick; a socket
+        // with no entry yet (mid-upgrade, not registered) is left alone rather than read as
+        // dead.
+        if (socketIsAlive.get(webSocket) === false) {
+          webSocket.terminate();
+          continue;
+        }
+        socketIsAlive.set(webSocket, false);
+        webSocket.ping();
+      } catch (error) {
+        console.error("[server] heartbeat failed for one socket, terminating it:", (error as Error).message);
+        try {
+          webSocket.terminate();
+        } catch {
+          // Nothing further to do about a socket that won't even terminate; the sweep must
+          // still continue on to the remaining clients regardless.
+        }
       }
-      socketIsAlive.set(webSocket, false);
-      webSocket.ping();
     }
   }, intervalMs);
 

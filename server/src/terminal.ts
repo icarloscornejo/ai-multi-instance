@@ -7,10 +7,21 @@ import {
   PtySpawnError,
   TooManyPtysError,
   isRetriableSpawnError,
+  recordAttachFailure,
+  truncateCloseReason,
 } from "./attachErrors";
 import { buildLaunchCommand } from "./launch";
 import { pathExists } from "./paths";
-import { createSession, enableMouseMode, hasSession, killSession, sendCommandToSession } from "./tmux";
+import {
+  TmuxError,
+  createSession,
+  enableMouseMode,
+  getSessionPresence,
+  isSessionInitIncomplete,
+  killSession,
+  markSessionInitComplete,
+  sendCommandToSession,
+} from "./tmux";
 import type { InstanceRecord } from "./types";
 
 // Re-exported so existing importers of terminal.ts (index.ts) don't need to know these moved
@@ -73,6 +84,104 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// A single failure must cost one terminal, never the whole process. Closing a socket is
+// itself capable of throwing (see truncateCloseReason's header comment: an untruncated,
+// multi-byte reason used to make ws's close() throw a RangeError from inside the very catch
+// block meant to handle the original failure), so this is the LAST line of defense and must
+// not itself be able to escalate: try close(), and only if that throws, fall back to
+// terminate() (which drops the TCP connection immediately, no close handshake, but cannot
+// itself reject on an oversized reason since it takes none). Any exception from terminate()
+// is swallowed - there is nothing further this function can do about a socket that won't even
+// tear down cleanly, and letting that exception escape would defeat the entire point.
+export function closeSocketSafely(socket: WebSocket, code: number, reason: string): void {
+  const truncatedReason = truncateCloseReason(reason);
+  try {
+    if (socket.readyState === socket.OPEN || socket.readyState === socket.CONNECTING) {
+      socket.close(code, truncatedReason);
+    }
+  } catch {
+    try {
+      socket.terminate();
+    } catch {
+      // Nothing more this process can do about a socket that won't even terminate cleanly;
+      // swallowing here is what keeps a broken socket from becoming a process crash.
+    }
+  }
+}
+
+// The one teardown routine every post-bridge failure path (onData, the pty's own "error"
+// listener, a malformed control message) funnels through. releasePty is already idempotent
+// (see its _released flag above), which is what lets this run safely alongside the "close"
+// listener registered right after spawn (bridgeTerminal, below) without ever double-
+// decrementing livePtyCount - that count gates MAX_LIVE_PTYS admission, so a drift there would
+// be silent and cumulative for the rest of the process's life. releasePty's own destroy()/
+// kill() call is wrapped too: this function must be able to absorb a failure in EITHER half
+// (pty teardown or socket close) and still attempt the other.
+//
+// Always logs, throttled through the same recordAttachFailure used for pre-bridge failures
+// (attachErrors.ts) - a post-bridge failure being contained (instead of crashing the process)
+// must not also mean it becomes invisible. Without this, `npm run dev`'s own terminal would
+// show nothing at all for a resize exploit, a broken pipe, or a pty stream error: the user
+// would just see a tab quietly reconnect with no way to tell what happened or fix it later.
+function teardownAttach(
+  socket: WebSocket,
+  attachProcess: nodePty.IPty,
+  instanceId: string,
+  code: number,
+  reason: string
+): void {
+  const failureMessage = recordAttachFailure(instanceId, reason);
+  if (failureMessage !== null) {
+    console.error(`[server] ${failureMessage}`);
+  }
+  try {
+    releasePty(attachProcess);
+  } catch {
+    // A pty that won't tear down cleanly must not block closing the socket below - the user
+    // still needs to see the terminal go away and reconnect, even if this process is left
+    // with a wedged child process (a much smaller problem than a full server crash).
+  }
+  closeSocketSafely(socket, code, reason);
+}
+
+// Post-bridge failures (a pty stream error, a throw while handling a client message) are not
+// pre-bridge ATTACH failures - the attach already succeeded once - so they deliberately do not
+// reuse 4006/closeCodeForAttachError (that would wrongly feed the client's slow attachStreak
+// backoff for something that isn't a repeated attach failure; see reconnectPolicy.ts). 1011 is
+// the WebSocket spec's own "server encountered an unexpected condition" code, which falls
+// through reconnectPolicy's normal-drop branch: the client reconnects at its ordinary cadence
+// and re-runs the full attach pipeline from scratch, same as any other drop.
+const POST_BRIDGE_FAILURE_CLOSE_CODE = 1011;
+
+// Shared by the initial-size query string (index.ts) and every live "resize" message
+// (handleMessage below) so a client cannot bypass the guard by only exploiting one of the two
+// paths - both used to be validated separately (and the initial-size path had no upper bound
+// at all). Positive finite integers alone are not enough: axis-only bounds still let through
+// a geometry whose PRODUCT is enormous (e.g. one huge axis and one merely-large one), which
+// can still blow up tmux's own grid allocation and redraw cost. MAX_AXIS and MAX_CELLS are
+// both generous relative to any real xterm.js viewport (a 4K display at a tiny font is still
+// only in the low hundreds of columns/rows) while remaining far short of what would let a
+// single malicious/buggy resize message meaningfully stress the server.
+const MAX_TERMINAL_AXIS = 2_000;
+const MAX_TERMINAL_CELLS = 300_000;
+
+export function validateTerminalSize(cols: unknown, rows: unknown): InitialSize | null {
+  if (
+    typeof cols !== "number" ||
+    typeof rows !== "number" ||
+    !Number.isInteger(cols) ||
+    !Number.isInteger(rows) ||
+    cols <= 0 ||
+    rows <= 0 ||
+    cols > MAX_TERMINAL_AXIS ||
+    rows > MAX_TERMINAL_AXIS ||
+    cols * rows > MAX_TERMINAL_CELLS
+  ) {
+    return null;
+  }
+  return { cols, rows };
+}
+
 // Most spikes in pty pressure (another terminal closing, an unrelated agent process
 // exiting) clear within a second or two; retrying the spawn itself inside the same attach
 // absorbs that transient case invisibly instead of surfacing a failure the client would
@@ -129,24 +238,27 @@ const sessionInitInFlight = new Map<string, Promise<void>>();
 // The whole "create session, launch the provider" sequence is treated as ONE unit for two
 // separate reasons:
 //
-// 1. Cancellation: createSession (tmux.ts, 4 tmux calls) and the sendCommandToSession that
-//    launches the provider (2 more tmux calls) are six tmux invocations spread across two
-//    functions. If a cancellation check ran between them, a socket closing mid-sequence
-//    would leave a tmux session that exists (hasSession would report it alive) but was
-//    never handed a provider - every future attach would then see "session alive", skip
-//    straight to enableMouseMode, and the user would be permanently stuck looking at an
-//    empty shell. So: no cancellation check anywhere inside this function, only before
-//    calling it and after it returns (see bridgeTerminal below).
+// 1. Cancellation: createSession (tmux.ts, chained new-session + marker set, then 3 more tmux
+//    calls) and the sendCommandToSession that launches the provider (2 more tmux calls) are
+//    several tmux invocations spread across two functions. If a cancellation check ran
+//    between them, a socket closing mid-sequence would leave a tmux session that exists
+//    (getSessionPresence would report it "present") but was never handed a provider. So: no
+//    cancellation check anywhere inside this function, only before calling it and after it
+//    returns (see bridgeTerminal below). The init-incomplete marker (tmux.ts) is what makes
+//    this survivable even so: a session left in that state reads as "confirmed incomplete"
+//    to the next ensureSessionReady call instead of being silently accepted forever - see
+//    that function below for the full mechanism and its history.
 //
 // 2. A per-command timeout (see DEFAULT_TMUX_TIMEOUT_MS in tmux.ts) can ALSO fire mid-
-//    sequence, with the exact same alive-but-empty consequence, even with no cancellation
+//    sequence, with the exact same half-initialized consequence, even with no cancellation
 //    involved at all: killing tmux's own client process on timeout does not undo commands
 //    the tmux SERVER already applied (new-session already ran; only the later provider
 //    launch timed out). That failure mode is handled by the catch below: if anything in
 //    this sequence throws after the session started existing, the (now-broken) session is
 //    killed before the error propagates, so the next attempt - this same caller retrying,
-//    or a concurrent one released from the in-flight map below - recreates it from scratch
-//    instead of inheriting the empty state.
+//    or a concurrent one released from the in-flight map below - recreates it from scratch.
+//    markSessionInitComplete is only ever reached on the success path, after every step
+//    above it succeeded, which is what makes clearing the marker meaningful proof at all.
 async function initializeSession(instance: InstanceRecord): Promise<void> {
   try {
     await createSession(instance.tmuxSession, instance.locationPath);
@@ -156,6 +268,7 @@ async function initializeSession(instance: InstanceRecord): Promise<void> {
         buildLaunchCommand(instance, { resumeSessionId: instance.sessionId ?? undefined })
       );
     }
+    await markSessionInitComplete(instance.tmuxSession);
   } catch (error) {
     try {
       await killSession(instance.tmuxSession);
@@ -168,12 +281,32 @@ async function initializeSession(instance: InstanceRecord): Promise<void> {
   }
 }
 
-// Ensures the instance's tmux session exists and, if freshly created, has its provider
-// launched - joining an already in-flight attempt for the same session instead of racing
-// it (see sessionInitInFlight above). A second concurrent attach that read "session alive"
-// while the first attempt was still between new-session and the provider launch would
-// otherwise skip straight to enableMouseMode and never notice the provider was never
-// started.
+// Ensures the instance's tmux session exists and is fully initialized - joining an already
+// in-flight attempt for the same session instead of racing it (see sessionInitInFlight
+// above). This function's shape is the result of getting it wrong twice, in two opposite and
+// both destructive directions, so both are recorded here rather than left to be
+// rediscovered:
+//
+//   1. First attempt: an in-memory "poisoned" set that killed-then-recreated a session once
+//      cleanup failed. Rejected because tmux's own kill-session REJECTS when the target
+//      session doesn't exist, and getSessionPresence collapsing a timeout into the same
+//      state as "gone" meant a session that was merely stalled - not actually missing -
+//      could get stuck failing forever on the kill step, a permanently dead terminal.
+//
+//   2. Second attempt: a "ready" marker set only once init completed, treating any session
+//      alive WITHOUT that marker as incomplete and recreating it. Rejected because every
+//      session that already existed before this marker was introduced has no marker at
+//      all - the very first attach after deploying that version would have destroyed every
+//      live session on the machine, agents and scrollback included. The README promises
+//      the opposite twice over (sessions and their output survive dashboard restarts).
+//
+// The design that survived: the marker (tmux.ts's SESSION_INIT_MARKER_OPTION) proves
+// INCOMPLETENESS, never readiness, and only a POSITIVE "1" reading counts as proof - a
+// legacy session with no marker, a session whose marker read failed, and a session already
+// marked complete are all indistinguishable to this function ON PURPOSE, and all three are
+// preserved untouched. The invariant this exists to protect: destroying a session must
+// require positive evidence it was left incomplete, never the mere absence of evidence it's
+// fine. See tmux.ts's isSessionInitIncomplete/getSessionPresence for the full mechanism.
 export async function ensureSessionReady(instance: InstanceRecord): Promise<void> {
   const existing = sessionInitInFlight.get(instance.tmuxSession);
   if (existing !== undefined) {
@@ -181,13 +314,39 @@ export async function ensureSessionReady(instance: InstanceRecord): Promise<void
   }
 
   const readyPromise = (async () => {
-    const sessionAlive = await hasSession(instance.tmuxSession);
-    if (sessionAlive) {
-      // Migrate sessions that were alive before this change (createSession already
+    const presence = await getSessionPresence(instance.tmuxSession);
+
+    if (presence === "unknown") {
+      // A timeout or a wedged tmux server is not proof the session is gone - it might be
+      // perfectly healthy. Surface this as a normal recoverable attach failure (the caller,
+      // bridgeTerminal, already treats any thrown error here that way) so the client retries
+      // instead of this function risking a destructive decision on ambiguous information.
+      throw new TmuxError("Could not confirm the tmux session's state; retrying automatically.");
+    }
+
+    if (presence === "absent") {
+      await initializeSession(instance);
+      return;
+    }
+
+    // presence === "present" from here on.
+    const initState = await isSessionInitIncomplete(instance.tmuxSession);
+    if (initState === "not-confirmed-incomplete") {
+      // Legacy session, already-complete session, or an unreadable marker: preserve as-is.
+      // Migrate sessions that were alive before mouse mode existed (createSession already
       // enables it for new ones); set-option is idempotent, no cost in repeating it.
       await enableMouseMode(instance.tmuxSession);
       return;
     }
+
+    // Confirmed incomplete: this exact process created this session and never finished
+    // initializing it (a crash, a killed provider launch) - the marker reading "1" is
+    // positive proof no user work could exist in it yet, since it's only cleared after the
+    // provider launch commands were sent. Safe to recreate from scratch.
+    await killSession(instance.tmuxSession).catch(() => {
+      // Best-effort: if the session already vanished on its own between the presence check
+      // above and here, there is nothing left to clean up.
+    });
     await initializeSession(instance);
   })();
 
@@ -261,38 +420,71 @@ export async function bridgeTerminal(
     return;
   }
 
+  // node-pty rethrows any stream error that isn't EAGAIN/EIO UNLESS the consumer has
+  // registered its own "error" listener (see unixTerminal.js: `if
+  // (this.listeners('error').length < 2) { throw err; }` - node-pty's own internal listener
+  // is always the first, so ours has to exist for that check to pass). IPty's public type
+  // only declares onData/onExit, not a raw "error" event, but Terminal.prototype.on/listeners
+  // (terminal.js) delegate directly to the underlying socket's EventEmitter for any event
+  // other than "close", which is exactly the listener count node-pty's own check inspects -
+  // hence the cast. Without this, a pty stream error after a perfectly successful attach
+  // could still throw as an uncaught exception from inside an EventEmitter callback and take
+  // the whole server down with it - this listener existing at all, regardless of what it
+  // does, is what prevents that.
+  (attachProcess as unknown as { on: (event: "error", listener: (error: Error) => void) => void }).on(
+    "error",
+    (error: Error) => {
+      teardownAttach(socket, attachProcess, instance.id, POST_BRIDGE_FAILURE_CLOSE_CODE, error.message);
+    }
+  );
+
   attachProcess.onData((outputChunk: string) => {
-    if (socket.readyState === socket.OPEN) {
-      socket.send(outputChunk);
+    try {
+      if (socket.readyState === socket.OPEN) {
+        socket.send(outputChunk);
+      }
+    } catch (error) {
+      // socket.send() throwing (a broken pipe, a send after a race with close) must cost
+      // only this terminal - see teardownAttach's header comment.
+      teardownAttach(socket, attachProcess, instance.id, POST_BRIDGE_FAILURE_CLOSE_CODE, (error as Error).message);
     }
   });
 
   // If the pty dies (kill-session from outside, tmux crash), the client must be notified
   attachProcess.onExit(() => {
     if (socket.readyState === socket.OPEN) {
-      socket.close(4001, "tmux session ended");
+      closeSocketSafely(socket, 4001, "tmux session ended");
     }
   });
 
   const handleMessage = (rawMessage: RawData): void => {
-    let controlMessage: ClientControlMessage;
     try {
-      controlMessage = JSON.parse(rawMessage.toString()) as ClientControlMessage;
-    } catch {
-      return;
-    }
-    if (controlMessage.type === "input" && typeof controlMessage.data === "string") {
-      attachProcess.write(controlMessage.data);
-    } else if (
-      controlMessage.type === "resize" &&
-      typeof controlMessage.cols === "number" &&
-      typeof controlMessage.rows === "number" &&
-      controlMessage.cols > 0 &&
-      controlMessage.rows > 0
-    ) {
-      attachProcess.resize(controlMessage.cols, controlMessage.rows);
-    } else if (controlMessage.type === "ping" && socket.readyState === socket.OPEN) {
-      socket.send(PONG_FRAME);
+      let controlMessage: ClientControlMessage;
+      try {
+        controlMessage = JSON.parse(rawMessage.toString()) as ClientControlMessage;
+      } catch {
+        return;
+      }
+      if (controlMessage.type === "input" && typeof controlMessage.data === "string") {
+        attachProcess.write(controlMessage.data);
+      } else if (controlMessage.type === "resize") {
+        // Shared with the initial-size query string in index.ts (see validateTerminalSize's
+        // header comment for why): this is the guard that used to accept `Infinity` (typeof
+        // Infinity === "number" and Infinity > 0 both pass a naive check) and hand it
+        // straight to node-pty's resize(), which throws explicitly for infinite dimensions -
+        // an exception any connected tab could trigger on demand, previously uncontained.
+        const validatedSize = validateTerminalSize(controlMessage.cols, controlMessage.rows);
+        if (validatedSize !== null) {
+          attachProcess.resize(validatedSize.cols, validatedSize.rows);
+        }
+      } else if (controlMessage.type === "ping" && socket.readyState === socket.OPEN) {
+        socket.send(PONG_FRAME);
+      }
+    } catch (error) {
+      // Catch-all for the whole handler: a throw from attachProcess.write/resize or
+      // socket.send here is a WebSocket "message" EventEmitter callback, so an uncaught
+      // exception here would otherwise crash the entire process, not just this terminal.
+      teardownAttach(socket, attachProcess, instance.id, POST_BRIDGE_FAILURE_CLOSE_CODE, (error as Error).message);
     }
   };
 

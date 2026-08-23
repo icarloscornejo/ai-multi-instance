@@ -1,6 +1,6 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { WebSocket, WebSocketServer } from "ws";
 import { registerHeartbeat, startHeartbeat } from "./heartbeat";
 
@@ -61,5 +61,35 @@ describe("heartbeat", () => {
     await sleep(150);
 
     expect(client.readyState).toBe(WebSocket.OPEN);
+  });
+
+  // Regression test for the crash the audit found: heartbeat used to call ping()/terminate()
+  // for every client inside a single try-less loop body, so one bad socket throwing (a race
+  // with its own close, an already-destroyed connection) escaped the setInterval callback
+  // uncaught - which doesn't just crash the process, it does so via the SAME callback that
+  // would otherwise have pinged every other connected terminal on this sweep too.
+  it("contains one client's failing ping()/terminate() without aborting the sweep for the others", async () => {
+    const badSocket = {
+      ping: vi.fn(() => {
+        throw new Error("EPIPE");
+      }),
+      terminate: vi.fn(() => {
+        throw new Error("terminate also failed");
+      }),
+    };
+    const goodSocket = { ping: vi.fn(), terminate: vi.fn() };
+    // startHeartbeat only touches `.clients` (a Set) and each member's ping()/terminate(), so
+    // a minimal fake server object exercises the real containment logic without opening any
+    // actual sockets.
+    const fakeServer = { clients: new Set([badSocket, goodSocket]) };
+    const stopHeartbeat = startHeartbeat(fakeServer as unknown as WebSocketServer, 10);
+    cleanup = stopHeartbeat;
+
+    await sleep(30); // several sweeps at a 10ms interval
+
+    expect(badSocket.ping).toHaveBeenCalled();
+    // The proof the sweep survived the bad socket's throw and kept going: the good socket
+    // still got pinged on the same and/or later sweeps, not just before the bad one ever ran.
+    expect(goodSocket.ping).toHaveBeenCalled();
   });
 });
