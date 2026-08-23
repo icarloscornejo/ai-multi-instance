@@ -1,13 +1,18 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { KEY_BAR_CATALOG, type KeyBarKeyId, type KeyBarPref } from "../keyBar";
 
+const ARROW_KEY_IDS: ReadonlySet<KeyBarKeyId> = new Set(["up", "down", "left", "right"]);
+
 interface KeyButtonProps {
   label: ReactNode;
   title: string;
+  // Arrow glyphs (↑↓←→) sit visually lower than text labels at the same baseline, so they get
+  // nudged up a bit more to look centered alongside the text-label keys.
+  nudgeUpPx: number;
   onPress: () => void;
 }
 
-function KeyButton({ label, title, onPress }: KeyButtonProps) {
+function KeyButton({ label, title, nudgeUpPx, onPress }: KeyButtonProps) {
   return (
     <button
       type="button"
@@ -16,9 +21,11 @@ function KeyButton({ label, title, onPress }: KeyButtonProps) {
       // dismisses the keyboard before onPress ever runs
       onPointerDown={(event) => event.preventDefault()}
       onClick={onPress}
-      className="flex h-[36px] min-w-[40px] shrink-0 items-center justify-center rounded-[6px] border border-border-strong bg-surface px-[10px] text-[12.5px] font-semibold text-txt-secondary active:bg-raised"
+      // Matches 12-mobile-terminal.html's .key: full-height, evenly divided by a border
+      // instead of individual bordered/rounded chips with gaps between them.
+      className="flex min-w-[40px] flex-1 shrink-0 items-center justify-center self-stretch border-r border-border bg-transparent px-[6px] text-[11px] font-semibold text-txt-secondary last:border-r-0 active:bg-raised"
     >
-      {label}
+      <span style={{ transform: `translateY(-${nudgeUpPx}px)` }}>{label}</span>
     </button>
   );
 }
@@ -55,14 +62,29 @@ export function MobileKeyBar({ prefs, onSendKey }: MobileKeyBarProps) {
     .filter((entry): entry is (typeof KEY_BAR_CATALOG)[number] => entry !== undefined);
 
   return (
-    <div className="flex shrink-0 items-center justify-center gap-[6px] overflow-x-auto border-t border-border bg-surface px-[8px] py-[4px] pb-[calc(4px+var(--safe-bottom))]">
-      {orderedEntries.map((entry) =>
-        entry.id === "ctrlV" ? (
-          pasteAvailable && <KeyButton key={entry.id} label={entry.label} title={entry.title} onPress={() => void paste()} />
-        ) : (
-          <KeyButton key={entry.id} label={entry.label} title={entry.title} onPress={() => onSendKey(entry.sequence!)} />
-        )
-      )}
+    // The safe-area clearance lives on this outer wrapper (pb-safe, see index.css), separate
+    // from the fixed-height row of keys below: putting both on the same box (an earlier pass
+    // did) let the safe-area padding eat into the row's own height on notched phones instead
+    // of just adding clearance underneath it.
+    <div className="flex shrink-0 flex-col border-t border-border bg-surface pb-safe">
+      <div className="flex h-[52px] items-stretch overflow-x-auto">
+        {orderedEntries.map((entry) => {
+          const nudgeUpPx: number = ARROW_KEY_IDS.has(entry.id) ? 2 : 1;
+          return entry.id === "ctrlV" ? (
+            pasteAvailable && (
+              <KeyButton key={entry.id} label={entry.label} title={entry.title} nudgeUpPx={nudgeUpPx} onPress={() => void paste()} />
+            )
+          ) : (
+            <KeyButton
+              key={entry.id}
+              label={entry.label}
+              title={entry.title}
+              nudgeUpPx={nudgeUpPx}
+              onPress={() => onSendKey(entry.sequence!)}
+            />
+          );
+        })}
+      </div>
     </div>
   );
 }

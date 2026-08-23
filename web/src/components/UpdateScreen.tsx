@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { api, ApiError } from "../api";
 import type { UpdateStatus } from "../types";
-import { btnGhost, btnPrimary, cardClassName, iconBtnClassName } from "../ui";
+import { btnGhost, btnPrimary, iconBtnClassName } from "../ui";
+import { Modal } from "./Modal";
 import { ResetConfirmModal } from "./ResetConfirmModal";
 
 interface UpdateScreenProps {
@@ -173,33 +174,28 @@ export function UpdateScreen({ initialStatus, autoApply = false, onStatusChange,
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent): void => {
-      if (event.key === "Escape") {
-        onClose();
-      }
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
+  // No Escape listener of its own: Modal's useModalEscapeStack (see Modal.tsx) already closes
+  // the topmost overlay on Escape, so with ResetConfirmModal open on top of this one, Escape
+  // closes only the reset confirmation instead of also closing Update underneath it.
 
   const busy: boolean = phase === "checking" || phase === "applying";
   const checking: boolean = phase === "checking";
   const couldNotCheck: boolean = !checking && errorMessage !== null;
 
   return (
-    <div className="flex h-screen items-center justify-center px-[16px]">
-      <div className={`w-full max-w-[580px] max-h-[90vh] overflow-y-auto ${cardClassName}`}>
-        <div className="flex items-center gap-[8px]">
-          <h1 className="text-[15px] font-bold text-txt-bright">Update</h1>
-          <button type="button" onClick={runCheck} disabled={busy} title="Check again" className={iconBtnClassName}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-[14px] w-[14px]">
-              <path d="M21 12a9 9 0 1 1-2.64-6.36" />
-              <path d="M21 3v6h-6" />
-            </svg>
-          </button>
-        </div>
-
+    <Modal
+      title="Update"
+      onClose={onClose}
+      widthClassName="w-[640px]"
+      headerActions={
+        <button type="button" onClick={runCheck} disabled={busy} title="Check again" className={iconBtnClassName}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-[14px] w-[14px]">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+            <path d="M21 3v6h-6" />
+          </svg>
+        </button>
+      }
+    >
         <div className="grid grid-cols-1 items-stretch gap-[10px] sm:grid-cols-[1fr_auto_1fr]">
           <CommitBlock
             label="Current"
@@ -300,7 +296,6 @@ export function UpdateScreen({ initialStatus, autoApply = false, onStatusChange,
             </button>
           )}
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

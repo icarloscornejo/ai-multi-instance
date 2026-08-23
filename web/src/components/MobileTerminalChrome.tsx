@@ -29,25 +29,27 @@ export function MobileTerminalChrome({
 
   return (
     <>
-      <header className="flex h-[46px] shrink-0 items-center gap-[4px] border-b border-border bg-app px-[10px]">
+      {/* Height and title size both cut ~20% from the first pass (64px/17px -&gt; 52px/14px):
+          the instance name doesn't need to read like a page title, it's a label in a toolbar. */}
+      <header className="flex h-[52px] shrink-0 items-center gap-[3px] border-b border-border px-[10px]">
         <button
           type="button"
           onClick={onBack}
           title="Back"
-          className="flex h-[30px] w-[30px] items-center justify-center rounded-sm text-txt-secondary hover:bg-raised hover:text-txt-body"
+          className="flex h-[36px] w-[36px] items-center justify-center text-txt-secondary hover:text-txt-body"
         >
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <path d="M15 18l-6-6 6-6" />
           </svg>
         </button>
-        <span className="min-w-0 flex-1 truncate px-[4px] text-[13.5px] font-semibold text-txt-bright">
+        <span className="min-w-0 flex-1 truncate px-[4px] text-[14px] font-bold tracking-[-.02em] text-txt-bright">
           {instance.label}
         </span>
         <button
           type="button"
           onClick={() => setSwitcherOpen(true)}
           title="Switch instance"
-          className="flex h-[30px] w-[30px] items-center justify-center rounded-sm text-txt-secondary hover:bg-raised hover:text-txt-body"
+          className="flex h-[36px] w-[36px] items-center justify-center text-txt-secondary hover:text-txt-body"
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <rect x="3" y="4" width="18" height="6" rx="1.5" />
@@ -58,7 +60,7 @@ export function MobileTerminalChrome({
           type="button"
           onClick={() => setOverflowOpen(true)}
           title="More"
-          className="flex h-[30px] w-[30px] items-center justify-center rounded-sm text-txt-secondary hover:bg-raised hover:text-txt-body"
+          className="flex h-[36px] w-[36px] items-center justify-center text-txt-secondary hover:text-txt-body"
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
             <circle cx="5" cy="12" r="1.8" />

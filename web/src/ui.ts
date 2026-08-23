@@ -24,12 +24,29 @@ export const btnGhost: string = `${btnBase} border border-transparent bg-transpa
 
 export const btnOutline: string = `${btnBase} border border-border-strong bg-transparent text-txt-secondary hover:border-txt-dim hover:text-txt-bright`;
 
-export const btnPrimary: string = `${btnBase} border border-accent bg-accent text-on-accent hover:brightness-[1.06]`;
+// El primario ya no es naranja: es tinta solida (negro sobre blanco en claro, blanco sobre
+// negro en oscuro), sin borde propio.
+export const btnPrimary: string = `${btnBase} bg-accent text-on-accent hover:brightness-[1.08]`;
+
+// Secundario tipo "Cancel"/"Add"/acciones del mock: borde suave sobre superficie elevada, sin
+// relleno de tinta.
+export const btnSecondary: string = `${btnBase} border border-border-strong bg-raised text-txt-body hover:border-txt-dim hover:text-txt-bright`;
 
 export const btnDanger: string = `${btnBase} border border-diff-removed bg-diff-removed text-on-accent hover:brightness-[1.06]`;
 
 export const iconBtnClassName: string =
   "flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-sm border border-border bg-surface text-txt-dim transition-colors hover:bg-raised hover:text-txt-bright disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-surface disabled:hover:text-txt-dim";
+
+// Control segmentado (Light / Dark / System, y variantes similares). segmentedClassName va en
+// el contenedor; segmentedButtonClassName(selected) en cada boton.
+export const segmentedClassName: string = "flex gap-[3px] rounded-md bg-raised-2 p-[3px]";
+
+export function segmentedButtonClassName(selected: boolean): string {
+  const base = "h-[30px] rounded-sm px-[14px] text-[12px] font-medium transition-colors";
+  return selected
+    ? `${base} bg-surface text-txt-bright shadow-[0_1px_4px_rgba(0,0,0,.08)]`
+    : `${base} bg-transparent text-txt-secondary hover:text-txt-bright`;
+}
 
 export function formatCountdown(ms: number): string {
   const totalSeconds: number = Math.max(0, Math.ceil(ms / 1000));

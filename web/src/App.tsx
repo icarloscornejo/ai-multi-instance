@@ -4,6 +4,7 @@ import { ConnectionLostScreen } from "./components/ConnectionLostScreen";
 import { DeleteConfirmModal } from "./components/DeleteConfirmModal";
 import { EmptyState } from "./components/EmptyState";
 import { GateScreen } from "./components/GateScreen";
+import { InstanceRail } from "./components/InstanceRail";
 import { MobileHome } from "./components/MobileHome";
 import { MobileKeyBar } from "./components/MobileKeyBar";
 import { MobileTerminalChrome } from "./components/MobileTerminalChrome";
@@ -12,10 +13,10 @@ import { RequiredUpdateBanner } from "./components/RequiredUpdateBanner";
 import { ServerErrorScreen } from "./components/ServerErrorScreen";
 import { SetupScreen } from "./components/SetupScreen";
 import { Sidebar } from "./components/Sidebar";
-import { TabBar } from "./components/TabBar";
 import { TerminalView, type TerminalViewHandle } from "./components/TerminalView";
 import { UpdateScreen } from "./components/UpdateScreen";
 import { useIsMobile } from "./hooks/useIsMobile";
+import { useLiveStatus } from "./hooks/useLiveStatus";
 import { useVisualViewport } from "./hooks/useVisualViewport";
 import { useWakeLock } from "./hooks/useWakeLock";
 import { useWakeRetry } from "./hooks/useWakeRetry";
@@ -84,16 +85,21 @@ export function App() {
   const [keyBarPrefs, setKeyBarPrefs] = useState<KeyBarPref[]>(getInitialKeyBarPrefs);
   const isMobile: boolean = useIsMobile();
   const [mobileScreen, setMobileScreen] = useState<"home" | "terminal">("home");
+  // True while the desktop rail has an inline rename open; suppresses the active terminal's
+  // own visibility-focus so a rename on a just-selected row doesn't lose focus to xterm two
+  // rAF later (see TerminalView's suppressAutoFocus prop).
+  const [railEditingActive, setRailEditingActive] = useState<boolean>(false);
   const terminalHandlesRef = useRef<Map<string, TerminalViewHandle>>(new Map());
   const { keyboardOpen, height: visualViewportHeight } = useVisualViewport();
   useWakeLock(isMobile && mobileScreen === "terminal");
-  const [mobileUpdateSnackbarOpen, setMobileUpdateSnackbarOpen] = useState<boolean>(false);
-  // Mirrors TabBar's popover auto-show: opens once per newly-seen remote commit, and
-  // re-dismissing with "Later" does not keep popping it back up for the same commit.
-  // Persisted to localStorage (not just a plain ref) so a full page reload, e.g. right
-  // after an update applies, does not forget a commit it already showed and reopen it.
-  const mobileSnackbarShownForCommitRef = useRef<string | null>(
-    localStorage.getItem("ccdash.mobileSnackbarShownCommit")
+
+  // Single live-status poll for the active instance, shared by the desktop session bar and
+  // the inspector (Sidebar) so both show the same branch/usage snapshot instead of each
+  // polling independently. Disabled on mobile: InstanceSettingsSheet runs its own scoped poll
+  // only while that sheet is actually open.
+  const { liveStatus: activeLiveStatus, gitBranch: activeGitBranch } = useLiveStatus(
+    activeInstanceId ?? "",
+    !isMobile && activeInstanceId !== null
   );
 
   const updateRequired: boolean =
@@ -345,18 +351,10 @@ export function App() {
     }
   }, [isMobile, mobileScreen, activeInstanceId]);
 
-  // Mobile has no toolbar to host the desktop UpdatePopover, so an optional (non-required)
-  // update instead surfaces as a bottom snackbar on the home screen
-  useEffect(() => {
-    if (!isMobile || updateRequired || updateStatus?.updateAvailable !== true || updateStatus.remoteCommit === null) {
-      return;
-    }
-    if (mobileSnackbarShownForCommitRef.current !== updateStatus.remoteCommit) {
-      mobileSnackbarShownForCommitRef.current = updateStatus.remoteCommit;
-      localStorage.setItem("ccdash.mobileSnackbarShownCommit", updateStatus.remoteCommit);
-      setMobileUpdateSnackbarOpen(true);
-    }
-  }, [isMobile, updateRequired, updateStatus]);
+  // Update is not user-reachable on mobile: no toolbar/rail to host a "check for updates"
+  // entry point there, and the small screen isn't a good fit for the commit-comparison UI.
+  // A required update still applies itself automatically via the countdown effect below,
+  // regardless of screen size; only the optional, user-initiated path is unavailable here.
 
   const enterMobileTerminal = useCallback((instanceId: string): void => {
     setActiveInstanceId(instanceId);
@@ -467,20 +465,6 @@ export function App() {
       />
     );
   }
-  if (updateViewOpen) {
-    return (
-      <UpdateScreen
-        initialStatus={updateStatus}
-        autoApply={autoApplyOnOpen}
-        onStatusChange={setUpdateStatus}
-        onClose={() => {
-          setUpdateViewOpen(false);
-          setAutoApplyOnOpen(false);
-        }}
-      />
-    );
-  }
-
   const activeInstance: Instance | undefined = instances.find(
     (candidate) => candidate.id === activeInstanceId
   );
@@ -503,27 +487,6 @@ export function App() {
           onOpenUpdateScreen={() => setUpdateViewOpen(true)}
         />
       )}
-      {!isMobile && (
-        <TabBar
-          instances={instances}
-          activeInstanceId={activeInstanceId}
-          updateStatus={updateStatus}
-          updateRequired={updateRequired}
-          countdownMs={countdownMs}
-          applying={applying}
-          onSelect={setActiveInstanceId}
-          onRename={(instanceId, newLabel) => updateInstance(instanceId, { label: newLabel })}
-          onReorder={reorderInstances}
-          onAddClick={() => setIsNewInstanceModalOpen(true)}
-          onUpdateClick={() => setUpdateViewOpen(true)}
-          onApplyNow={openUpdateScreenAndApply}
-          onSettingsClick={() => setSettingsOpen(true)}
-          onCloseRequest={setDeleteRequest}
-          theme={theme}
-          onToggleTheme={() => setThemePreference(theme === "dark" ? "light" : "dark")}
-        />
-      )}
-
       {isMobile && mobileScreen === "terminal" && activeInstance !== undefined && (
         <MobileTerminalChrome
           instance={activeInstance}
@@ -536,78 +499,93 @@ export function App() {
         />
       )}
 
-      <div className="relative flex min-h-0 flex-1">
-        {/* The terminal pool: always rendered at this exact tree position, only its
-            className toggles, so xterm never remounts when crossing the mobile/desktop
-            breakpoint or navigating between the mobile home and terminal screens. */}
-        <div
-          className={
-            isMobile && mobileScreen !== "terminal" ? "hidden" : "flex min-w-0 flex-1 flex-col"
-          }
-        >
-          {instances.length === 0 && !isMobile ? (
-            <EmptyState onNewInstance={() => setIsNewInstanceModalOpen(true)} />
-          ) : (
-            instances.map((instance) => (
-              <TerminalView
-                key={instance.id}
-                ref={(handle) => {
-                  if (handle) {
-                    terminalHandlesRef.current.set(instance.id, handle);
-                  } else {
-                    terminalHandlesRef.current.delete(instance.id);
-                  }
-                }}
-                instance={instance}
-                visible={instance.id === activeInstanceId}
-                theme={theme}
-                focusOnVisible={!isMobile}
-              />
-            ))
-          )}
-        </div>
-
-        {!isMobile && activeInstance !== undefined && (
-          <Sidebar instance={activeInstance} onUpdate={updateInstance} onDeleteRequest={setDeleteRequest} />
+      <div className="flex min-h-0 flex-1">
+        {/* Desktop rail and inspector are fixed sibling slots ({!isMobile && ...}), never a
+            wrapper the terminal pool itself moves in or out of: see the pool's own comment
+            below for why that distinction matters. */}
+        {!isMobile && (
+          <InstanceRail
+            instances={instances}
+            activeInstanceId={activeInstanceId}
+            updateStatus={updateStatus}
+            updateRequired={updateRequired}
+            countdownMs={countdownMs}
+            applying={applying}
+            onSelect={setActiveInstanceId}
+            onRename={(instanceId, newLabel) => updateInstance(instanceId, { label: newLabel })}
+            onReorder={reorderInstances}
+            onAddClick={() => setIsNewInstanceModalOpen(true)}
+            onUpdateClick={() => setUpdateViewOpen(true)}
+            onApplyNow={openUpdateScreenAndApply}
+            onSettingsClick={() => setSettingsOpen(true)}
+            onCloseRequest={setDeleteRequest}
+            theme={theme}
+            onToggleTheme={() => setThemePreference(theme === "dark" ? "light" : "dark")}
+            onEditingChange={setRailEditingActive}
+          />
         )}
 
-        {isMobile && mobileScreen === "home" && (
-          <div className="absolute inset-0 z-10 bg-app">
-            <MobileHome
-              instances={instances}
-              onOpenInstance={enterMobileTerminal}
-              onNewInstance={() => setIsNewInstanceModalOpen(true)}
-              onSettingsClick={() => setSettingsOpen(true)}
-              onDeleteRequest={setDeleteRequest}
-            />
-            {mobileUpdateSnackbarOpen && updateStatus !== null && (
-              <div className="absolute inset-x-[10px] bottom-[calc(10px+env(safe-area-inset-bottom))] z-20 flex items-center gap-[10px] rounded-lg border border-border-strong bg-surface px-[14px] py-[10px] shadow-modal">
-                <span className="h-[7px] w-[7px] shrink-0 rounded-full bg-accent" />
-                <span className="min-w-0 flex-1 truncate text-[12px] text-txt-body">
-                  Update available · {updateStatus.changelog.length} commits behind
-                </span>
-                <button
-                  type="button"
-                  onClick={() => setMobileUpdateSnackbarOpen(false)}
-                  className="shrink-0 rounded-sm px-[8px] py-[6px] text-[11.5px] font-semibold text-txt-secondary hover:bg-raised"
-                >
-                  Later
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setMobileUpdateSnackbarOpen(false);
-                    openUpdateScreenAndApply();
-                  }}
-                  className="shrink-0 rounded-sm bg-accent px-[10px] py-[6px] text-[11.5px] font-semibold text-on-accent"
-                >
-                  Update
-                </button>
+        {/* pt only on desktop: without a session bar above it anymore, the terminal was
+            sitting flush against the top edge. Mobile already has its own header
+            (MobileTerminalChrome) above the pool, so it doesn't need this. bg-terminal (not
+            the app background) so that top margin reads as part of the terminal's own white
+            surface instead of a gray strip borrowed from the app chrome behind it. */}
+        <div className={`flex min-w-0 flex-1 flex-col ${!isMobile ? "bg-terminal pt-[10px]" : ""}`}>
+          <div className="relative flex min-h-0 flex-1">
+            {/* The terminal pool: always rendered at this exact tree position, only its
+                className toggles, so xterm never remounts when crossing the mobile/desktop
+                breakpoint or navigating between the mobile home and terminal screens. */}
+            <div
+              className={
+                isMobile && mobileScreen !== "terminal" ? "hidden" : "flex min-w-0 flex-1 flex-col"
+              }
+            >
+              {instances.length === 0 && !isMobile ? (
+                <EmptyState onNewInstance={() => setIsNewInstanceModalOpen(true)} />
+              ) : (
+                instances.map((instance) => (
+                  <TerminalView
+                    key={instance.id}
+                    ref={(handle) => {
+                      if (handle) {
+                        terminalHandlesRef.current.set(instance.id, handle);
+                      } else {
+                        terminalHandlesRef.current.delete(instance.id);
+                      }
+                    }}
+                    instance={instance}
+                    visible={instance.id === activeInstanceId}
+                    theme={theme}
+                    focusOnVisible={!isMobile}
+                    suppressAutoFocus={!isMobile && railEditingActive}
+                  />
+                ))
+              )}
+            </div>
+
+            {isMobile && mobileScreen === "home" && (
+              <div className="absolute inset-0 z-10 bg-app">
+                <MobileHome
+                  instances={instances}
+                  onOpenInstance={enterMobileTerminal}
+                  onNewInstance={() => setIsNewInstanceModalOpen(true)}
+                  onSettingsClick={() => setSettingsOpen(true)}
+                  onDeleteRequest={setDeleteRequest}
+                />
               </div>
             )}
           </div>
-        )}
+        </div>
 
+        {!isMobile && activeInstance !== undefined && (
+          <Sidebar
+            instance={activeInstance}
+            liveStatus={activeLiveStatus}
+            gitBranch={activeGitBranch}
+            onUpdate={updateInstance}
+            onDeleteRequest={setDeleteRequest}
+          />
+        )}
       </div>
 
       {isMobile && mobileScreen === "terminal" && activeInstance !== undefined && (
@@ -628,6 +606,23 @@ export function App() {
           instance={deleteRequest}
           onConfirm={confirmDelete}
           onClose={() => setDeleteRequest(null)}
+        />
+      )}
+
+      {/* Approved redesign: Update is an overlay above the current app/terminal context,
+          not a full-screen replacement (see the handoff's "Update is an overlay/modal"
+          correction). The terminal pool above stays mounted and connected the whole time;
+          Modal's useFocusTrap (see Modal.tsx) is what stops a keystroke meant for this dialog
+          from still reaching the covered terminal's xterm textarea. */}
+      {updateViewOpen && (
+        <UpdateScreen
+          initialStatus={updateStatus}
+          autoApply={autoApplyOnOpen}
+          onStatusChange={setUpdateStatus}
+          onClose={() => {
+            setUpdateViewOpen(false);
+            setAutoApplyOnOpen(false);
+          }}
         />
       )}
     </div>

@@ -1,20 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { useLiveStatus } from "../hooks/useLiveStatus";
-import type { Instance, UpdateInstancePayload } from "../types";
-
-const PROVIDER_LABELS = {
-  claude: "Claude Code",
-  codex: "Codex CLI",
-  cursor: "Cursor Agent",
-  custom: "Custom command",
-} as const;
-const PROVIDER_DEFAULT_COMMANDS = { claude: "claude", codex: "codex", cursor: "agent", custom: "" } as const;
-
-const compactNumberFormatter = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 });
-
-function formatCompactNumber(value: number): string {
-  return compactNumberFormatter.format(value).toLowerCase();
-}
+import { PROVIDER_DEFAULT_COMMANDS, PROVIDER_LABELS, formatCompactNumber, usagePctColorClass } from "../liveStatusFormatting";
+import type { Instance, LiveStatus, UpdateInstancePayload } from "../types";
 
 function formatShortResetTime(epochSeconds: number): string {
   return new Date(epochSeconds * 1000).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
@@ -29,15 +15,6 @@ function formatLongResetTime(epochSeconds: number): string {
     minute: "2-digit",
     hour12: false,
   });
-}
-
-// 4-band usage severity, roughly matching common dashboard conventions
-// (green below 60%, red at 90%+), with an extra orange band between yellow and red.
-function usagePctColorClass(pct: number): string {
-  if (pct >= 90) return "text-diff-removed";
-  if (pct >= 80) return "text-status-orange";
-  if (pct >= 60) return "text-status-yellow";
-  return "text-diff-added";
 }
 
 function formatAge(isoTimestamp: string): string {
@@ -57,17 +34,24 @@ function pathToTreeLines(path: string): { text: string; depth: number }[] {
 
 interface SidebarProps {
   instance: Instance;
+  // Lifted from a single useLiveStatus call at the desktop workbench level (App.tsx) instead
+  // of polled here directly: the session bar above the terminal shows the same branch, and
+  // two independent polls would double the request traffic and could show two different
+  // snapshots for the same instance.
+  liveStatus: LiveStatus | null;
+  gitBranch: string | null;
   onUpdate: (instanceId: string, payload: UpdateInstancePayload) => void;
   onDeleteRequest: (instance: Instance) => void;
 }
 
-function FieldLabel({ children, action }: { children: string; action?: ReactNode }) {
-  return (
-    <div className="mb-[4px] flex items-center gap-[6px]">
-      <div className="text-[11px] font-semibold uppercase tracking-[.02em] text-txt-bright">{children}</div>
-      {action}
-    </div>
-  );
+// Each field sits below a top border except the very first one, matching the approved
+// inspector's rhythm (see 03-main.html's .inspector-section).
+function Section({ children }: { children: ReactNode }) {
+  return <div className="border-t border-border pt-[12px] first:border-t-0 first:pt-0">{children}</div>;
+}
+
+function Eyebrow({ children }: { children: string }) {
+  return <div className="mb-[6px] text-[10px] font-bold uppercase tracking-[.06em] text-txt-dim">{children}</div>;
 }
 
 // navigator.clipboard requires a secure context (https, or the special-cased
@@ -131,9 +115,8 @@ function CopyButton({ value, title }: { value: string; title: string }) {
   );
 }
 
-export function Sidebar({ instance, onUpdate, onDeleteRequest }: SidebarProps) {
+export function Sidebar({ instance, liveStatus, gitBranch, onUpdate, onDeleteRequest }: SidebarProps) {
   const [commandDraft, setCommandDraft] = useState<string>(instance.command);
-  const { liveStatus, gitBranch } = useLiveStatus(instance.id, true);
 
   // When switching tabs the sidebar shows a different instance: resync the draft
   useEffect(() => {
@@ -143,25 +126,28 @@ export function Sidebar({ instance, onUpdate, onDeleteRequest }: SidebarProps) {
   const liveBranch: string | undefined = liveStatus?.available === true ? liveStatus.branch ?? undefined : undefined;
 
   return (
-    <aside className="flex w-[300px] flex-none flex-col gap-[18px] overflow-y-auto border-l border-border bg-surface p-[20px_18px]">
-      <div className="border-b border-border pb-[14px] text-[13.5px] font-bold text-txt-bright">{instance.label}</div>
+    <aside className="flex w-[286px] flex-none flex-col gap-[14px] overflow-y-auto border-l border-border bg-surface p-[18px_16px]">
+      <div className="text-[13px] font-bold text-txt-bright">{instance.label}</div>
 
-      <div>
-        <FieldLabel action={<CopyButton value={instance.locationPath} title="Copy location path" />}>Location</FieldLabel>
-        <div className="rounded-sm bg-raised px-[12px] py-[10px] font-mono text-[11.5px] text-txt-secondary">
-          {pathToTreeLines(instance.locationPath).map((line, index) => (
-            <div key={index} className="break-all" style={{ paddingLeft: line.depth * 10 }}>
-              {line.text}
-            </div>
-          ))}
+      <Section>
+        <Eyebrow>Location</Eyebrow>
+        <div className="flex items-start gap-[8px]">
+          <div className="min-w-0 flex-1 font-mono text-[11px] leading-[1.5] text-txt-secondary">
+            {pathToTreeLines(instance.locationPath).map((line, index) => (
+              <div key={index} className="break-all" style={{ paddingLeft: line.depth * 10 }}>
+                {line.text}
+              </div>
+            ))}
+          </div>
+          <CopyButton value={instance.locationPath} title="Copy location path" />
         </div>
-      </div>
+      </Section>
 
-      <div>
-        <FieldLabel>Provider</FieldLabel>
-        <div className="mb-[7px] text-[12px] font-semibold text-txt-body">{PROVIDER_LABELS[instance.provider]}</div>
+      <Section>
+        <Eyebrow>Provider</Eyebrow>
+        <div className="mb-[5px] text-[12px] font-semibold text-txt-body">{PROVIDER_LABELS[instance.provider]}</div>
         <input
-          className="note-field font-mono text-[12.5px] text-txt-body"
+          className="note-field font-mono text-[12px] text-txt-body"
           value={commandDraft}
           placeholder={PROVIDER_DEFAULT_COMMANDS[instance.provider]}
           onChange={(event) => setCommandDraft(event.target.value)}
@@ -171,23 +157,28 @@ export function Sidebar({ instance, onUpdate, onDeleteRequest }: SidebarProps) {
             })
           }
         />
-      </div>
+      </Section>
 
       {liveStatus === null && (
-        <div className="text-[11px] text-txt-dimmer">Loading...</div>
+        <Section>
+          <div className="text-[11px] text-txt-dimmer">Loading...</div>
+        </Section>
       )}
       {liveStatus !== null && !liveStatus.available && (
-        <div className="text-[11px] leading-[1.5] text-txt-dimmer">
-          No live provider data yet. Session and git information will appear when {PROVIDER_LABELS[instance.provider]} exposes it.
-        </div>
+        <Section>
+          <div className="text-[11px] leading-[1.5] text-txt-dimmer">
+            No live provider data yet. Session and git information will appear when {PROVIDER_LABELS[instance.provider]} exposes it.
+          </div>
+        </Section>
       )}
 
       {(liveBranch !== undefined || gitBranch !== null) && (
-        <div>
-          <FieldLabel action={<CopyButton value={(liveBranch ?? gitBranch) as string} title="Copy branch name" />}>
-            Branch
-          </FieldLabel>
-          <div className="font-mono text-[12.5px] text-txt-body">
+        <Section>
+          <div className="mb-[6px] flex items-center justify-between">
+            <div className="text-[10px] font-bold uppercase tracking-[.06em] text-txt-dim">Branch</div>
+            <CopyButton value={(liveBranch ?? gitBranch) as string} title="Copy branch name" />
+          </div>
+          <div className="font-mono text-[12px] text-txt-body">
             {liveBranch ?? gitBranch}
             {(liveStatus?.gitAdded ?? 0) + (liveStatus?.gitRemoved ?? 0) > 0 && (
               <span>
@@ -196,97 +187,97 @@ export function Sidebar({ instance, onUpdate, onDeleteRequest }: SidebarProps) {
               </span>
             )}
           </div>
-        </div>
+        </Section>
       )}
 
       {liveStatus !== null && liveStatus.available && (
         <>
           {liveStatus.model !== undefined && (
-            <div>
-              <FieldLabel>Model</FieldLabel>
-              <div className="font-mono text-[12.5px] text-txt-body">{liveStatus.model}</div>
-            </div>
+            <Section>
+              <Eyebrow>Model</Eyebrow>
+              <div className="font-mono text-[12px] text-txt-body">{liveStatus.model}</div>
+            </Section>
           )}
 
           {liveStatus.effort !== undefined && (
-            <div>
-              <FieldLabel>Effort</FieldLabel>
-              <div className="font-mono text-[12.5px] text-txt-body">{liveStatus.effort}</div>
-            </div>
+            <Section>
+              <Eyebrow>Effort</Eyebrow>
+              <div className="font-mono text-[12px] text-txt-body">{liveStatus.effort}</div>
+            </Section>
           )}
 
           {liveStatus.contextUsed !== undefined && liveStatus.contextSize !== undefined && (
-            <div>
-              <FieldLabel>Context</FieldLabel>
-              <div className={`font-mono text-[12.5px] ${usagePctColorClass(liveStatus.contextPct ?? 0)}`}>
+            <Section>
+              <Eyebrow>Context</Eyebrow>
+              <div className={`font-mono text-[12px] ${usagePctColorClass(liveStatus.contextPct ?? 0)}`}>
                 {formatCompactNumber(liveStatus.contextUsed)}/{formatCompactNumber(liveStatus.contextSize)} ({Math.round(liveStatus.contextPct ?? 0)}%)
               </div>
-            </div>
+            </Section>
           )}
 
           {(liveStatus.inputTokens !== undefined || liveStatus.outputTokens !== undefined) && (
-            <div>
-              <FieldLabel>Tokens</FieldLabel>
-              <div className="font-mono text-[12.5px] text-txt-body">
+            <Section>
+              <Eyebrow>Tokens</Eyebrow>
+              <div className="font-mono text-[12px] text-txt-body">
                 {liveStatus.inputTokens !== undefined && `↓${formatCompactNumber(liveStatus.inputTokens)}`}
                 {liveStatus.inputTokens !== undefined && liveStatus.outputTokens !== undefined && " "}
                 {liveStatus.outputTokens !== undefined && `↑${formatCompactNumber(liveStatus.outputTokens)}`}
               </div>
-            </div>
+            </Section>
           )}
 
           {liveStatus.sessionCostUsd !== undefined && (
-            <div>
-              <FieldLabel>Session cost</FieldLabel>
-              <div className="font-mono text-[12.5px] text-txt-body">${liveStatus.sessionCostUsd.toFixed(2)}</div>
-            </div>
+            <Section>
+              <Eyebrow>Session cost</Eyebrow>
+              <div className="font-mono text-[12px] text-txt-body">${liveStatus.sessionCostUsd.toFixed(2)}</div>
+            </Section>
           )}
 
           {liveStatus.fiveHourPct != null && (
-            <div>
-              <FieldLabel>5H LIMIT</FieldLabel>
-              <div className="font-mono text-[12.5px] text-txt-body">
+            <Section>
+              <Eyebrow>5H LIMIT</Eyebrow>
+              <div className="font-mono text-[12px] text-txt-body">
                 <span className={usagePctColorClass(liveStatus.fiveHourPct)}>{Math.round(liveStatus.fiveHourPct)}%</span>
                 {liveStatus.fiveHourResetsAt != null && <span> → {formatShortResetTime(liveStatus.fiveHourResetsAt)}</span>}
               </div>
-            </div>
+            </Section>
           )}
 
           {liveStatus.sevenDayPct != null && (
-            <div>
-              <FieldLabel>7D LIMIT</FieldLabel>
-              <div className="font-mono text-[12.5px] text-txt-body">
+            <Section>
+              <Eyebrow>7D LIMIT</Eyebrow>
+              <div className="font-mono text-[12px] text-txt-body">
                 <span className={usagePctColorClass(liveStatus.sevenDayPct)}>{Math.round(liveStatus.sevenDayPct)}%</span>
                 {liveStatus.sevenDayResetsAt != null && <span> → {formatLongResetTime(liveStatus.sevenDayResetsAt)}</span>}
               </div>
-            </div>
+            </Section>
           )}
 
           {liveStatus.extraUsd != null && liveStatus.extraLimitUsd != null && (
-            <div>
-              <FieldLabel>Extra usage</FieldLabel>
+            <Section>
+              <Eyebrow>Extra usage</Eyebrow>
               <div
-                className={`font-mono text-[12.5px] ${usagePctColorClass(
+                className={`font-mono text-[12px] ${usagePctColorClass(
                   liveStatus.extraLimitUsd > 0 ? (liveStatus.extraUsd / liveStatus.extraLimitUsd) * 100 : 0,
                 )}`}
               >
                 ${liveStatus.extraUsd.toFixed(2)}/${liveStatus.extraLimitUsd.toFixed(2)}
               </div>
-            </div>
+            </Section>
           )}
 
           {liveStatus.burnPerHour != null && (
-            <div>
-              <FieldLabel>Burn</FieldLabel>
-              <div className="font-mono text-[12.5px] text-txt-body">${liveStatus.burnPerHour.toFixed(2)}/h</div>
-            </div>
+            <Section>
+              <Eyebrow>Burn</Eyebrow>
+              <div className="font-mono text-[12px] text-txt-body">${liveStatus.burnPerHour.toFixed(2)}/h</div>
+            </Section>
           )}
 
           {liveStatus.dayTotalUsd != null && (
-            <div>
-              <FieldLabel>Today</FieldLabel>
-              <div className="font-mono text-[12.5px] text-txt-body">${liveStatus.dayTotalUsd.toFixed(2)}</div>
-            </div>
+            <Section>
+              <Eyebrow>Today</Eyebrow>
+              <div className="font-mono text-[12px] text-txt-body">${liveStatus.dayTotalUsd.toFixed(2)}</div>
+            </Section>
           )}
 
           {liveStatus.updatedAt !== undefined && (
@@ -295,15 +286,13 @@ export function Sidebar({ instance, onUpdate, onDeleteRequest }: SidebarProps) {
         </>
       )}
 
-      <div className="mt-auto flex flex-col gap-[2px] border-t border-border pt-[14px]">
-        <button
-          type="button"
-          onClick={() => onDeleteRequest(instance)}
-          className="self-start rounded-sm px-[6px] py-[8px] text-[12px] font-semibold text-diff-removed hover:bg-diff-removed-dim"
-        >
-          ✕ Delete instance
-        </button>
-      </div>
+      <button
+        type="button"
+        onClick={() => onDeleteRequest(instance)}
+        className="mt-auto self-start rounded-sm border-t border-border px-[6px] py-[10px] text-[12px] font-semibold text-diff-removed hover:bg-diff-removed-dim"
+      >
+        ✕ Delete instance
+      </button>
     </aside>
   );
 }

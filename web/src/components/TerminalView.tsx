@@ -53,15 +53,17 @@ const DISCONNECTED_OVERLAY_DELAY_MS = 1_500;
 // sits harmlessly in the server's pre-attach buffer until then; a healthy but otherwise-silent
 // session would not produce any frame within HEARTBEAT_INTERVAL_MS otherwise.
 
-// ANSI palette aligned to the design tokens (xterm's defaults are too saturated)
+// ANSI palette aligned to the design tokens. The neutrals (background/foreground/cursor) mirror
+// --color-terminal/-terminal-text/-terminal-muted from index.css so the terminal surface itself
+// is monochromatic per the approved redesign; the ANSI colors (red/green/blue/...) are kept as
+// semantic content coloring, not branding, so they stay saturated and are not derived from
+// tokens.
 const terminalThemeDark: ITheme = {
-  background: "#17181a",
-  foreground: "#c8cace",
-  cursor: "#e2665e",
-  cursorAccent: "#17181a",
+  background: "#101011",
+  foreground: "#ededf0",
+  cursor: "#ededf0",
+  cursorAccent: "#101011",
   selectionBackground: "rgba(255,255,255,0.18)",
-  // Original #1e2023 was nearly invisible on the #17181a background (contrast ~1.1:1);
-  // Claude Code menus use ANSI black as text and were unreadable
   black: "#4d5058",
   red: "#c1615c",
   green: "#7ec699",
@@ -69,7 +71,7 @@ const terminalThemeDark: ITheme = {
   blue: "#7d9fc4",
   magenta: "#b491c8",
   cyan: "#7dcfb6",
-  white: "#c8cace",
+  white: "#a2a2a8",
   brightBlack: "#6b6d70",
   brightRed: "#d3766f",
   brightGreen: "#93d4ab",
@@ -82,8 +84,8 @@ const terminalThemeDark: ITheme = {
 
 const terminalThemeLight: ITheme = {
   background: "#ffffff",
-  foreground: "#26282c",
-  cursor: "#cf5147",
+  foreground: "#202124",
+  cursor: "#202124",
   cursorAccent: "#ffffff",
   selectionBackground: "rgba(0,0,0,0.14)",
   black: "#2b2c2f",
@@ -93,7 +95,7 @@ const terminalThemeLight: ITheme = {
   blue: "#3f6fa8",
   magenta: "#8a5aa8",
   cyan: "#1f8f7d",
-  white: "#5b5d62",
+  white: "#626268",
   brightBlack: "#75777c",
   brightRed: "#c1544a",
   brightGreen: "#3aa76a",
@@ -116,6 +118,12 @@ interface TerminalViewProps {
   // Mobile navigates into the terminal screen without the user having tapped inside
   // the terminal itself; auto-focusing there would pop the native keyboard unprompted
   focusOnVisible?: boolean;
+  // True while the desktop rail has an inline rename open. Selecting a row starts this
+  // instance's terminal becoming visible before the double-click that opens the rename
+  // input is even processed, so without this the visibility effect's own focus() (two rAF
+  // later, see below) steals focus back from the still-open rename field. The rail is
+  // responsible for keeping this true until the rename commits or cancels.
+  suppressAutoFocus?: boolean;
 }
 
 // tmux's mouse mode puts xterm's own touch-scroll to sleep (it only runs when
@@ -248,6 +256,7 @@ const liveTerminals = new Set<Terminal>();
 // re-trigger the same cross-terminal corruption this fix is for.
 let fontsAtlasWipeDone = false;
 
+
 function DisconnectedOverlay({
   onReconnect,
   fatalReason,
@@ -292,7 +301,7 @@ function DisconnectedOverlay({
 }
 
 export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(function TerminalView(
-  { instance, visible, theme, focusOnVisible = true },
+  { instance, visible, theme, focusOnVisible = true, suppressAutoFocus = false },
   forwardedRef
 ) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -1252,6 +1261,11 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     }
   }, [visible, hasBeenVisible]);
 
+  // Read inside the rAF callback below (not closed over directly) so a rename that opens or
+  // closes between this effect scheduling and the rAF actually firing is still respected.
+  const suppressAutoFocusRef = useRef<boolean>(suppressAutoFocus);
+  suppressAutoFocusRef.current = suppressAutoFocus;
+
   // When becoming visible again the container recovers real dimensions: re-fit and focus.
   // Double rAF because returning from Settings may leave the flex layout not yet settled
   // on the first frame (a single rAF sometimes measures the container mid-transition).
@@ -1267,13 +1281,26 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
           if (terminal !== null) {
             terminal.refresh(0, terminal.rows - 1);
           }
-          if (focusOnVisible) {
+          if (focusOnVisible && !suppressAutoFocusRef.current) {
             terminalRef.current?.focus();
           }
         });
       });
     }
   }, [visible, safeFit, focusOnVisible]);
+
+  // Selecting a rail row and double-clicking to rename it race: the click already made this
+  // instance visible (see suppressAutoFocusRef above), so once the rename actually commits or
+  // cancels, hand focus back to the terminal instead of leaving it stranded on whatever the
+  // rail did with its own input.
+  const wasSuppressingAutoFocusRef = useRef<boolean>(suppressAutoFocus);
+  useEffect(() => {
+    const wasSuppressing = wasSuppressingAutoFocusRef.current;
+    wasSuppressingAutoFocusRef.current = suppressAutoFocus;
+    if (wasSuppressing && !suppressAutoFocus && visible && focusOnVisible) {
+      terminalRef.current?.focus();
+    }
+  }, [suppressAutoFocus, visible, focusOnVisible]);
 
   const reconnect = (): void => {
     terminalRef.current?.reset();

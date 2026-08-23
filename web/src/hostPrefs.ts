@@ -23,3 +23,17 @@ export function setHostFontSize(instanceId: string, fontSize: number): void {
   map[instanceId] = fontSize;
   localStorage.setItem(FONT_SIZE_STORAGE_KEY, JSON.stringify(map));
 }
+
+// Desktop rail width (InstanceRail), same per-host-only pattern as font size above: instance
+// labels vary a lot in length, so the default width is just a starting point.
+const RAIL_WIDTH_STORAGE_KEY = "ccdash.railWidth";
+
+export function getHostRailWidth(fallback: number): number {
+  const stored: string | null = localStorage.getItem(RAIL_WIDTH_STORAGE_KEY);
+  const parsed: number = stored !== null ? Number(stored) : NaN;
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+export function setHostRailWidth(width: number): void {
+  localStorage.setItem(RAIL_WIDTH_STORAGE_KEY, String(width));
+}

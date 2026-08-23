@@ -1,7 +1,7 @@
-import "@fontsource/inter/400.css";
-import "@fontsource/inter/500.css";
-import "@fontsource/inter/600.css";
-import "@fontsource/inter/700.css";
+// The system-first redesign moved the UI font to the platform stack, but the terminal itself
+// stays on JetBrains Mono: system monospace stacks (SFMono/ui-monospace/Menlo) fall through to
+// a generic, worse-looking monospace on Android, and the terminal is the dominant surface on
+// mobile, so that fallback is the one place worth the webfont cost.
 import "@fontsource/jetbrains-mono/400.css";
 import "@fontsource/jetbrains-mono/500.css";
 import "@fontsource/jetbrains-mono/600.css";

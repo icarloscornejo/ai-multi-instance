@@ -14,11 +14,15 @@ const LONG_PRESS_MOVE_TOLERANCE_PX = 10;
 
 interface InstanceCardProps {
   instance: Instance;
+  // Only the first row in the list carries the active bar in the approved mock
+  // (11-main-mobile.html): it stands in for "most recently opened" since mobile has no
+  // persistent tab selection the way desktop does.
+  isFirst: boolean;
   onOpen: () => void;
   onLongPress: () => void;
 }
 
-export function InstanceCard({ instance, onOpen, onLongPress }: InstanceCardProps) {
+export function InstanceCard({ instance, isFirst, onOpen, onLongPress }: InstanceCardProps) {
   const [branch, setBranch] = useState<string | null>(null);
   const pressTimerRef = useRef<number | null>(null);
   const pressStartRef = useRef<{ x: number; y: number } | null>(null);
@@ -82,26 +86,23 @@ export function InstanceCard({ instance, onOpen, onLongPress }: InstanceCardProp
         }
         onOpen();
       }}
-      className="flex w-full items-center gap-[12px] rounded-lg border border-border bg-surface px-[16px] py-[14px] text-left active:bg-raised"
+      className="relative flex w-full items-center gap-[10px] border-b border-border py-[17px] pl-[14px] pr-[8px] text-left active:bg-raised"
     >
-      <div className="flex min-w-0 flex-1 flex-col gap-[6px]">
-        <span className="truncate text-[14px] font-semibold text-txt-bright">{instance.label}</span>
-        <div className="flex flex-wrap items-center gap-[6px]">
-          <span className="rounded-full border border-border-strong px-[8px] py-[2px] text-[11px] text-txt-dim">
+      <span className={`absolute bottom-[18px] left-0 top-[18px] w-[3px] rounded-full ${isFirst ? "bg-accent" : "bg-transparent"}`} />
+      <div className="min-w-0 flex-1">
+        <span className="block truncate text-[15px] font-semibold tracking-[-.015em] text-txt-bright">{instance.label}</span>
+        <div className="mt-[5px] flex flex-col gap-[3px]">
+          <span className="text-[11px] text-txt-dim">
             {PROVIDER_LABELS[instance.provider]}
             {instance.model !== null ? ` · ${instance.model}` : ""}
             {instance.effort !== null ? ` · ${instance.effort}` : ""}
           </span>
-          {branch !== null && (
-            <span className="rounded-full border border-border-strong px-[8px] py-[2px] font-mono text-[11px] text-txt-dim">
-              {branch}
-            </span>
-          )}
+          {branch !== null && <span className="font-mono text-[11px] text-txt-dim">{branch}</span>}
         </div>
       </div>
       <svg
-        width="16"
-        height="16"
+        width="15"
+        height="15"
         viewBox="0 0 24 24"
         fill="none"
         stroke="currentColor"
@@ -110,7 +111,7 @@ export function InstanceCard({ instance, onOpen, onLongPress }: InstanceCardProp
         strokeLinejoin="round"
         className="shrink-0 text-txt-dim"
       >
-        <path d="M9 18l6-6-6-6" />
+        <path d="m9 6 6 6-6 6" />
       </svg>
     </button>
   );

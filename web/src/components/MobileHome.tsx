@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { Instance } from "../types";
+import { btnPrimary } from "../ui";
 import { ActionSheet } from "./ActionSheet";
 import { InstanceCard } from "./InstanceCard";
 
@@ -22,13 +23,13 @@ export function MobileHome({
 
   return (
     <div className="flex h-full flex-col">
-      <header className="flex h-[46px] shrink-0 items-center gap-[8px] border-b border-border px-[16px]">
-        <span className="flex-1 truncate text-[15px] font-semibold text-txt-bright">AI Multi-Instance</span>
+      <header className="flex h-[64px] shrink-0 items-center gap-[8px] px-[20px]">
+        <span className="flex-1 truncate text-[20px] font-bold tracking-[-.03em] text-txt-bright">AI Multi-Instance</span>
         <button
           type="button"
           onClick={onSettingsClick}
           title="Settings"
-          className="flex h-[30px] w-[30px] items-center justify-center rounded-sm text-txt-secondary hover:bg-raised hover:text-txt-body"
+          className="flex h-[38px] w-[38px] items-center justify-center rounded-md bg-raised text-txt-secondary hover:text-txt-body"
         >
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <circle cx="12" cy="12" r="3" />
@@ -37,29 +38,24 @@ export function MobileHome({
         </button>
       </header>
 
-      <div className="flex-1 overflow-y-auto px-[16px] py-[14px]">
+      <div className="flex-1 overflow-y-auto px-[14px] pb-[96px]">
         {instances.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-[16px]">
             <span className="text-[14px] text-txt-dim">No active instances</span>
-            <button
-              type="button"
-              onClick={onNewInstance}
-              className="rounded-[6px] bg-accent px-[18px] py-[9px] text-[13px] font-semibold text-on-accent"
-            >
+            <button type="button" onClick={onNewInstance} className={btnPrimary}>
               New instance
             </button>
           </div>
         ) : (
-          <div className="flex flex-col gap-[10px]">
-            {instances.map((instance) => (
-              <InstanceCard
-                key={instance.id}
-                instance={instance}
-                onOpen={() => onOpenInstance(instance.id)}
-                onLongPress={() => setLongPressedInstance(instance)}
-              />
-            ))}
-          </div>
+          instances.map((instance, index) => (
+            <InstanceCard
+              key={instance.id}
+              instance={instance}
+              isFirst={index === 0}
+              onOpen={() => onOpenInstance(instance.id)}
+              onLongPress={() => setLongPressedInstance(instance)}
+            />
+          ))
         )}
       </div>
 
@@ -68,7 +64,7 @@ export function MobileHome({
           type="button"
           onClick={onNewInstance}
           title="New instance"
-          className="fixed bottom-[calc(24px+env(safe-area-inset-bottom))] right-[20px] flex h-[52px] w-[52px] items-center justify-center rounded-full bg-accent text-[24px] font-semibold leading-none text-on-accent shadow-modal"
+          className="fixed bottom-[calc(22px+env(safe-area-inset-bottom))] right-[18px] flex h-[52px] w-[52px] items-center justify-center rounded-lg bg-accent text-[24px] font-semibold leading-none text-on-accent shadow-modal"
         >
           +
         </button>

@@ -1,36 +1,51 @@
 @import "tailwindcss";
 @import "@xterm/xterm/css/xterm.css";
 
+/* Sistema visual monocromatico (redisenio aprobado, ver
+   ~/Downloads/ai-multi-instance-claude-code-handoff/CLAUDE_CODE_IMPLEMENTATION.md). Se
+   conserva la mecanica existente: oscuro vive en @theme (default antes de que theme.ts
+   decida), :root.light lo invierte. Claro pasa a ser la preferencia por defecto en
+   theme.ts (getInitialThemePreference ya devuelve "light"), pero el mecanismo de clases no
+   cambia para no tocar theme.ts. */
 @theme {
-  --color-app: oklch(21% 0.004 50);
-  --color-surface: oklch(25% 0.004 50);
-  --color-raised: oklch(29% 0.005 50);
-  --color-raised-2: oklch(33% 0.006 50);
-  --color-overlay: rgba(10, 9, 8, 0.6);
-  --color-accent: oklch(70% 0.15 38);
-  --color-accent-dim: oklch(70% 0.15 38 / 0.14);
-  --color-accent-border: oklch(70% 0.15 38 / 0.4);
-  --color-on-accent: oklch(18% 0.02 38);
-  --color-txt-primary: oklch(96% 0.004 50);
-  --color-txt-bright: oklch(96% 0.004 50);
-  --color-txt-secondary: oklch(70% 0.007 50);
-  --color-txt-body: oklch(83% 0.006 50);
-  --color-txt-dim: oklch(54% 0.007 50);
-  --color-txt-dimmer: oklch(43% 0.007 50);
-  --color-txt-placeholder: oklch(43% 0.007 50);
-  --color-diff-added: oklch(72% 0.15 148);
-  --color-diff-removed: oklch(66% 0.17 24);
-  --color-diff-removed-dim: oklch(66% 0.17 24 / 0.14);
-  --color-diff-removed-border: oklch(66% 0.17 24 / 0.4);
-  --color-status-yellow: oklch(80% 0.16 95);
-  --color-status-orange: oklch(72% 0.17 55);
-  --color-border: oklch(96% 0.005 50 / 0.08);
-  --color-border-strong: oklch(96% 0.005 50 / 0.18);
-  --radius-sm: 6px;
-  --radius-md: 10px;
-  --radius-lg: 14px;
-  --shadow-modal: 0 1px 2px rgba(0, 0, 0, 0.3), 0 16px 40px rgba(0, 0, 0, 0.45);
-  --font-ui: "Inter", system-ui, sans-serif;
+  --color-app: #0b0b0c;
+  --color-surface: #151516;
+  --color-raised: #1b1b1d;
+  --color-raised-2: #242426;
+  --color-overlay: rgba(0, 0, 0, 0.28);
+  --color-accent: #f5f5f7;
+  --color-accent-dim: rgba(245, 245, 247, 0.08);
+  --color-accent-border: #7f7f86;
+  --color-on-accent: #0b0b0c;
+  --color-soft: rgba(255, 255, 255, 0.075);
+  --color-txt-primary: #f5f5f7;
+  --color-txt-bright: #f5f5f7;
+  --color-txt-secondary: #b8b8bd;
+  --color-txt-body: #b8b8bd;
+  --color-txt-dim: #7f7f86;
+  --color-txt-dimmer: #7f7f86;
+  --color-txt-placeholder: #7f7f86;
+  --color-diff-added: #65b37a;
+  --color-diff-removed: #de686c;
+  --color-diff-removed-dim: rgba(222, 104, 108, 0.14);
+  --color-diff-removed-border: rgba(222, 104, 108, 0.4);
+  --color-status-yellow: #d0a04b;
+  --color-status-warn: #d0a04b;
+  --color-border: rgba(255, 255, 255, 0.085);
+  --color-border-strong: rgba(255, 255, 255, 0.15);
+  --color-terminal: #101011;
+  --color-terminal-text: #ededf0;
+  --color-terminal-muted: #a2a2a8;
+  --radius-sm: 9px;
+  --radius-md: 12px;
+  --radius-lg: 15px;
+  --radius-xl: 18px;
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.24), 0 10px 30px rgba(0, 0, 0, 0.27);
+  --shadow-2: 0 2px 6px rgba(0, 0, 0, 0.32), 0 24px 70px rgba(0, 0, 0, 0.36);
+  --shadow-modal: var(--shadow-2);
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", system-ui, sans-serif;
+  /* JetBrains Mono, not the system stack: see main.tsx's import comment. Android has no
+     SFMono/Menlo/Monaco and falls through to a much plainer generic monospace. */
   --font-mono: "JetBrains Mono", ui-monospace, monospace;
 }
 
@@ -43,31 +58,37 @@
    para que el toggle manual del usuario tenga la ultima palabra. */
 :root.light {
   color-scheme: light;
-  --color-app: oklch(97% 0.004 50);
-  --color-surface: oklch(99% 0.002 50);
-  --color-raised: oklch(94% 0.005 50);
-  --color-raised-2: oklch(90% 0.006 50);
-  --color-overlay: rgba(30, 26, 22, 0.35);
-  --color-accent: oklch(58% 0.16 38);
-  --color-accent-dim: oklch(58% 0.16 38 / 0.12);
-  --color-accent-border: oklch(58% 0.16 38 / 0.45);
-  --color-on-accent: oklch(99% 0.01 38);
-  --color-txt-primary: oklch(20% 0.006 50);
-  --color-txt-bright: oklch(20% 0.006 50);
-  --color-txt-secondary: oklch(45% 0.008 50);
-  --color-txt-body: oklch(32% 0.007 50);
-  --color-txt-dim: oklch(56% 0.008 50);
-  --color-txt-dimmer: oklch(64% 0.008 50);
-  --color-txt-placeholder: oklch(64% 0.008 50);
-  --color-diff-added: oklch(52% 0.14 148);
-  --color-diff-removed: oklch(55% 0.18 24);
-  --color-diff-removed-dim: oklch(55% 0.18 24 / 0.1);
-  --color-diff-removed-border: oklch(55% 0.18 24 / 0.45);
-  --color-status-yellow: oklch(65% 0.16 95);
-  --color-status-orange: oklch(58% 0.17 55);
-  --color-border: oklch(20% 0.006 50 / 0.1);
-  --color-border-strong: oklch(20% 0.006 50 / 0.2);
-  --shadow-modal: 0 1px 2px rgba(20, 16, 12, 0.06), 0 16px 40px rgba(20, 16, 12, 0.12);
+  --color-app: #f5f5f7;
+  --color-surface: #ffffff;
+  --color-raised: #fafafa;
+  --color-raised-2: #efeff1;
+  --color-overlay: rgba(0, 0, 0, 0.28);
+  --color-accent: #111113;
+  --color-accent-dim: rgba(17, 17, 19, 0.06);
+  --color-accent-border: #86868b;
+  --color-on-accent: #ffffff;
+  --color-soft: rgba(0, 0, 0, 0.055);
+  --color-txt-primary: #1d1d1f;
+  --color-txt-bright: #1d1d1f;
+  --color-txt-secondary: #5b5b61;
+  --color-txt-body: #5b5b61;
+  --color-txt-dim: #86868b;
+  --color-txt-dimmer: #86868b;
+  --color-txt-placeholder: #86868b;
+  --color-diff-added: #2f7d4a;
+  --color-diff-removed: #b33f43;
+  --color-diff-removed-dim: rgba(179, 63, 67, 0.1);
+  --color-diff-removed-border: rgba(179, 63, 67, 0.45);
+  --color-status-yellow: #9a6818;
+  --color-status-warn: #9a6818;
+  --color-border: rgba(0, 0, 0, 0.085);
+  --color-border-strong: rgba(0, 0, 0, 0.14);
+  --color-terminal: #ffffff;
+  --color-terminal-text: #202124;
+  --color-terminal-muted: #626268;
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.055);
+  --shadow-2: 0 2px 5px rgba(0, 0, 0, 0.06), 0 20px 60px rgba(0, 0, 0, 0.11);
+  --shadow-modal: var(--shadow-2);
 }
 
 :root {
@@ -122,19 +143,20 @@ textarea::placeholder {
   resize: none;
 }
 
-/* Franja de tabs: scrollbar fina, visible solo al hover para no comer los 46px del header */
-.tab-scroll {
+/* Lista de instancias del rail vertical: scrollbar fina, visible solo al hover para no
+   competir visualmente con los items */
+.rail-scroll {
   scrollbar-width: thin;
   scrollbar-color: var(--color-border-strong) transparent;
 }
-.tab-scroll::-webkit-scrollbar {
-  height: 4px;
+.rail-scroll::-webkit-scrollbar {
+  width: 4px;
 }
-.tab-scroll::-webkit-scrollbar-thumb {
+.rail-scroll::-webkit-scrollbar-thumb {
   background: transparent;
   border-radius: 2px;
 }
-.tab-scroll:hover::-webkit-scrollbar-thumb {
+.rail-scroll:hover::-webkit-scrollbar-thumb {
   background: var(--color-border-strong);
 }
 

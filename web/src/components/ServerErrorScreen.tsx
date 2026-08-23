@@ -4,7 +4,10 @@ export function ServerErrorScreen() {
   return (
     <div className="flex h-screen items-center justify-center">
       <div className="flex w-full max-w-[580px] min-h-[320px] flex-col items-center justify-center gap-[18px] rounded-lg border border-border bg-app p-[40px] mx-[16px]">
-        <RetryRing size={64} tone="danger">
+        {/* Server Error is monochromatic per the approved redesign: the "danger" (red) tone
+            stays reserved for in-terminal disconnect states, not this initial-load screen.
+            The error is communicated by copy and iconography, not by color. */}
+        <RetryRing size={64} tone="accent">
           <svg
             viewBox="0 0 24 24"
             fill="none"

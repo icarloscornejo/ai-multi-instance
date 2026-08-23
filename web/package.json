@@ -1,6 +1,6 @@
 {
   "name": "@ai-multi-instance/web",
-  "version": "1.13.6",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -14,7 +14,6 @@
     "@dnd-kit/modifiers": "^9.0.0",
     "@dnd-kit/sortable": "^10.0.0",
     "@dnd-kit/utilities": "^3.2.2",
-    "@fontsource/inter": "^5.1.0",
     "@fontsource/jetbrains-mono": "^5.1.0",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/addon-webgl": "^0.19.0",

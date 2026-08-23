@@ -1,29 +1,8 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { useLiveStatus } from "../hooks/useLiveStatus";
+import { PROVIDER_DEFAULT_COMMANDS, PROVIDER_LABELS, formatCompactNumber, usagePctColorClass } from "../liveStatusFormatting";
 import type { Instance, UpdateInstancePayload } from "../types";
 import { BottomSheet } from "./BottomSheet";
-
-const PROVIDER_LABELS = {
-  claude: "Claude Code",
-  codex: "Codex CLI",
-  cursor: "Cursor Agent",
-  custom: "Custom command",
-} as const;
-const PROVIDER_DEFAULT_COMMANDS = { claude: "claude", codex: "codex", cursor: "agent", custom: "" } as const;
-
-const compactNumberFormatter = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 });
-
-function formatCompactNumber(value: number): string {
-  return compactNumberFormatter.format(value).toLowerCase();
-}
-
-// 4-band usage severity, matching the same convention as the desktop Sidebar
-function usagePctColorClass(pct: number): string {
-  if (pct >= 90) return "text-diff-removed";
-  if (pct >= 80) return "text-status-orange";
-  if (pct >= 60) return "text-status-yellow";
-  return "text-diff-added";
-}
 
 interface InstanceSettingsSheetProps {
   instance: Instance;

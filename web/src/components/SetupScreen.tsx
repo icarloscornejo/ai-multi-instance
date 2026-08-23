@@ -27,7 +27,6 @@ import {
   btnGhost,
   btnOutline,
   btnPrimary,
-  cardClassName,
   errorTextClassName,
   hintTextClassName,
   inputClassName,
@@ -182,6 +181,8 @@ function TunnelQr({ url }: { url: string }) {
       alt="QR code for the public tunnel URL"
       width={180}
       height={180}
+      // Deliberately literal white, not a theme token: this is the QR's quiet zone, and
+      // scanners need it to stay white regardless of dark mode for reliable decoding.
       className="rounded-sm border border-border-strong bg-white p-[8px]"
     />
   );
@@ -653,16 +654,45 @@ export function SetupScreen({
   // Above ~900px there's room to split into two columns (Locations/Agents/LAN on the left,
   // Remote access on the right) instead of one long scrolling column; below that, or on
   // mobile devices (which never render the LAN/Tunnel columns), stay single-column.
-  const cardWidthClassName: string = isMobile
-    ? "w-full max-w-[520px]"
-    : "w-full max-w-[520px] min-[900px]:max-w-[min(92vw,1280px)]";
   const contentLayoutClassName: string = isMobile
     ? "flex flex-col gap-[18px]"
     : "flex flex-col gap-[18px] min-[900px]:grid min-[900px]:grid-cols-2 min-[900px]:items-start min-[900px]:gap-x-[80px] min-[900px]:gap-y-0";
 
   return (
-    <div className="flex h-screen items-center justify-center px-[16px]">
-      <div className={`max-h-[90vh] overflow-y-auto ${cardWidthClassName} ${cardClassName}`}>
+    // h-dvh-full (a hard viewport height), not min-h: with min-height the outer flex column
+    // could grow taller than the viewport on a long form, and then the WHOLE page scrolls
+    // (header included) instead of just the content below it. Capping the outer height and
+    // keeping only the content div scrollable is what pins the pagebar in place.
+    <div className="flex h-dvh-full flex-col bg-app">
+      {/* Full-page pagebar, replacing the old centered floating card: matches the approved
+          05-settings.html composition. Cancel/Save live here instead of at the bottom of the
+          form so they stay reachable without scrolling on a long Setup/Settings page. */}
+      <header className="flex h-[64px] shrink-0 items-center gap-[10px] border-b border-border bg-surface px-[20px] sm:px-[28px]">
+        <strong className="text-[15px] font-semibold text-txt-bright">{onClose !== undefined ? "Settings" : "Setup"}</strong>
+        <div className="flex-1" />
+        {errorCount > 0 && (
+          <span className="hidden text-[11px] text-diff-removed sm:inline">
+            Fix the {errorCount} error{errorCount === 1 ? "" : "s"} above to save
+          </span>
+        )}
+        {onClose !== undefined && (
+          <button type="button" onClick={onClose} className={btnGhost}>
+            Cancel
+          </button>
+        )}
+        <button type="button" onClick={() => void handleSave()} disabled={!canSave || saving} className={btnPrimary}>
+          {saving ? "Saving..." : "Save"}
+        </button>
+      </header>
+
+      <div className="flex-1 overflow-y-auto">
+        <div className="mx-auto max-w-[1100px] px-[20px] py-[28px] sm:px-[34px] sm:py-[42px]">
+          {errorMessage !== null && <div className={`mb-[18px] ${errorTextClassName}`}>{errorMessage}</div>}
+          {errorCount > 0 && (
+            <div className="mb-[14px] text-[11px] text-diff-removed sm:hidden">
+              Fix the {errorCount} error{errorCount === 1 ? "" : "s"} above to save
+            </div>
+          )}
         <div className={contentLayoutClassName}>
           <div className="flex min-w-0 flex-col gap-[18px]">
             <div className="flex flex-col gap-[4px]">
@@ -806,25 +836,6 @@ export function SetupScreen({
             </div>
           )}
         </div>
-
-        {errorMessage !== null && <div className={errorTextClassName}>{errorMessage}</div>}
-
-        <div className="flex items-center justify-between gap-[10px]">
-          {errorCount > 0 && (
-            <span className="text-[11px] text-diff-removed">
-              Fix the {errorCount} error{errorCount === 1 ? "" : "s"} above to save
-            </span>
-          )}
-          <div className="ml-auto flex gap-[10px]">
-            {onClose !== undefined && (
-              <button type="button" onClick={onClose} className={btnGhost}>
-                Cancel
-              </button>
-            )}
-            <button type="button" onClick={() => void handleSave()} disabled={!canSave || saving} className={btnPrimary}>
-              {saving ? "Saving..." : "Save"}
-            </button>
-          </div>
         </div>
       </div>
     </div>

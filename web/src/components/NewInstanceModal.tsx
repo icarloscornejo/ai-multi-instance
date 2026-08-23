@@ -265,7 +265,7 @@ export function NewInstanceModal({ instances, enabledProviders, onCreate, onClos
                   }}
                   className={`rounded-sm border px-[10px] py-[9px] text-left text-[12px] ${
                     provider === option.value
-                      ? "border-accent bg-accent/10 font-semibold text-txt-bright"
+                      ? "border-accent bg-soft font-semibold text-txt-bright"
                       : "border-border-strong bg-app text-txt-secondary hover:bg-raised"
                   } disabled:opacity-40`}
                 >

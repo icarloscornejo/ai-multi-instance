@@ -27,9 +27,9 @@ function syncThemeColorMeta(theme: Theme): void {
   if (themeColorMeta === null) {
     return;
   }
-  // Hex values mirror --color-app in index.css for dark/light (oklch tokens are not
-  // directly usable by the browser chrome/status bar, which reads this meta as a color)
-  themeColorMeta.content = theme === "light" ? "#f7f6f5" : "#1c1b1a";
+  // Hex values mirror --color-app in index.css for light/dark (kept as literal hex since
+  // this meta tag is read by the browser chrome/status bar, not by CSS)
+  themeColorMeta.content = theme === "light" ? "#f5f5f7" : "#0b0b0c";
 }
 
 export function applyTheme(theme: Theme): void {
