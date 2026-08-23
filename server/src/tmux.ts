@@ -5,12 +5,26 @@ const execFileAsync = promisify(execFile);
 
 export class TmuxError extends Error {}
 
+// A tmux command hanging forever (a wedged tmux server, a slow filesystem the shell's
+// startup files touch) used to hold a WebSocket attach open indefinitely: the client's own
+// watchdog would eventually give up (see LIVENESS_TIMEOUT_MS in TerminalView.tsx) and start
+// a fresh attach on top of the still-running one, accumulating orphaned tmux child
+// processes across reconnects. Deliberately well under that 25s client timeout so a hung
+// command is killed and surfaces as a normal recoverable failure (see
+// closeCodeForAttachError) long before the client would otherwise abandon the socket.
+const DEFAULT_TMUX_TIMEOUT_MS = 10_000;
+
 // Note: the "=" exact-match prefix is not used because in tmux 3.7 several commands
 // (set-option, send-keys) do not resolve it. The ccdash-<id> names never collide on
 // prefix with each other, and tmux always prefers the exact name match.
-async function runTmux(tmuxArguments: string[]): Promise<string> {
+async function runTmux(tmuxArguments: string[], timeoutMs: number = DEFAULT_TMUX_TIMEOUT_MS): Promise<string> {
   try {
-    const { stdout } = await execFileAsync("tmux", tmuxArguments);
+    // execFile's own `timeout` option sends SIGTERM to the child once it elapses and
+    // rejects the promise; Node reports this as an ETIMEDOUT-ish error with `killed: true`
+    // rather than a distinct error class, but that's fine here - it's caught below and
+    // wrapped in TmuxError like any other tmux failure, which the attach path already
+    // treats as recoverable (see closeCodeForAttachError in attachErrors.ts).
+    const { stdout } = await execFileAsync("tmux", tmuxArguments, { timeout: timeoutMs });
     return stdout.trim();
   } catch (error) {
     const stderr: string = ((error as { stderr?: string }).stderr ?? "").trim();

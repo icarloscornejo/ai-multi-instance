@@ -6,7 +6,7 @@ import { api } from "../api";
 import { useIsMobile } from "../hooks/useIsMobile";
 import { useWakeRetry } from "../hooks/useWakeRetry";
 import { getHostFontSize, setHostFontSize } from "../hostPrefs";
-import { retryDelayMs } from "../retry";
+import { INITIAL_RECONNECT_STATE, reduceConnection, type ReconnectState } from "../reconnectPolicy";
 import { btnGhost } from "../ui";
 import { RetryRing } from "./RetryRing";
 import type { Instance } from "../types";
@@ -45,10 +45,13 @@ const CONNECT_TIMEOUT_MS = 8_000;
 // disconnected" for a reconnect that completes in a few hundred ms is just noise. A real
 // outage still shows it soon enough to matter.
 const DISCONNECTED_OVERLAY_DELAY_MS = 1_500;
-// Close codes the server only sends for conditions that will not clear on their own (see
-// index.ts): the instance was removed from the registry, the server ran out of ptys, or the
-// instance's folder is gone. Auto-retrying against these just repeats the same failure.
-const NON_RECOVERABLE_CLOSE_CODES = new Set<number>([4004, 4005]);
+// Application-level ping sent the instant the socket opens (before the server has even
+// spawned the pty), purely to get a bridgeReady signal deterministically: see the
+// "bridgeReady" event dispatched from onmessage below and reconnectPolicy.ts's comment on
+// why attachStreak cannot reset on "open" alone. The server only registers its own message
+// handler (which is what answers ping with a pong) after a successful attach, so this ping
+// sits harmlessly in the server's pre-attach buffer until then; a healthy but otherwise-silent
+// session would not produce any frame within HEARTBEAT_INTERVAL_MS otherwise.
 
 // ANSI palette aligned to the design tokens (xterm's defaults are too saturated)
 const terminalThemeDark: ITheme = {
@@ -250,9 +253,10 @@ function DisconnectedOverlay({
   fatalReason,
 }: {
   onReconnect: () => void;
-  // Present only for a close code that will not clear on retry (see NON_RECOVERABLE_CLOSE_CODES):
-  // swaps the tone to danger, stops the ring spinning (nothing is actually in progress), and
-  // shows the server's actual reason instead of the generic auto-retry copy.
+  // Present only for a close code that will not clear on retry (see FATAL_CLOSE_CODES in
+  // reconnectPolicy.ts): swaps the tone to danger, stops the ring spinning (nothing is
+  // actually in progress), and shows the server's actual reason instead of the generic
+  // auto-retry copy.
   fatalReason: string | null;
 }) {
   const tone: "accent" | "danger" = fatalReason !== null ? "danger" : "accent";
@@ -298,8 +302,14 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   const socketRef = useRef<WebSocket | null>(null);
   const persistTimerRef = useRef<number | null>(null);
   // Lives outside the connection effect (which reruns on every connectionEpoch bump) so the
-  // backoff keeps counting across reconnect attempts instead of resetting each time.
-  const reconnectAttemptRef = useRef<number>(0);
+  // backoff keeps counting across reconnect attempts instead of resetting each time. This is
+  // the ONLY place normalAttempt/attachStreak/fatalReason/transientNotice are written; every
+  // callback below (onopen, onmessage, onclose, wake, manual reconnect) goes through
+  // reduceConnection instead of mutating a counter directly. That single-writer rule is what
+  // makes reconnectPolicy.test.ts meaningful: while any callback could still reach in and
+  // reset a counter on its own, the original bug (backoff never growing because onopen reset
+  // it) could always be reintroduced with every reducer test still green.
+  const reconnectStateRef = useRef<ReconnectState>(INITIAL_RECONNECT_STATE);
   // performance.now() of the last sign of life on the current socket while OPEN (real output,
   // a heartbeat pong); read by both the heartbeat interval below and the wake-retry override
   // to tell a genuinely live socket apart from a zombie one still reporting OPEN.
@@ -323,8 +333,14 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   // Non-null only for close codes the server sends when retrying can never succeed on its
   // own (4004 unknown instance, 4005 out-of-ptys/missing folder, see index.ts). The reason
   // string, when the server sent one, is what DisconnectedOverlay shows instead of "Retrying
-  // automatically..."; retry scheduling is skipped entirely for these.
+  // automatically..."; retry scheduling is skipped entirely for these. Mirrors
+  // reconnectStateRef.current.fatalReason; kept as separate React state purely so it
+  // re-renders the overlay (the ref itself is not observed by React).
   const [fatalDisconnectReason, setFatalDisconnectReason] = useState<string | null>(null);
+  // Non-blocking notice for a discarded-input close (4007, see reconnectPolicy.ts). Distinct
+  // from fatalDisconnectReason: the connection keeps retrying normally, this only tells the
+  // user some typed input never made it to the server.
+  const [transientNotice, setTransientNotice] = useState<string | null>(null);
   const [connectionEpoch, setConnectionEpoch] = useState<number>(0);
   // On mobile every instance mounts hidden (display: none) in the always-rendered pool, so
   // fit() measures a zero-width container and the socket would open with xterm's 80x24
@@ -409,6 +425,19 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     }),
     []
   );
+
+  // The single point where reconnectStateRef is written (see its declaration above): every
+  // caller below hands this an event instead of touching the counters directly, and reads
+  // back only the effect it needs (a retry delay). fatalDisconnectReason/transientNotice are
+  // mirrored into React state here so the overlay re-renders; reconnectStateRef itself stays
+  // a plain ref since nothing else needs a render off of normalAttempt/attachStreak changing.
+  const applyConnectionEvent = useCallback((event: Parameters<typeof reduceConnection>[1]) => {
+    const { state, effect } = reduceConnection(reconnectStateRef.current, event);
+    reconnectStateRef.current = state;
+    setFatalDisconnectReason(state.fatalReason);
+    setTransientNotice(state.transientNotice);
+    return effect;
+  }, []);
 
   const safeFit = useCallback((): void => {
     const container = containerRef.current;
@@ -1088,13 +1117,19 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       socket.send(JSON.stringify({ type: "ping" }));
     }, HEARTBEAT_INTERVAL_MS);
 
+    // See attachStreak's comment in reconnectPolicy.ts: this fires exactly once per
+    // connection attempt, the moment ANY frame (string output or the binary pong) arrives,
+    // and is the only proof that the server's bridge actually came up. Guards against
+    // calling applyConnectionEvent on every subsequent message, which would be harmless
+    // (bridgeReady is idempotent) but pointless.
+    let bridgeReadySignaled = false;
+
     socket.onopen = () => {
       window.clearTimeout(connectTimeoutId);
       window.clearTimeout(disconnectedOverlayTimeoutIdRef.current);
-      reconnectAttemptRef.current = 0;
+      applyConnectionEvent({ kind: "open" });
       lastActivityAtRef.current = performance.now();
       setDisconnected(false);
-      setFatalDisconnectReason(null);
       safeFit();
       const terminal = terminalRef.current;
       if (terminal !== null) {
@@ -1104,9 +1139,21 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
         // showing whatever was on screen before the drop.
         terminal.refresh(0, terminal.rows - 1);
       }
+      // Sent immediately, before the server could possibly have finished attaching (it
+      // spawns the pty and registers its message handler only after a successful attach,
+      // see bridgeTerminal in server/src/terminal.ts). This ping sits in the server's
+      // pre-attach buffer until then, so the pong that eventually comes back is a
+      // deterministic bridgeReady signal even for a session that produces no output on its
+      // own - without this, a silent session would leave attachStreak stale until the next
+      // HEARTBEAT_INTERVAL_MS tick, or forever if the socket drops before that.
+      socket.send(JSON.stringify({ type: "ping" }));
     };
     socket.onmessage = (event: MessageEvent) => {
       lastActivityAtRef.current = performance.now();
+      if (!bridgeReadySignaled) {
+        bridgeReadySignaled = true;
+        applyConnectionEvent({ kind: "bridgeReady" });
+      }
       if (typeof event.data === "string") {
         // Apple Color Emoji has no art at all for U+23F5 (auto-accept), so without this
         // swap iOS draws nothing there, not even a fallback emoji. U+25B6/U+25CF are
@@ -1120,16 +1167,22 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
         });
       }
       // A binary frame is the server's heartbeat pong (see terminal.ts): it carries no
-      // terminal output, updating lastActivityAtRef above is its entire purpose.
+      // terminal output, updating lastActivityAtRef (and bridgeReadySignaled) above is its
+      // entire purpose.
     };
     // A real disconnect (server restart from tsx watch, self-update, etc.) keeps retrying
     // on a growing backoff instead of stranding the user on the manual Reconnect button
     let reconnectTimeoutId: number | undefined;
     socket.onclose = (event: CloseEvent) => {
-      if (NON_RECOVERABLE_CLOSE_CODES.has(event.code)) {
-        // No point debouncing behind DISCONNECTED_OVERLAY_DELAY_MS: this is a final state,
-        // not a drop that might resolve itself in the next few hundred ms.
-        setFatalDisconnectReason(event.reason || "This session cannot be restored.");
+      const { retryDelayMs: delayMs } = applyConnectionEvent({
+        kind: "close",
+        code: event.code,
+        reason: event.reason,
+      });
+      if (delayMs === null) {
+        // Fatal (4004/4005, see reconnectPolicy.ts): no point debouncing behind
+        // DISCONNECTED_OVERLAY_DELAY_MS, this is a final state, not a drop that might
+        // resolve itself in the next few hundred ms.
         setDisconnected(true);
         return;
       }
@@ -1138,8 +1191,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       }, DISCONNECTED_OVERLAY_DELAY_MS);
       reconnectTimeoutId = window.setTimeout(() => {
         setConnectionEpoch((previousEpoch) => previousEpoch + 1);
-      }, retryDelayMs(reconnectAttemptRef.current));
-      reconnectAttemptRef.current += 1;
+      }, delayMs);
     };
 
     return () => {
@@ -1175,7 +1227,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
         return;
       }
     }
-    reconnectAttemptRef.current = 0;
+    applyConnectionEvent({ kind: "wake" });
     if (socket !== null && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) {
       // Past its own timeout/liveness window: force a real "close" so the effect's
       // onclose-driven backoff (now reset to attempt 0, so it fires almost immediately)
@@ -1225,7 +1277,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
 
   const reconnect = (): void => {
     terminalRef.current?.reset();
-    reconnectAttemptRef.current = 0;
+    applyConnectionEvent({ kind: "manualReconnect" });
     setConnectionEpoch((previousEpoch) => previousEpoch + 1);
   };
 
@@ -1257,6 +1309,15 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
           style={{ touchAction: "none", willChange: "transform" }}
         />
         {disconnected && <DisconnectedOverlay onReconnect={reconnect} fatalReason={fatalDisconnectReason} />}
+        {/* Non-blocking: a 4007 close (see reconnectPolicy.ts) means some input was dropped
+            but the connection is still retrying normally, possibly without ever showing the
+            full DisconnectedOverlay at all (see DISCONNECTED_OVERLAY_DELAY_MS). Shown
+            independently of `disconnected` so the user actually sees it. */}
+        {transientNotice !== null && (
+          <div className="absolute top-[10px] left-1/2 -translate-x-1/2 rounded-md border border-border-strong bg-surface px-[12px] py-[6px] text-[11.5px] text-txt-dim shadow-lg">
+            {transientNotice}
+          </div>
+        )}
         {showScrollToBottom && (
           <button
             type="button"

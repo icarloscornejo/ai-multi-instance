@@ -4,11 +4,21 @@ import path from "node:path";
 import express, { type Request, type Response, type NextFunction } from "express";
 import { WebSocketServer, type WebSocket, type RawData } from "ws";
 import { AUTH_COOKIE_NAME, isAuthEnabled, readCookie, verifyToken } from "./auth";
+import { AttachCancelledError, closeCodeForAttachError, recordAttachFailure, recordAttachSuccess } from "./attachErrors";
+import { createAttachBuffer } from "./attachBuffer";
 import { registerHeartbeat, startHeartbeat } from "./heartbeat";
 import { apiRouter } from "./routes";
 import { loadState } from "./store";
-import { bridgeTerminal, LocationMissingError, TooManyPtysError } from "./terminal";
+import { bridgeTerminal } from "./terminal";
 import type { DashboardState } from "./types";
+
+// Close code for "the pre-attach input buffer overflowed" (see attachBuffer.ts). Deliberately
+// NOT one of the codes closeCodeForAttachError produces: an overflow is not an attach
+// failure - the attach could well have succeeded moments later - so it must not feed the
+// client's slow attachStreak backoff (see web/src/reconnectPolicy.ts). It gets the normal
+// reconnect cadence instead.
+const INPUT_OVERFLOW_CLOSE_CODE = 4007;
+const INPUT_OVERFLOW_REASON = "Some input was discarded and could not be sent.";
 
 const serverPort: number = Number(process.env.PORT ?? 3001);
 const serverHost: string = process.env.HOST ?? "127.0.0.1";
@@ -78,16 +88,36 @@ httpServer.on("upgrade", (request, socket, head) => {
   function completeUpgrade(): void {
     webSocketServer.handleUpgrade(request, socket, head, (webSocket: WebSocket) => {
       registerHeartbeat(webSocket);
-      // bridgeTerminal performs several awaits (loadState here, and hasSession/createSession
-      // inside) before it can hook into live messages; the client may send its initial
-      // "resize" (and even type) throughout that window. "ws" does not buffer messages
-      // for an EventEmitter with no listener: without this synchronous buffer (which stays
-      // active until bridgeTerminal installs its own handler), that first resize is lost
-      // forever and the pty keeps the fallback size (see terminal.ts) until the client
-      // triggers the next real resize.
-      const pendingMessages: RawData[] = [];
+      // bridgeTerminal performs several awaits (loadState here, and ensureSessionReady/
+      // spawnWithRetry inside) before it can hook into live messages; the client may send
+      // its initial "resize" (and even type, and its immediate onopen ping - see
+      // TerminalView.tsx) throughout that window. "ws" does not buffer messages for an
+      // EventEmitter with no listener: without this synchronous buffer (which stays active
+      // until stopBuffering below detaches it), that first resize is lost forever and the
+      // pty keeps the fallback size (see terminal.ts) until the client triggers the next
+      // real resize. attachBuffer also caps how much can accumulate here (see
+      // attachBuffer.ts) - unlike the raw array this replaces, an attach stuck for a long
+      // time (a hung tmux command, see runTmux's timeout) no longer buffers unbounded input.
+      const attachBuffer = createAttachBuffer();
+      let bufferingActive = true;
+      // Idempotent by design: called from the overflow path below, from the instance-not-
+      // found branch, from bridgeTerminal's own success path, AND from the catch below on
+      // every failure/cancellation - covering every exit path this attach can take, not
+      // just the happy one (a preexisting gap: the old code only removed this listener on
+      // success, so a failed attach left it attached and the buffer growing unbounded for
+      // as long as the client kept retrying).
+      const stopBuffering = (): void => {
+        if (bufferingActive) {
+          bufferingActive = false;
+          webSocket.removeListener("message", bufferMessage);
+        }
+      };
       const bufferMessage = (rawMessage: RawData): void => {
-        pendingMessages.push(rawMessage);
+        const accepted = attachBuffer.add(rawMessage);
+        if (!accepted) {
+          stopBuffering();
+          webSocket.close(INPUT_OVERFLOW_CLOSE_CODE, INPUT_OVERFLOW_REASON);
+        }
       };
       webSocket.on("message", bufferMessage);
 
@@ -95,20 +125,30 @@ httpServer.on("upgrade", (request, socket, head) => {
         const state: DashboardState = await loadState();
         const instance = state.instances.find((candidate) => candidate.id === instanceId);
         if (instance === undefined) {
-          webSocket.removeListener("message", bufferMessage);
+          stopBuffering();
           webSocket.close(4004, "Unknown instance");
           return;
         }
-        await bridgeTerminal(webSocket, instance, initialSize, pendingMessages, () =>
-          webSocket.removeListener("message", bufferMessage)
-        );
+        await bridgeTerminal(webSocket, instance, initialSize, attachBuffer, stopBuffering);
+        const recoveryMessage = recordAttachSuccess(instanceId);
+        if (recoveryMessage !== null) {
+          console.log(`[server] ${recoveryMessage}`);
+        }
       })().catch((error: Error) => {
-        console.error(`[server] failed to attach instance ${instanceId}:`, error.message);
-        // 4005: a condition that will not clear itself on retry (server out of ptys, or the
-        // instance's folder is gone). The client stops auto-retrying on this code instead of
-        // hammering an attach that can only succeed after user or operator action.
-        const closeCode: number =
-          error instanceof TooManyPtysError || error instanceof LocationMissingError ? 4005 : 4000;
+        stopBuffering();
+        if (error instanceof AttachCancelledError) {
+          // The socket is already gone (this is only thrown once isStillWanted() is
+          // false) - typically because the overflow handler above already closed it with
+          // its own code/reason. Nothing further to log or close here.
+          return;
+        }
+        // Logged at most once per minute per instance regardless of how many times (or how
+        // many concurrent tabs) this fails - see recordAttachFailure in attachErrors.ts.
+        const failureMessage = recordAttachFailure(instanceId, error.message);
+        if (failureMessage !== null) {
+          console.error(`[server] ${failureMessage}`);
+        }
+        const closeCode = closeCodeForAttachError(error);
         webSocket.close(closeCode, error.message.slice(0, 120));
       });
     });
