@@ -13,8 +13,12 @@ export function UpdatePopover({ status, applying, onSeeWhatsNew, onLater, onUpda
   const shortHash: string = status.remoteCommit?.slice(0, 7) ?? "";
 
   return (
-    <div className="absolute right-0 top-[calc(100%+8px)] z-50 w-[280px] rounded-lg border border-border-strong bg-surface p-[14px] shadow-modal">
-      <div className="absolute -top-[5px] right-[16px] h-[9px] w-[9px] rotate-45 border-l border-t border-border-strong bg-surface" />
+    // Opens UPWARD (bottom-[calc(100%+8px)]), not downward: the Update button lives pinned to
+    // the bottom of the sidebar (see InstanceRail.tsx), so a popover anchored below it would
+    // render partly or fully under the viewport's bottom edge - unreadable and unclickable,
+    // exactly the bug this was.
+    <div className="absolute right-0 bottom-[calc(100%+8px)] z-50 w-[280px] rounded-lg border border-border-strong bg-surface p-[14px] shadow-modal">
+      <div className="absolute -bottom-[5px] right-[16px] h-[9px] w-[9px] rotate-45 border-b border-r border-border-strong bg-surface" />
       <div className="flex items-center gap-[8px]">
         <span className="h-[7px] w-[7px] shrink-0 rounded-full bg-accent" />
         <span className="text-[12.5px] font-bold text-txt-bright">Update available · {shortHash}</span>
