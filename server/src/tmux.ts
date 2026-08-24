@@ -107,11 +107,19 @@ export async function getSessionPresence(sessionName: string): Promise<SessionPr
 const SESSION_INIT_MARKER_OPTION = "@ccdash_init_incomplete";
 
 export async function createSession(sessionName: string, workingDirectory: string): Promise<void> {
-  // The marker is set in the SAME tmux invocation that creates the session (chained with
-  // "\;", the same technique reduceScrollStep below already relies on for tmux's argv
-  // parser), closing the window where the session could exist with no marker at all - which
+  // The marker is set in the SAME tmux invocation that creates the session (chained with a
+  // bare ";"), closing the window where the session could exist with no marker at all - which
   // would otherwise misread as "legacy, preserve" for a session this process itself just
   // created and hasn't finished initializing.
+  //
+  // Bare ";", not "\;" like reduceScrollStep below: runTmux calls execFile directly, with no
+  // shell involved, so there is no shell to escape the ";" FROM in the first place. new-session
+  // treats any trailing, un-chained argument as its own optional shell-command, so a literal
+  // "\;" token here doesn't separate two commands - it gets absorbed as the start of that
+  // shell-command, which fails instantly and kills the session with exit code 0 and no stderr,
+  // silently. reduceScrollStep's "\;" is correct there because bind-key's own action argument
+  // is re-parsed as a command sequence at KEYPRESS time, a wholly different parse than the one
+  // this new-session invocation goes through right now - the two are not the same technique.
   //
   // tmux starts the user's default shell as a login shell, so Vertex env vars
   // arrive from .zprofile/.zshrc just as they would in a regular terminal
@@ -122,7 +130,7 @@ export async function createSession(sessionName: string, workingDirectory: strin
     sessionName,
     "-c",
     workingDirectory,
-    "\\;",
+    ";",
     "set-option",
     "-t",
     sessionName,

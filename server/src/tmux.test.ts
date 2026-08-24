@@ -104,6 +104,12 @@ describe("isSessionInitIncomplete", () => {
 });
 
 describe("createSession", () => {
+  // execFile is mocked in this file, so this only proves the argv shape is what runTmux
+  // receives - it cannot tell a real, working tmux separator from a broken one, which is
+  // exactly the gap that let this argv ship with "\;" (wrong outside a shell) instead of ";"
+  // for a whole release. tmux.real.test.ts covers the part this test structurally cannot: that
+  // the real tmux binary treats this exact argv as "create the session AND set the marker",
+  // not as "create the session, then run a doomed shell-command".
   it("chains the init-incomplete marker into the same tmux invocation that creates the session", async () => {
     runTmuxMock.mockResolvedValue({ stdout: "", stderr: "" });
     await createSession("ccdash-abc", "/tmp/project");
@@ -115,7 +121,7 @@ describe("createSession", () => {
       "ccdash-abc",
       "-c",
       "/tmp/project",
-      "\\;",
+      ";",
       "set-option",
       "-t",
       "ccdash-abc",
