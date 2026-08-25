@@ -4,13 +4,41 @@ import path from "node:path";
 import express, { type Request, type Response, type NextFunction } from "express";
 import { WebSocketServer, type WebSocket, type RawData } from "ws";
 import { AUTH_COOKIE_NAME, isAuthEnabled, readCookie, verifyToken } from "./auth";
-import { AttachCancelledError, closeCodeForAttachError, recordAttachFailure, recordAttachSuccess } from "./attachErrors";
+import {
+  AttachCancelledError,
+  PtySpawnError,
+  TooManyPtysError,
+  closeCodeForAttachError,
+  describeError,
+  recordAttachFailure,
+  recordAttachSuccess,
+  shortErrorMessage,
+  systemClock,
+} from "./attachErrors";
 import { createAttachBuffer } from "./attachBuffer";
 import { registerHeartbeat, startHeartbeat } from "./heartbeat";
+import { countSystemDynamicPtys, getPtmxMax } from "./ptyCapacity";
 import { apiRouter } from "./routes";
 import { loadState } from "./store";
-import { bridgeTerminal, closeSocketSafely, validateTerminalSize } from "./terminal";
+import { bridgeTerminal, closeSocketSafely, getLivePtyCount, validateTerminalSize } from "./terminal";
 import type { DashboardState } from "./types";
+
+// Extra diagnostic context appended ONLY to the console line (via recordAttachFailure's lazy
+// buildDetail - see attachErrors.ts), never to anything sent to a client - see
+// describeError/shortErrorMessage's header comment there for why those two stay separate. The
+// system-wide pty snapshot is only worth attaching for the two error shapes it can actually
+// explain (PtySpawnError, TooManyPtysError) - appending it to every unrelated failure would
+// just be noise. See ptyCapacity.ts for why this snapshot is informational only, never a gate.
+function buildFailureDetail(error: unknown): string {
+  const parts = [describeError(error)];
+  if (error instanceof PtySpawnError || error instanceof TooManyPtysError) {
+    const systemDynamicPtys = countSystemDynamicPtys();
+    parts.push(
+      `systemDynamicPtys=${systemDynamicPtys ?? "unknown"} ptmxMax=${getPtmxMax()} livePtyCount=${getLivePtyCount()}`
+    );
+  }
+  return parts.join(" ");
+}
 
 // Close code for "the pre-attach input buffer overflowed" (see attachBuffer.ts). Deliberately
 // NOT one of the codes closeCodeForAttachError produces: an overflow is not an attach
@@ -123,7 +151,9 @@ httpServer.on("upgrade", (request, socket, head) => {
       // so the event has a listener and Node does not escalate it to a process crash, plus
       // leave one throttled log line so a real bug is still visible.
       webSocket.on("error", (error: Error) => {
-        const failureMessage = recordAttachFailure(instanceId, error.message);
+        const failureMessage = recordAttachFailure(instanceId, shortErrorMessage(error), systemClock, () =>
+          describeError(error)
+        );
         if (failureMessage !== null) {
           console.error(`[server] ${failureMessage}`);
         }
@@ -183,8 +213,13 @@ httpServer.on("upgrade", (request, socket, head) => {
           return;
         }
         // Logged at most once per minute per instance regardless of how many times (or how
-        // many concurrent tabs) this fails - see recordAttachFailure in attachErrors.ts.
-        const failureMessage = recordAttachFailure(instanceId, error.message);
+        // many concurrent tabs) this fails - see recordAttachFailure in attachErrors.ts. The
+        // short message is what both the visible log line and the close reason use;
+        // buildFailureDetail's richer output (stack, code, attempt history, and - for a
+        // PtySpawnError/TooManyPtysError - the system-wide pty snapshot) is console-only, see
+        // its own comment above.
+        const shortMessage = shortErrorMessage(error);
+        const failureMessage = recordAttachFailure(instanceId, shortMessage, systemClock, () => buildFailureDetail(error));
         if (failureMessage !== null) {
           console.error(`[server] ${failureMessage}`);
         }
@@ -193,7 +228,7 @@ httpServer.on("upgrade", (request, socket, head) => {
         // in attachErrors.ts for why a plain slice() here used to be able to make close()
         // itself throw (RangeError from ws) for any error message containing a multi-byte
         // path segment, turning this recoverable-failure handler into an unhandled rejection.
-        closeSocketSafely(webSocket, closeCode, error.message);
+        closeSocketSafely(webSocket, closeCode, shortMessage);
       });
     });
   }

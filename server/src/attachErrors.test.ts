@@ -7,9 +7,11 @@ import {
   TooManyPtysError,
   _resetAttachLogStateForTests,
   closeCodeForAttachError,
+  describeError,
   isRetriableSpawnError,
   recordAttachFailure,
   recordAttachSuccess,
+  shortErrorMessage,
   truncateCloseReason,
   type Clock,
 } from "./attachErrors";
@@ -153,6 +155,37 @@ describe("attach failure/recovery logging", () => {
     expect(recordAttachFailure("only-fails-0", "x", clock)).toBeNull();
   });
 
+  it("appends buildDetail's output only when a line is actually emitted, never on a suppressed failure", () => {
+    const clock = fakeClock();
+    let calls = 0;
+    const buildDetail = () => {
+      calls += 1;
+      return "detail-1";
+    };
+    const first = recordAttachFailure("abc123", "x", clock, buildDetail);
+    expect(first).toContain("detail-1");
+    expect(calls).toBe(1);
+
+    // Suppressed by the throttle - buildDetail must not even run (cost, and correctness: a
+    // suppressed failure has no log line to append the detail to).
+    clock.advance(1_000);
+    recordAttachFailure("abc123", "x", clock, buildDetail);
+    expect(calls).toBe(1);
+  });
+
+  it("still emits the failure line, with a snapshotError note, when buildDetail itself throws", () => {
+    // The worst possible outcome here would be consuming the throttle window and returning
+    // null anyway - losing 60s of diagnosis to exactly the kind of hostile/broken input this
+    // detail-gathering exists to survive.
+    const clock = fakeClock();
+    const line = recordAttachFailure("abc123", "posix_spawnp failed.", clock, () => {
+      throw new Error("snapshot blew up");
+    });
+    expect(line).not.toBeNull();
+    expect(line).toContain("posix_spawnp failed.");
+    expect(line).toContain("snapshotError=snapshot blew up");
+  });
+
   it("does not evict an ongoing outage: continued failures inside the retention window keep refreshing lastTouchedAt", () => {
     const clock = fakeClock();
     recordAttachFailure("ongoing", "x", clock); // logs
@@ -173,6 +206,143 @@ describe("error classes", () => {
   it("AttachCancelledError and friends are plain Error subclasses usable with instanceof", () => {
     expect(new AttachCancelledError("cancelled")).toBeInstanceOf(Error);
     expect(new PtySpawnError("x", 3).attempts).toBe(3);
+  });
+
+  it("PtySpawnError carries the per-attempt history, defaulting to empty for old-style callers", () => {
+    expect(new PtySpawnError("x", 3).attemptDetails).toEqual([]);
+    const detail = { attemptIndex: 1, durationMs: 5, message: "EMFILE", code: "EMFILE" };
+    expect(new PtySpawnError("x", 1, [detail]).attemptDetails).toEqual([detail]);
+  });
+});
+
+describe("describeError", () => {
+  it("includes the whitelisted fields of a plain Error, including stack", () => {
+    const error = new Error("boom");
+    const described = describeError(error);
+    expect(described).toContain("message=boom");
+    expect(described).toContain("stack=");
+  });
+
+  it("includes errno-style fields (code, errno, syscall, path)", () => {
+    const error = new Error("spawn failed") as NodeJS.ErrnoException;
+    error.code = "EMFILE";
+    error.errno = -24;
+    error.syscall = "spawn";
+    error.path = "/usr/bin/tmux";
+    const described = describeError(error);
+    expect(described).toContain("code=EMFILE");
+    expect(described).toContain("errno=-24");
+    expect(described).toContain("syscall=spawn");
+    expect(described).toContain("path=/usr/bin/tmux");
+  });
+
+  it("includes a PtySpawnError's full attempt history, not just the final message", () => {
+    const error = new PtySpawnError("posix_spawnp failed.", 2, [
+      { attemptIndex: 1, durationMs: 10, message: "EMFILE", code: "EMFILE" },
+      { attemptIndex: 2, durationMs: 12, message: "posix_spawnp failed." },
+    ]);
+    const described = describeError(error);
+    expect(described).toContain("attemptIndex=1");
+    expect(described).toContain("code=EMFILE");
+    expect(described).toContain("attemptIndex=2");
+  });
+
+  it("walks a cause chain up to its depth limit", () => {
+    const root = new Error("root cause");
+    const middle = new Error("middle", { cause: root });
+    const top = new Error("top", { cause: middle });
+    const described = describeError(top);
+    expect(described).toContain("message=top");
+    expect(described).toContain("message=middle");
+    expect(described).toContain("message=root cause");
+  });
+
+  it("never throws and never recurses forever on a cyclic cause chain", () => {
+    const a = new Error("a") as Error & { cause?: unknown };
+    const b = new Error("b") as Error & { cause?: unknown };
+    a.cause = b;
+    b.cause = a;
+    expect(() => describeError(a)).not.toThrow();
+    expect(describeError(a).length).toBeGreaterThan(0);
+  });
+
+  it("never throws when a property getter on the error itself throws", () => {
+    const hostile = new Error("hostile");
+    Object.defineProperty(hostile, "code", {
+      get() {
+        throw new Error("getter exploded");
+      },
+    });
+    expect(() => describeError(hostile)).not.toThrow();
+    expect(describeError(hostile)).toContain("message=hostile");
+  });
+
+  it("never throws for a Proxy whose property access always throws", () => {
+    const hostile = new Proxy(new Error("proxied"), {
+      get() {
+        throw new Error("proxy trap exploded");
+      },
+    });
+    expect(() => describeError(hostile)).not.toThrow();
+  });
+
+  it("never throws and produces something readable for non-Error thrown values", () => {
+    expect(() => describeError("a plain string")).not.toThrow();
+    expect(() => describeError(42)).not.toThrow();
+    expect(() => describeError(null)).not.toThrow();
+    expect(() => describeError(undefined)).not.toThrow();
+    expect(() => describeError(Symbol("weird"))).not.toThrow();
+    expect(describeError("a plain string")).toContain("a plain string");
+  });
+
+  it("strips CR/LF so a hostile message cannot inject fake extra log lines", () => {
+    const error = new Error("line one\nFAKE LOG LINE\r\nline three");
+    const described = describeError(error);
+    expect(described).not.toContain("\n");
+    expect(described).not.toContain("\r");
+  });
+
+  it("truncates an enormous stack instead of producing an unbounded log line", () => {
+    const error = new Error("boom");
+    error.stack = "x".repeat(100_000);
+    const described = describeError(error);
+    expect(described.length).toBeLessThan(10_000);
+  });
+});
+
+describe("shortErrorMessage", () => {
+  it("returns an Error's message", () => {
+    expect(shortErrorMessage(new Error("posix_spawnp failed."))).toBe("posix_spawnp failed.");
+  });
+
+  it("never includes stack, code, or cause - only the message", () => {
+    const error = new Error("boom") as NodeJS.ErrnoException;
+    error.code = "EMFILE";
+    const short = shortErrorMessage(error);
+    expect(short).toBe("boom");
+    expect(short).not.toContain("EMFILE");
+    expect(short).not.toContain("at ");
+  });
+
+  it("never throws for a Proxy whose message getter throws, falling back to a safe default", () => {
+    const hostile = new Proxy(new Error("real message"), {
+      get(target, prop) {
+        if (prop === "message") {
+          throw new Error("exploded");
+        }
+        return Reflect.get(target, prop);
+      },
+    });
+    expect(() => shortErrorMessage(hostile)).not.toThrow();
+  });
+
+  it("strips CR/LF from the message", () => {
+    expect(shortErrorMessage(new Error("line one\nline two"))).not.toContain("\n");
+  });
+
+  it("falls back to a safe default for non-Error values", () => {
+    expect(shortErrorMessage(null)).toBe("unknown error");
+    expect(shortErrorMessage(Symbol("weird"))).toBe("unknown error");
   });
 });
 

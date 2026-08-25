@@ -6,11 +6,16 @@ import {
   LocationMissingError,
   PtySpawnError,
   TooManyPtysError,
+  describeError,
   isRetriableSpawnError,
   recordAttachFailure,
+  shortErrorMessage,
+  systemClock,
   truncateCloseReason,
+  type SpawnAttemptDetail,
 } from "./attachErrors";
 import { buildLaunchCommand } from "./launch";
+import { computeMaxLivePtys, getPtmxMax } from "./ptyCapacity";
 import { pathExists } from "./paths";
 import {
   TmuxError,
@@ -49,15 +54,35 @@ interface InitialSize {
 const FALLBACK_COLS = 120;
 const FALLBACK_ROWS = 32;
 
-// macOS caps ptys at kern.tty.ptmx_max (511 by default). Refusing new attaches with a
-// readable error well below that is the difference between a clear "too many terminals"
-// message and every subsequent spawn silently dying with node-pty's opaque
-// "posix_spawnp failed." once the real kernel limit is hit. This only guards against THIS
-// process's own pty count; it cannot see pressure from other terminals/processes on the
-// machine, which is exactly the case spawnWithRetry below (and the 4006 slow-retry path in
-// index.ts/reconnectPolicy.ts) exists to recover from automatically.
-const MAX_LIVE_PTYS = 480;
+// macOS caps ptys at kern.tty.ptmx_max - a SYSTEM-WIDE limit (511 by default), confirmed
+// against Apple's own XNU source (bsd/kern/tty_ptmx.c) while chasing this exact bug down:
+// every attach that failed with the opaque "posix_spawnp failed." traced back to this pool
+// being exhausted machine-wide, not to anything wrong with this process. This gate only ever
+// sees THIS process's own pty count - it cannot see pressure from other terminals/processes on
+// the machine - so it is deliberately derived from the system's actual ptmx_max (see
+// ptyCapacity.ts's computeMaxLivePtys) rather than a fixed constant that would either waste
+// headroom (if ptmx_max is later raised) or starve every other terminal app on the machine (the
+// previous fixed 480 left only 31 ptys of margin below the 511 default - which is exactly the
+// scenario that emptied the pool in the first place). Computed once, at module load - see
+// ptyCapacity.ts's own comment on why reading ptmx_max here (a one-time sysctl call at process
+// startup, long before the first attach) is fine even though spawning a process to diagnose a
+// LIVE spawn failure would not be.
+//
+// This remains the ONLY gate that actually rejects an attach for pty-capacity reasons. The
+// system-wide pty count (ptyCapacity.ts's countSystemDynamicPtys) is informational only, never
+// a second gate: it measurably overcounts under normal churn (a pty's /dev node is reclaimed
+// when its OWNING PROCESS exits, not when the pty is destroyed - see that module's own
+// comment), so treating it as authoritative would reject perfectly good attaches. It exists
+// solely to enrich the diagnostic detail when THIS gate fires, or when a spawn genuinely fails
+// (see buildFailureDetail in index.ts).
+const MAX_LIVE_PTYS = computeMaxLivePtys(getPtmxMax());
 let livePtyCount = 0;
+
+// Read-only outside this module: exposed for index.ts's diagnostic detail (see
+// buildFailureDetail there), never as a second admission gate - see MAX_LIVE_PTYS's comment.
+export function getLivePtyCount(): number {
+  return livePtyCount;
+}
 
 // node-pty's IPty type only declares kill(), which sends SIGHUP but leaves the pty's
 // master file descriptor open (see UnixTerminal.prototype.kill vs .destroy in
@@ -123,14 +148,19 @@ export function closeSocketSafely(socket: WebSocket, code: number, reason: strin
 // must not also mean it becomes invisible. Without this, `npm run dev`'s own terminal would
 // show nothing at all for a resize exploit, a broken pipe, or a pty stream error: the user
 // would just see a tab quietly reconnect with no way to tell what happened or fix it later.
-function teardownAttach(
-  socket: WebSocket,
-  attachProcess: nodePty.IPty,
-  instanceId: string,
-  code: number,
-  reason: string
-): void {
-  const failureMessage = recordAttachFailure(instanceId, reason);
+//
+// Takes `unknown`, not a pre-extracted string: every caller below used to convert to
+// `.message` before calling this, which threw away code/errno/stack before this function ever
+// saw the error - the exact loss this whole diagnostic effort exists to stop. The two
+// representations this derives are DELIBERATELY separate and neither depends on the other
+// succeeding (see describeError/shortErrorMessage's header comment in attachErrors.ts):
+// shortErrorMessage feeds both the visible part of the log line and the WebSocket close
+// reason (same as before - this function is not the place that decides to widen what a
+// client sees), while describeError's richer detail goes to console only, via
+// recordAttachFailure's lazy buildDetail.
+function teardownAttach(socket: WebSocket, attachProcess: nodePty.IPty, instanceId: string, code: number, rawError: unknown): void {
+  const shortMessage = shortErrorMessage(rawError);
+  const failureMessage = recordAttachFailure(instanceId, shortMessage, systemClock, () => describeError(rawError));
   if (failureMessage !== null) {
     console.error(`[server] ${failureMessage}`);
   }
@@ -141,7 +171,7 @@ function teardownAttach(
     // still needs to see the terminal go away and reconnect, even if this process is left
     // with a wedged child process (a much smaller problem than a full server crash).
   }
-  closeSocketSafely(socket, code, reason);
+  closeSocketSafely(socket, code, shortMessage);
 }
 
 // Post-bridge failures (a pty stream error, a throw while handling a client message) are not
@@ -201,12 +231,28 @@ export async function spawnWithRetry(
 ): Promise<nodePty.IPty> {
   const maxAttempts = delaysMs.length + 1;
   let lastError: Error | null = null;
+  // Every failed attempt's own outcome, not just the last one - see SpawnAttemptDetail's
+  // header comment in attachErrors.ts for why the decisive signal is often in an EARLIER
+  // attempt (e.g. attempt 1 carries a real errno, attempt 4 is the opaque posix_spawnp
+  // message), which discarding down to only the last error throws away.
+  const attemptDetails: SpawnAttemptDetail[] = [];
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const attemptStartedAt = Date.now();
     try {
       return spawnAttempt();
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
+      const errnoError = lastError as NodeJS.ErrnoException;
+      attemptDetails.push({
+        attemptIndex: attempt,
+        durationMs: Date.now() - attemptStartedAt,
+        name: lastError.name,
+        message: lastError.message,
+        code: errnoError.code,
+        errno: errnoError.errno,
+        syscall: errnoError.syscall,
+      });
       if (!isRetriableSpawnError(lastError)) {
         // Not the diagnosed signature (e.g. tmux missing from PATH, a bad cwd): a real
         // configuration/programming problem retrying can never fix. Propagate immediately,
@@ -223,7 +269,7 @@ export async function spawnWithRetry(
     }
   }
 
-  throw new PtySpawnError(lastError?.message ?? "pty spawn failed", maxAttempts);
+  throw new PtySpawnError(lastError?.message ?? "pty spawn failed", maxAttempts, attemptDetails);
 }
 
 // Guards concurrent attaches for the SAME tmux session (multiple browser tabs on one
@@ -434,7 +480,7 @@ export async function bridgeTerminal(
   (attachProcess as unknown as { on: (event: "error", listener: (error: Error) => void) => void }).on(
     "error",
     (error: Error) => {
-      teardownAttach(socket, attachProcess, instance.id, POST_BRIDGE_FAILURE_CLOSE_CODE, error.message);
+      teardownAttach(socket, attachProcess, instance.id, POST_BRIDGE_FAILURE_CLOSE_CODE, error);
     }
   );
 
@@ -446,7 +492,7 @@ export async function bridgeTerminal(
     } catch (error) {
       // socket.send() throwing (a broken pipe, a send after a race with close) must cost
       // only this terminal - see teardownAttach's header comment.
-      teardownAttach(socket, attachProcess, instance.id, POST_BRIDGE_FAILURE_CLOSE_CODE, (error as Error).message);
+      teardownAttach(socket, attachProcess, instance.id, POST_BRIDGE_FAILURE_CLOSE_CODE, error);
     }
   });
 
@@ -484,7 +530,7 @@ export async function bridgeTerminal(
       // Catch-all for the whole handler: a throw from attachProcess.write/resize or
       // socket.send here is a WebSocket "message" EventEmitter callback, so an uncaught
       // exception here would otherwise crash the entire process, not just this terminal.
-      teardownAttach(socket, attachProcess, instance.id, POST_BRIDGE_FAILURE_CLOSE_CODE, (error as Error).message);
+      teardownAttach(socket, attachProcess, instance.id, POST_BRIDGE_FAILURE_CLOSE_CODE, error);
     }
   };
 

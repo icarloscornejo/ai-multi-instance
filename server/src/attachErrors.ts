@@ -13,12 +13,33 @@ export class LocationMissingError extends Error {}
 
 export class TooManyPtysError extends Error {}
 
+// One retry attempt's outcome, captured by spawnWithRetry (terminal.ts) as it happens - not
+// reconstructed after the fact from just the last error's message. This is what makes it
+// possible to tell "the first attempt hit EMFILE and the last one came back with the opaque
+// posix_spawnp message" apart from "all four attempts were identically opaque": the decisive
+// signal is often in an EARLIER attempt, and averaging/discarding down to only the last error
+// (what this used to do) throws that away. Deliberately scalar-only fields, matching
+// describeError's own whitelist below - no raw Error object, no stack here, so this can be
+// logged directly without needing its own defensive-read pass.
+export interface SpawnAttemptDetail {
+  attemptIndex: number;
+  durationMs: number;
+  name?: string;
+  message: string;
+  code?: string;
+  errno?: number;
+  syscall?: string;
+}
+
 // Thrown by spawnWithRetry (terminal.ts) once every retry attempt has failed. Carries the
-// last raw error's message and the number of attempts made, purely for logging.
+// last raw error's message and the number of attempts made, purely for logging, plus every
+// attempt's own outcome (see SpawnAttemptDetail above) so describeError can surface the whole
+// retry history, not just the final, often least-informative, failure.
 export class PtySpawnError extends Error {
   constructor(
     message: string,
-    public readonly attempts: number
+    public readonly attempts: number,
+    public readonly attemptDetails: readonly SpawnAttemptDetail[] = []
   ) {
     super(message);
     this.name = "PtySpawnError";
@@ -66,6 +87,167 @@ export function closeCodeForAttachError(_error: Error): number {
 // problem that retrying can never fix; it propagates immediately instead of being retried
 // and silently swallowed for several seconds first.
 const RETRIABLE_SPAWN_ERROR_CODES = new Set(["EMFILE", "ENFILE", "EAGAIN"]);
+
+// --- describeError / shortErrorMessage -------------------------------------------------
+//
+// Two DELIBERATELY separate representations of the same unknown thrown value, because the two
+// destinations they feed have opposite requirements. describeError is the rich, whitelisted
+// one, meant only for this process's own console: it includes stack, code, errno, syscall, and
+// (for PtySpawnError) the full retry history. shortErrorMessage is meant for whatever is on the
+// other end of a WebSocket close frame: message only, nothing that could leak a local path,
+// a stack trace, or diagnostic detail to a remote client. Neither is derived from the other -
+// shortErrorMessage must keep working even if describeError's own construction fails partway
+// through (see its own comment below), so a socket can always be closed with SOME reason even
+// when the richer console line degrades.
+//
+// Both are TOTAL by construction: this runs inside handlers that exist specifically because an
+// exception during error-handling already crashed the process once before this file existed
+// (see closeSocketSafely's header comment in terminal.ts). A hostile getter, a Proxy, a cyclic
+// `cause` chain, or a thrown symbol must never escape either function - every property read is
+// its own try/catch, not just an event guard around the whole call.
+
+const MAX_FIELD_LENGTH = 500;
+const MAX_DESCRIPTION_LENGTH = 4000;
+const MAX_CAUSE_DEPTH = 3;
+
+// Strips CR/LF and other control characters so a hostile or accidental multi-line message can
+// never inject fake extra log lines (or corrupt a WebSocket close frame) just by being thrown.
+function stripControlChars(value: string): string {
+  // eslint-disable-next-line no-control-regex -- deliberately matching raw control bytes
+  return value.replace(/[\r\n\t\x00-\x1f\x7f]/g, " ");
+}
+
+function truncateField(value: string): string {
+  const clean = stripControlChars(value);
+  return clean.length > MAX_FIELD_LENGTH ? `${clean.slice(0, MAX_FIELD_LENGTH)}…` : clean;
+}
+
+// Reads a single property defensively: a Proxy or a getter defined with Object.defineProperty
+// can throw on access alone, before any type check even runs, so the guard has to wrap the
+// read itself, not just what's done with the result.
+function safeRead(source: unknown, key: string): unknown {
+  try {
+    return (source as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function safeReadArray(source: unknown, key: string): unknown[] | undefined {
+  const raw = safeRead(source, key);
+  return Array.isArray(raw) ? raw : undefined;
+}
+
+// Only scalars are ever whitelisted through - an object/function/symbol field is silently
+// dropped rather than stringified, so nothing can smuggle its own toString()/Symbol.toPrimitive
+// into the log by being assigned to a whitelisted property name.
+function safeScalar(value: unknown): string | undefined {
+  try {
+    if (typeof value === "string") {
+      return value;
+    }
+    if (typeof value === "number" || typeof value === "boolean") {
+      return String(value);
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Same whitelist SpawnAttemptDetail declares, plus the Error-standard/errno/TmuxError fields
+// (TmuxError - tmux.ts - is read by duck typing since this file cannot import it, see the
+// file's header comment) and PtySpawnError's own `attempts` count.
+const WHITELISTED_ERROR_FIELDS = ["name", "message", "code", "errno", "syscall", "path", "killed", "signal", "attempts"] as const;
+
+const SPAWN_ATTEMPT_FIELDS = ["attemptIndex", "durationMs", "name", "message", "code", "errno", "syscall"] as const;
+
+function describeAttemptDetails(attemptDetails: unknown[]): string {
+  const summarized = attemptDetails.map((entry, index) => {
+    const bits: string[] = [];
+    for (const field of SPAWN_ATTEMPT_FIELDS) {
+      const scalar = safeScalar(safeRead(entry, field));
+      if (scalar !== undefined) {
+        bits.push(`${field}=${truncateField(scalar)}`);
+      }
+    }
+    return bits.length > 0 ? `[${bits.join(",")}]` : `[attempt ${index}: unreadable]`;
+  });
+  return summarized.join(" ");
+}
+
+// `seen` guards against a cyclic `cause` chain (error.cause = error, or a longer cycle through
+// several objects) turning this into infinite recursion; MAX_CAUSE_DEPTH is a second, cheaper
+// backstop for a long-but-not-cyclic chain.
+function describeErrorChain(error: unknown, depth: number, seen: WeakSet<object>): string {
+  if (depth > MAX_CAUSE_DEPTH) {
+    return "…(cause chain truncated)…";
+  }
+  if (!(error instanceof Error)) {
+    const scalar = safeScalar(error);
+    return scalar !== undefined ? `non-Error thrown: ${truncateField(scalar)}` : "non-Error thrown (unprintable)";
+  }
+  if (seen.has(error)) {
+    return "…(cause cycle)…";
+  }
+  seen.add(error);
+
+  const parts: string[] = [];
+  for (const field of WHITELISTED_ERROR_FIELDS) {
+    const scalar = safeScalar(safeRead(error, field));
+    if (scalar !== undefined) {
+      parts.push(`${field}=${truncateField(scalar)}`);
+    }
+  }
+  const stack = safeRead(error, "stack");
+  if (typeof stack === "string") {
+    parts.push(`stack=${truncateField(stack)}`);
+  }
+  // PtySpawnError-only, read by duck typing (see WHITELISTED_ERROR_FIELDS comment): the whole
+  // point of carrying attemptDetails is for it to actually reach the log line.
+  const attemptDetails = safeReadArray(error, "attemptDetails");
+  if (attemptDetails !== undefined && attemptDetails.length > 0) {
+    parts.push(`attempts=${describeAttemptDetails(attemptDetails)}`);
+  }
+
+  let described = parts.join(" ");
+  const cause = safeRead(error, "cause");
+  if (cause !== undefined && cause !== null) {
+    described += ` cause=[${describeErrorChain(cause, depth + 1, seen)}]`;
+  }
+  return described;
+}
+
+// Console-only. Never send this to a client - see shortErrorMessage for that.
+export function describeError(error: unknown): string {
+  try {
+    const described = describeErrorChain(error, 0, new WeakSet());
+    return described.length > MAX_DESCRIPTION_LENGTH ? `${described.slice(0, MAX_DESCRIPTION_LENGTH)}…` : described;
+  } catch {
+    // The backstop, not the primary defense (every read above already guards itself) - see
+    // this section's header comment for why a diagnostic helper must never itself become the
+    // reason an error handler crashes.
+    return "error description unavailable";
+  }
+}
+
+// Safe to hand to a remote client (WebSocket close reason). Deliberately message-only: no
+// stack, no code/errno, no cause chain, no attempt history - those are local diagnostic detail,
+// not something to leak to whatever is on the other end of the socket. Independent of
+// describeError (see this section's header comment) so a close reason is still produced even if
+// the richer description fails.
+export function shortErrorMessage(error: unknown): string {
+  try {
+    if (error instanceof Error) {
+      const message = safeScalar(safeRead(error, "message"));
+      return message !== undefined && message.length > 0 ? stripControlChars(message) : "unknown error";
+    }
+    const scalar = safeScalar(error);
+    return scalar !== undefined ? stripControlChars(scalar) : "unknown error";
+  } catch {
+    return "unknown error";
+  }
+}
 
 export function isRetriableSpawnError(error: unknown): boolean {
   if (!(error instanceof Error)) {
@@ -146,7 +328,23 @@ function getOrCreateState(instanceId: string, now: number): InstanceLogState {
 // on the same instanceId (multiple browser tabs) are handled implicitly: whichever call
 // lands first in a given window logs, the rest are silently suppressed the same way
 // repeated failures from one socket would be.
-export function recordAttachFailure(instanceId: string, errorMessage: string, clock: Clock = systemClock): string | null {
+//
+// buildDetail is an OPTIONAL, LAZY diagnostic-detail provider (see describeError/
+// shortErrorMessage in this file, and ptyCapacity.ts for what terminal.ts/index.ts actually
+// pass here) - called only once we've already decided this particular failure earns a log
+// line, never on a suppressed one. That matters for cost (a snapshot of system pty capacity is
+// cheap but not free, and most failures in an outage get suppressed by the throttle) and for
+// correctness: by the time buildDetail runs, lastFailureLoggedAt is already committed, so if
+// buildDetail itself throws, the function still returns a real line (with a snapshotError note
+// instead of the detail) rather than silently consuming the throttle window and returning
+// nothing - the worst possible outcome here would be losing 60s of diagnosis to exactly the
+// kind of hostile/broken input this detail-gathering exists to survive.
+export function recordAttachFailure(
+  instanceId: string,
+  errorMessage: string,
+  clock: Clock = systemClock,
+  buildDetail?: () => string
+): string | null {
   const now = clock.now();
   evictStale(now);
   const state = getOrCreateState(instanceId, now);
@@ -157,9 +355,20 @@ export function recordAttachFailure(instanceId: string, errorMessage: string, cl
     return null;
   }
   state.lastFailureLoggedAt = now;
+  let detailSuffix = "";
+  if (buildDetail !== undefined) {
+    try {
+      const detail = buildDetail();
+      if (detail.length > 0) {
+        detailSuffix = ` | ${detail}`;
+      }
+    } catch (detailError) {
+      detailSuffix = ` | snapshotError=${detailError instanceof Error ? detailError.message : String(detailError)}`;
+    }
+  }
   return `instance ${instanceId}: attach failed (${errorMessage}), retrying automatically; further failures silenced for ${
     LOG_WINDOW_MS / 1000
-  }s`;
+  }s${detailSuffix}`;
 }
 
 // Records a successful attach for this instance. Returns the recovery message to log, or

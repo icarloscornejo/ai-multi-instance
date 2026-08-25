@@ -188,6 +188,36 @@ describe("spawnWithRetry", () => {
     expect(spawnAttempt).toHaveBeenCalledTimes(delays.length + 1);
   });
 
+  // The decisive signal is often in an EARLIER attempt, not the last one - see
+  // SpawnAttemptDetail's header comment in attachErrors.ts. This is the regression test for
+  // that: attempt 1 carries a real errno the final, opaque posix_spawnp message does not.
+  it("carries every attempt's own outcome, not just the final one", async () => {
+    let calls = 0;
+    const spawnAttempt = vi.fn(() => {
+      calls += 1;
+      const error = new Error(calls === 1 ? "spawn failed" : "posix_spawnp failed.") as NodeJS.ErrnoException;
+      if (calls === 1) {
+        error.code = "EMFILE";
+      }
+      throw error;
+    });
+    const delays = [1, 1, 1];
+    let caught: unknown;
+    try {
+      await spawnWithRetry(spawnAttempt, () => true, delays);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(PtySpawnError);
+    const attemptDetails = (caught as PtySpawnError).attemptDetails;
+    expect(attemptDetails).toHaveLength(delays.length + 1);
+    expect(attemptDetails[0]).toMatchObject({ attemptIndex: 1, message: "spawn failed", code: "EMFILE" });
+    expect(attemptDetails[attemptDetails.length - 1]).toMatchObject({
+      attemptIndex: delays.length + 1,
+      message: "posix_spawnp failed.",
+    });
+  });
+
   it("propagates a non-retriable error immediately, unwrapped, without retrying", async () => {
     const spawnAttempt = vi.fn(() => {
       throw new Error("spawn tmux ENOENT");
@@ -489,6 +519,32 @@ describe("bridgeTerminal", () => {
 
     expect(socket.close).toHaveBeenCalledWith(1011, "EIO: input/output error, read");
     expect(fakePty.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  // Strict separation between what console sees and what the client sees (see teardownAttach's
+  // header comment): the close reason must stay message-only, while the console line carries
+  // the richer describeError detail (here, the stack) that must never reach the socket.
+  it("keeps the WebSocket close reason short while the console log carries the full stack detail", async () => {
+    const fakePty = makeFakePty();
+    vi.mocked(nodePty.spawn).mockReturnValue(fakePty as never);
+    const socket = makeFakeSocket();
+    // A distinct instance id, not shared with any other test in this file: attachErrors.ts's
+    // failure-throttle state is module-level (see recordAttachFailure), so reusing an id another
+    // test already failed for within the same 60s window would silently suppress this line.
+    const instance = makeReadyInstance({ id: "stack-detail-separation-test" });
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await bridgeTerminal(socket as never, instance, null, makeNoopAttachBuffer(), () => {});
+    const error = new Error("EIO: input/output error, read");
+    fakePty._emitError(error);
+
+    const [, closeReason] = socket.close.mock.calls[0] as [number, string];
+    expect(closeReason).toBe("EIO: input/output error, read");
+    expect(closeReason).not.toContain("at ");
+
+    const loggedLine = consoleErrorSpy.mock.calls.map((args) => String(args.join(" "))).join("\n");
+    expect(loggedLine).toContain("stack=");
+    consoleErrorSpy.mockRestore();
   });
 
   it("contains a malformed live resize (Infinity) instead of letting it reach node-pty's resize()", async () => {
