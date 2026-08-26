@@ -82,6 +82,14 @@ export interface UpdateStatus {
   diverged: boolean;
   localOnlyCommits: ChangelogEntry[];
   resetLosesWork: boolean;
+  // Mirrors server/src/updater.ts's UpdateStatus: the commit the frontend actually being served
+  // was built from, independent of currentCommit (that's just HEAD). See frontendPublishPending.
+  publishedCommit: string | null;
+  // True while the served frontend hasn't caught up to currentCommit yet - a build/publish is
+  // either running or has failed (see frontendPublishError). Independent of pendingRestart/
+  // restartKind, which are about git and the server process, not about the static build.
+  frontendPublishPending: boolean;
+  frontendPublishError: string | null;
 }
 
 export type TunnelState = "stopped" | "starting" | "running" | "error";

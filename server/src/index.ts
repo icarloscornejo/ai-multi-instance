@@ -20,6 +20,7 @@ import { registerHeartbeat, startHeartbeat } from "./heartbeat";
 import { countSystemDynamicPtys, getPtmxMax } from "./ptyCapacity";
 import { apiRouter } from "./routes";
 import { loadState } from "./store";
+import { reconcileFrontendPublishOnStartup } from "./updater";
 import { bridgeTerminal, closeSocketSafely, getLivePtyCount, validateTerminalSize } from "./terminal";
 import type { DashboardState } from "./types";
 
@@ -55,10 +56,13 @@ const app = express();
 app.use(express.json());
 app.use("/api", apiRouter);
 
-// Fallback only: LAN traffic and the tunnel both go through Caddy -> Vite (see Caddyfile,
-// server/src/tunnel.ts), so this pre-built web/dist is reached only by hitting this port
-// directly. Kept for that case rather than removed outright; the self-update flow
-// (updater.ts) does not rebuild it, so it can go stale.
+// The one frontend pipeline for LAN and tunnel visitors: Caddy proxies straight to this Express
+// server (see Caddyfile), which serves whatever updateTransaction.ts most recently published here.
+// There is deliberately no Vite dev server in this path anymore - that used to be what LAN/tunnel
+// visitors got (Caddy -> Vite), and its client-side HMR reload-on-reconnect is exactly what caused
+// a Chrome Android tab to fully reload instead of just reattaching its terminal WebSocket after
+// coming back from the background. `localhost:5173` (Vite's own dev server) is still available
+// for local development with HMR intact; it is simply no longer what LAN/tunnel requests reach.
 const webDistPath: string = path.resolve(import.meta.dirname, "../../web/dist");
 app.use(express.static(webDistPath));
 
@@ -236,4 +240,9 @@ httpServer.on("upgrade", (request, socket, head) => {
 
 httpServer.listen(serverPort, serverHost, () => {
   console.log(`[server] listening on http://${serverHost}:${serverPort}`);
+  // Deliberately AFTER listen(), not before: Express must start accepting requests against
+  // whatever is already in web/dist - stale or not - rather than block startup on a build. This is
+  // also what makes a transaction interrupted by a `tsx` restart self-heal with no user action:
+  // see updateTransaction.ts's header comment and updater.ts's reconcileFrontendPublishOnStartup.
+  void reconcileFrontendPublishOnStartup();
 });

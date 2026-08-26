@@ -279,9 +279,19 @@ export function UpdateScreen({ initialStatus, autoApply = false, onStatusChange,
           </div>
         </div>
 
+        {/* "auto" means no manual relaunch is needed, but for a frontend-affecting change that is
+            no longer the same thing as "already live": the server/src side is already running
+            (tsx watch restarted it), but web/dist is rebuilt asynchronously by
+            updateTransaction.ts. frontendPublishPending distinguishes "still building" from
+            "published, just needs a reload" - conflating them would tell the user to reload into
+            a build that isn't there yet. */}
         {status !== null && !checking && status.pendingRestart && status.restartKind === "auto" && (
           <div className="text-[11.5px] text-accent">
-            Only server/web code changed: tsx watch and Vite already hot-reloaded it. Reload this page to run the new frontend.
+            {status.frontendPublishPending
+              ? status.frontendPublishError !== null
+                ? `Publishing the updated frontend failed: ${status.frontendPublishError}`
+                : "Publishing the updated frontend…"
+              : "New frontend published. Reload this page to use it."}
           </div>
         )}
 

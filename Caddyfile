@@ -1,18 +1,20 @@
 http://ai.local, http://claude.local {
-	reverse_proxy 127.0.0.1:5173
+	reverse_proxy 127.0.0.1:3001
 	handle_errors {
-		respond "Caddy can't reach the dashboard's dev server (status {err.status_code}). Start it with: npm run dev" {err.status_code}
+		respond "Caddy can't reach the dashboard's server (status {err.status_code}). Start it with: npm run dev" {err.status_code}
 	}
 }
 
-# Same-LAN access by raw IP (e.g. from a phone on home WiFi, without touching its DNS):
-# Vite only allows the ai.local/claude.local hostnames, so the Host header sent upstream
-# is rewritten regardless of what the client actually typed in the address bar.
+# Same-LAN access by raw IP (e.g. from a phone on home WiFi, without touching its DNS): the
+# Host-header rewrite below is a leftover of when this proxied to Vite, which validates
+# allowedHosts. Express (server/src/index.ts) doesn't check the Host header at all, so this block
+# no longer strictly needs it - kept anyway since it's harmless and avoids depending on that never
+# being enforced anywhere downstream.
 :80 {
-	reverse_proxy 127.0.0.1:5173 {
+	reverse_proxy 127.0.0.1:3001 {
 		header_up Host ai.local
 	}
 	handle_errors {
-		respond "Caddy can't reach the dashboard's dev server (status {err.status_code}). Start it with: npm run dev" {err.status_code}
+		respond "Caddy can't reach the dashboard's server (status {err.status_code}). Start it with: npm run dev" {err.status_code}
 	}
 }

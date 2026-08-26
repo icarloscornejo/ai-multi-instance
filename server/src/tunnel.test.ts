@@ -2,7 +2,20 @@ import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { classifyPreflight, extractTunnelUrl } from "./tunnel";
 
-const APP_SHELL_BODY = '<html><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>';
+// Shape of the real production build's index.html (web/dist/index.html, produced by
+// updateTransaction.ts): a hashed script bundle, not the dev-only /src/main.tsx module path.
+const APP_SHELL_BODY =
+  '<html><head><title>AI Multi-Instance</title><link rel="icon" href="/ai-multi-instance.svg" />' +
+  '<script type="module" crossorigin src="/assets/index-q-rZD3FO.js"></script></head>' +
+  '<body><div id="root"></div></body></html>';
+
+// A generic React/Vite app shell that happens to share the two markers this preflight used to
+// rely on (`<div id="root">`, an `/assets/` path) but isn't THIS app - the exact case
+// classifyPreflight exists to rule out (Caddy answering, but fronting some unrelated service).
+const GENERIC_REACT_VITE_BODY =
+  '<html><head><title>Some Other App</title>' +
+  '<script type="module" crossorigin src="/assets/index-abc123.js"></script></head>' +
+  '<body><div id="root"></div></body></html>';
 
 // startTunnel() writes cloudflared's own stdout/stderr straight to data/cloudflared.log (see
 // tunnel.ts's dataDirectory comment); stubbing fs here keeps the state-machine tests below from
@@ -372,6 +385,13 @@ describe("classifyPreflight", () => {
     expect(classifyPreflight(200, "<html><body>Hello from some other server</body></html>")).toBe("wrong-origin");
   });
 
+  // The exact bug this preflight would have had with a generic marker like `<div id="root">` or
+  // `/assets/`: those are common to any React/Vite build, so Caddy could be misconfigured to
+  // front a completely different app and this would have falsely reported "ok".
+  it("classifies a 200 from a DIFFERENT React/Vite app (same generic markers) as wrong-origin", () => {
+    expect(classifyPreflight(200, GENERIC_REACT_VITE_BODY)).toBe("wrong-origin");
+  });
+
   it("classifies a 404 as wrong-origin", () => {
     expect(classifyPreflight(404, "Not Found")).toBe("wrong-origin");
   });
@@ -384,7 +404,7 @@ describe("classifyPreflight", () => {
     expect(classifyPreflight(503, "")).toBe("upstream-down");
   });
 
-  it("classifies Vite's host-check rejection as wrong-origin", () => {
+  it("classifies a blocked/rejected response as wrong-origin", () => {
     expect(classifyPreflight(403, "Blocked request. This host is not allowed.")).toBe("wrong-origin");
   });
 });

@@ -70,19 +70,21 @@ export function getTunnelStatus(): TunnelStatus {
   return { ...status };
 }
 
-// Caddy's HTTP listener (see Caddyfile, started by setup.sh). The tunnel points here, not at
-// the Express server on PORT/3001: Express only ever serves the (possibly stale) web/dist
-// build, while Caddy proxies to Vite, the same upstream the LAN/ai.local path uses. This is
-// what keeps a public tunnel visitor and a LAN visitor looking at identical frontend code.
+// Caddy's HTTP listener (see Caddyfile, started by setup.sh). The tunnel points here, not
+// directly at PORT/3001, because Caddy is what fronts BOTH the tunnel and LAN/ai.local visitors -
+// checking through Caddy is what actually confirms a public visitor would reach the same thing a
+// LAN visitor does. Caddy itself now proxies straight to the Express server (server/src/index.ts),
+// which serves the frontend updateTransaction.ts publishes to web/dist - there is no separate Vite
+// upstream in this path anymore (see this repo's Caddyfile and index.ts's own comment on why).
 const CADDY_HTTP_PORT: number = Number(process.env.CADDY_HTTP_PORT ?? 80);
 const CADDY_PREFLIGHT_TIMEOUT_MS = 2_000;
 
-// If Caddy isn't running, or is running but its upstream (Vite) isn't, cloudflared still
-// starts and reports a URL happily; the failure only shows up as a blank/502 page once
+// If Caddy isn't running, or is running but its upstream (the Express server) isn't, cloudflared
+// still starts and reports a URL happily; the failure only shows up as a blank/502 page once
 // someone actually opens that URL, with nothing in this app's UI pointing at the real cause.
 // Check first so startTunnel can fail with an actionable message instead of a "running"
-// status that lies. Distinguishing "Caddy down" from "Caddy up, Vite down" from "Caddy up,
-// but not proxying to our Vite at all" matters because they point at three different fixes
+// status that lies. Distinguishing "Caddy down" from "Caddy up, server down" from "Caddy up,
+// but not proxying to this app at all" matters because they point at three different fixes
 // (brew services, npm run dev, or a stale/wrong Caddyfile).
 type CaddyPreflightResult = "ok" | "caddy-down" | "upstream-down" | "wrong-origin";
 
@@ -90,14 +92,18 @@ const PREFLIGHT_BODY_CAP_BYTES = 8_192;
 
 // Pure so it's testable without sockets: given the raw response status and a body snippet
 // (already capped), decide which of the four outcomes this preflight hit. 502/503/504 are
-// Caddy's own responses when reverse_proxy can't reach Vite; anything else that isn't a 200
-// serving our actual app shell (web/index.html has both markers) means Caddy answered but
-// isn't fronting this app's Vite (wrong config, stale build, unrelated service on the port).
+// Caddy's own responses when reverse_proxy can't reach the server. A 200 alone isn't enough to
+// call "ok": `<div id="root">` plus a generic `/assets/` path are both common to any React/Vite
+// build, which this preflight exists specifically to rule OUT (a different app entirely could be
+// answering on that port). This checks markers specific to THIS repo's built index.html instead -
+// its title and its favicon path (see web/index.html) - which a generic React/Vite shell won't
+// have. Anything else means Caddy answered but isn't fronting this app (wrong config, an
+// unrelated service on the port).
 export function classifyPreflight(status: number | undefined, bodySnippet: string): CaddyPreflightResult {
   if (status !== undefined && status >= 502 && status <= 504) {
     return "upstream-down";
   }
-  if (status === 200 && bodySnippet.includes('<div id="root">') && bodySnippet.includes("/src/main.tsx")) {
+  if (status === 200 && bodySnippet.includes("<title>AI Multi-Instance</title>") && bodySnippet.includes("/ai-multi-instance.svg")) {
     return "ok";
   }
   return "wrong-origin";

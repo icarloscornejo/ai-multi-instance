@@ -1,6 +1,17 @@
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
+import lockfile from "proper-lockfile";
+import { isCommitPublished, readManifest } from "./frontendPublish";
+import {
+  lockTargetPath as transactionLockPath,
+  spawnAndAwaitUpdateTransaction,
+  spawnUpdateTransaction,
+  transactionResultPath,
+  webDistDir,
+  type TransactionResult,
+} from "./updateTransaction";
+import fs from "node:fs";
 
 const execFileAsync = promisify(execFile);
 
@@ -40,6 +51,21 @@ export interface UpdateStatus {
   // true when HEAD's tree differs from origin/main's: a reset would discard real content,
   // not just replay the same tree under different commit hashes
   resetLosesWork: boolean;
+  // The commit the frontend actually being served (web/dist) was built from, per its own
+  // manifest (frontendPublish.ts) - independent of `currentCommit` (that's just HEAD). These two
+  // can differ for a while after HEAD moves: see frontendPublishPending.
+  publishedCommit: string | null;
+  // True whenever `currentCommit !== publishedCommit`: HEAD has moved (or nothing has ever been
+  // published) and the frontend build hasn't caught up yet, whether because a transaction is
+  // currently running or because the last one failed. Kept separate from `pendingRestart`/
+  // `lastError` (which are about git and server-process state) because publishing the frontend is
+  // now an asynchronous step that git being up to date says nothing about.
+  frontendPublishPending: boolean;
+  // Set from the last failed update-transaction's blockedReason/error (updateTransaction.ts), and
+  // NOT cleared just because a later checkForUpdate's git-side polling succeeds: a build or
+  // publish failure must stay visible until a transaction actually succeeds, or a real failure
+  // would get silently hidden by the very next 30s poll.
+  frontendPublishError: string | null;
 }
 
 const status: UpdateStatus = {
@@ -61,6 +87,9 @@ const status: UpdateStatus = {
   diverged: false,
   localOnlyCommits: [],
   resetLosesWork: false,
+  publishedCommit: null,
+  frontendPublishPending: false,
+  frontendPublishError: null,
 };
 
 // A required update forces auto-install on a countdown with no way to dismiss it, so it
@@ -77,18 +106,31 @@ export function isMajorBump(localVersion: string | null, remoteVersion: string |
   return parseInt(remoteMajor[1], 10) > parseInt(localMajor[1], 10);
 }
 
-// tsx watch restarts the server automatically for changes under server/src, and vite
-// hot-reloads web/src in the browser: those paths need no manual relaunch from the user.
-// This holds for both LAN and tunnel visitors now that the tunnel points at Caddy -> Vite
-// instead of the prebuilt web/dist (see server/src/tunnel.ts), so there's a single frontend
-// pipeline to reason about here, not two. Any other path (package.json, root configs,
-// vite.config, etc.) does require a manual relaunch.
+// Three effects a changed path can have, no longer just two: `tsx watch` restarts the server
+// process automatically for anything under server/src, with nothing else needed. A change that
+// feeds the frontend BUILD (web/src, plus everything else Vite reads to produce it) is also
+// unattended, but on a different, asynchronous timeline: LAN/tunnel visitors are served the
+// prebuilt web/dist (server/src/index.ts, server/src/tunnel.ts - Caddy proxies to Express, not to
+// Vite's dev server), reconstructed by updateTransaction.ts, so "auto" here means "no manual
+// relaunch needed", not "already live" - see reconcileFrontendPublish below for what actually
+// gates that. Anything else (root package.json, vite.config.ts's own config semantics changing in
+// a way a rebuild can't paper over, unrelated root configs) still needs a manual relaunch.
+const FRONTEND_BUILD_PREFIXES = ["web/src/", "web/index.html", "web/public/", "web/vite.config.ts", "web/package.json"];
+const FRONTEND_BUILD_EXACT_PATHS = ["package-lock.json"];
+
+function affectsFrontendBuild(changedPath: string): boolean {
+  return (
+    FRONTEND_BUILD_PREFIXES.some((prefix) => changedPath.startsWith(prefix)) ||
+    FRONTEND_BUILD_EXACT_PATHS.includes(changedPath)
+  );
+}
+
 function classifyRestartKind(changedPaths: string[]): RestartKind {
   if (changedPaths.length === 0) {
     return "none";
   }
   const needsManualRestart: boolean = changedPaths.some(
-    (changedPath) => !changedPath.startsWith("server/src/") && !changedPath.startsWith("web/src/")
+    (changedPath) => !changedPath.startsWith("server/src/") && !affectsFrontendBuild(changedPath)
   );
   return needsManualRestart ? "manual" : "auto";
 }
@@ -171,17 +213,82 @@ async function refreshRestartStatus(currentCommit: string): Promise<void> {
           .filter((changedPath) => changedPath !== "")
       )
     : "none";
-  // "auto" changes are already live via tsx watch / Vite HMR, with no real process
-  // restart coming to bump startedAtCommit on its own: track it here instead, or the
-  // banner would report a pending restart forever even after the user reloads the page
-  if (status.restartKind === "auto") {
+  // A server/src-only change is already live via tsx watch, with no real process restart coming
+  // to bump startedAtCommit on its own: track it here instead, or the banner would report a
+  // pending restart forever even after the user reloads the page. A change that touches the
+  // frontend build is different: it's "auto" in the sense that no MANUAL action is needed, but
+  // it is NOT live yet until updateTransaction.ts actually publishes it - reconcileFrontendPublish
+  // (called right after this, see checkForUpdate/applyUpdate/resetToRemote) is what clears
+  // pendingRestart for that case, once the published commit really matches.
+  if (status.restartKind === "auto" && !frontendBuildIsPending(currentCommit)) {
     status.startedAtCommit = currentCommit;
     status.pendingRestart = false;
   }
 }
 
+// Cheap, synchronous: true whenever the frontend actually being served hasn't caught up to
+// `currentCommit` yet. Shared by refreshRestartStatus (to decide whether "auto" can already be
+// considered resolved) and reconcileFrontendPublish (to decide whether to spawn a transaction).
+function frontendBuildIsPending(currentCommit: string): boolean {
+  return !isCommitPublished(webDistDir, currentCommit);
+}
+
+// Brings status.publishedCommit/frontendPublishPending/frontendPublishError in line with reality,
+// and spawns a transaction if the frontend is behind and nothing is already working on it.
+// Called after every checkForUpdate/applyUpdate/resetToRemote, and once at server startup (see
+// index.ts) - see updateTransaction.ts's header comment for why a separate, detached process
+// (not this one) does the actual work.
+async function reconcileFrontendPublish(currentCommit: string): Promise<void> {
+  const manifest = readManifest(webDistDir);
+  status.publishedCommit = manifest?.commit ?? null;
+  status.frontendPublishPending = frontendBuildIsPending(currentCommit);
+
+  if (!status.frontendPublishPending) {
+    status.frontendPublishError = null;
+    return;
+  }
+
+  // A transaction may already be running (spawned by this reconciliation a moment ago, by
+  // applyUpdate's explicit trigger, or by `setup.sh` run by hand) - checking the real
+  // cross-process lock, not an in-memory flag, is what makes this safe to call on every poll
+  // without piling up redundant child processes (see updateTransaction.ts's header comment on
+  // why an in-memory-only guard can't see setup.sh at all).
+  const alreadyRunning: boolean = await lockfile
+    .check(transactionLockPath)
+    .catch(() => false); // lock target may not exist yet on a fresh checkout - not running, not an error
+  if (!alreadyRunning) {
+    spawnUpdateTransaction();
+  }
+
+  try {
+    const lastResult = JSON.parse(fs.readFileSync(transactionResultPath, "utf8")) as TransactionResult;
+    // Only surface a failure if it's about the commit we're actually waiting on: a stale failure
+    // from a past, already-resolved attempt must not haunt the UI forever.
+    status.frontendPublishError =
+      !lastResult.ok && lastResult.commit === currentCommit ? (lastResult.blockedReason ?? lastResult.error) : null;
+  } catch {
+    status.frontendPublishError = null;
+  }
+}
+
 export function getUpdateStatus(): UpdateStatus {
   return { ...status };
+}
+
+// Called once at server startup (see index.ts), after httpServer.listen() so Express serves
+// whatever is already in web/dist - stale or not - instead of blocking startup on a build. This is
+// what lets a transaction interrupted by a `tsx` restart (see updateTransaction.ts's header
+// comment) self-heal without any user action: the new process, on its very first reconciliation,
+// notices the manifest doesn't match HEAD and spawns a transaction again.
+export async function reconcileFrontendPublishOnStartup(): Promise<void> {
+  try {
+    const currentCommit: string = await runGit(["rev-parse", "HEAD"]);
+    await reconcileFrontendPublish(currentCommit);
+  } catch (error) {
+    // Never let a reconciliation failure at boot take the server down with it - see
+    // frontendPublish.ts's header comment on the same principle for its own read path.
+    console.error("[updater] frontend publish reconciliation failed at startup:", (error as Error).message);
+  }
 }
 
 // Triggered on demand from the UI: fetches origin/main, compares against HEAD, and
@@ -234,6 +341,7 @@ export async function checkForUpdate(): Promise<UpdateStatus> {
 
     await refreshVersionStatus();
     await refreshRestartStatus(currentCommit);
+    await reconcileFrontendPublish(currentCommit);
     status.lastError = null;
   } catch (error) {
     status.lastError = (error as Error).message;
@@ -244,86 +352,47 @@ export async function checkForUpdate(): Promise<UpdateStatus> {
   return getUpdateStatus();
 }
 
-// Shared by applyUpdate's auto-recovery path and the explicit resetToRemote(): tags the
-// abandoned HEAD for a manual undo, then hard-resets onto origin/main and syncs deps.
-// Never called with a dirty working tree: callers must check status --porcelain first.
-async function performReset(): Promise<void> {
-  await runGit(["tag", `pre-reset-${Date.now()}`]);
-  await runGit(["reset", "--hard", "origin/main"]);
-  await execFileAsync("npm", ["install", "--no-audit", "--no-fund"], { cwd: dashboardRepoRoot });
-  // Discard any churn that npm install may have left in the lockfile
-  await runGit(["checkout", "--", "package-lock.json"]).catch(() => undefined);
+// Reflects a finished TransactionResult (updateTransaction.ts) into `status`, the same fields the
+// old inline git logic used to set directly. Shared by applyUpdate and resetToRemote since both
+// now just trigger a transaction and report its outcome, rather than doing git/npm/build
+// themselves - see updateTransaction.ts's header comment for why that moved out of this process.
+function applyTransactionResult(result: TransactionResult): void {
+  if (result.commit !== null) {
+    status.currentCommit = result.commit;
+  }
+  status.blockedReason = result.blockedReason;
+  if (result.ok) {
+    status.changelog = [];
+    status.diverged = false;
+    status.localOnlyCommits = [];
+    status.resetLosesWork = false;
+  }
 }
 
-// Applies an update previously reported by checkForUpdate: fast-forwards onto origin/main
-// and syncs dependencies when behind, or auto-recovers via performReset() when diverged but
-// content-identical (e.g. after a force-pushed history rewrite upstream that changed no
-// tracked content). A divergence that would actually discard local content is left blocked,
-// for resetToRemote() to handle behind an explicit user confirmation.
-export async function applyUpdate(): Promise<UpdateStatus> {
+// Applies an update previously reported by checkForUpdate. All the actual work - fetch,
+// fast-forward or tagged reset, dependency install, frontend build and publish - runs inside
+// updateTransaction.ts under its cross-process lock; this only triggers it and waits for the
+// outcome (spawnAndAwaitUpdateTransaction survives this process being restarted mid-flight by
+// `tsx`, since the transaction itself runs as a detached child - see that module's header comment).
+// A divergence that would discard local content comes back as a blockedReason, same as before;
+// resetToRemote below is the explicit, user-confirmed path past that.
+async function runAndReportTransaction(options: { forceReset?: boolean } = {}): Promise<UpdateStatus> {
   if (updateInProgress) {
     return getUpdateStatus();
   }
   updateInProgress = true;
   try {
-    await runGit(["fetch", "--quiet", "origin", "main"]);
-    const remoteCommit: string = await runGit(["rev-parse", "origin/main"]);
-    let currentCommit: string = await runGit(["rev-parse", "HEAD"]);
+    const result: TransactionResult = await spawnAndAwaitUpdateTransaction(options);
+    applyTransactionResult(result);
+    const currentCommit: string = result.commit ?? (await runGit(["rev-parse", "HEAD"]));
+    const remoteCommit: string = await runGit(["rev-parse", "origin/main"]).catch(() => currentCommit);
     status.remoteCommit = remoteCommit;
-
-    if (currentCommit !== remoteCommit) {
-      const behindRemote: boolean = await isBehindRemote();
-      // npm install regenerates package-lock metadata depending on the npm version;
-      // that local noise is not a user change and must not block updates
-      await runGit(["checkout", "--", "package-lock.json"]).catch(() => undefined);
-      const workingTreeClean: boolean = (await runGit(["status", "--porcelain"])) === "";
-      if (behindRemote && workingTreeClean) {
-        // Fast-forward only: never overwrite local commits or uncommitted changes
-        await runGit(["merge", "--ff-only", "origin/main"]);
-        // The update may have brought a new package-lock: sync dependencies
-        await execFileAsync("npm", ["install", "--no-audit", "--no-fund"], { cwd: dashboardRepoRoot });
-        // Discard any churn that npm install may have left in the lockfile
-        await runGit(["checkout", "--", "package-lock.json"]).catch(() => undefined);
-        currentCommit = remoteCommit;
-        status.blockedReason = null;
-        status.changelog = [];
-        status.diverged = false;
-        status.localOnlyCommits = [];
-        status.resetLosesWork = false;
-      } else if (!behindRemote && workingTreeClean) {
-        const divergence = await inspectDivergence();
-        if (!divergence.resetLosesWork) {
-          await performReset();
-          currentCommit = remoteCommit;
-          status.blockedReason = null;
-          status.changelog = [];
-          status.diverged = false;
-          status.localOnlyCommits = [];
-          status.resetLosesWork = false;
-        } else {
-          status.diverged = true;
-          status.localOnlyCommits = divergence.localOnlyCommits;
-          status.resetLosesWork = true;
-          status.blockedReason = `Local history diverges from origin/main with ${divergence.localOnlyCommits.length} local ${
-            divergence.localOnlyCommits.length === 1 ? "commit" : "commits"
-          } not on origin/main.`;
-        }
-      } else {
-        status.blockedReason = "There are uncommitted local changes in the dashboard folder.";
-      }
-    } else {
-      status.blockedReason = null;
-      status.diverged = false;
-      status.localOnlyCommits = [];
-      status.resetLosesWork = false;
-    }
-
-    status.currentCommit = currentCommit;
     status.currentSubject = await getSubject(currentCommit);
     status.updateAvailable = currentCommit !== remoteCommit;
     await refreshVersionStatus();
     await refreshRestartStatus(currentCommit);
-    status.lastError = null;
+    await reconcileFrontendPublish(currentCommit);
+    status.lastError = result.ok ? null : (result.error ?? status.lastError);
   } catch (error) {
     status.lastError = (error as Error).message;
   } finally {
@@ -331,45 +400,18 @@ export async function applyUpdate(): Promise<UpdateStatus> {
     updateInProgress = false;
   }
   return getUpdateStatus();
+}
+
+export async function applyUpdate(): Promise<UpdateStatus> {
+  return runAndReportTransaction();
 }
 
 // Explicit, user-confirmed recovery for a divergence that would discard local content
-// (status.resetLosesWork === true). Tags the abandoned HEAD before resetting, so it stays
-// recoverable with `git reset --hard <tag>`.
+// (status.resetLosesWork === true). Goes through the exact same transaction as applyUpdate, with
+// forceReset so a real content divergence (not just a content-identical one) is tagged and reset
+// instead of blocking - the only difference from the user's perspective is that this path is only
+// reached after they explicitly accepted losing the local-only commits already listed in
+// status.localOnlyCommits.
 export async function resetToRemote(): Promise<UpdateStatus> {
-  if (updateInProgress) {
-    return getUpdateStatus();
-  }
-  updateInProgress = true;
-  try {
-    await runGit(["fetch", "--quiet", "origin", "main"]);
-    const remoteCommit: string = await runGit(["rev-parse", "origin/main"]);
-    await runGit(["checkout", "--", "package-lock.json"]).catch(() => undefined);
-    const workingTreeClean: boolean = (await runGit(["status", "--porcelain"])) === "";
-    if (!workingTreeClean) {
-      status.blockedReason = "There are uncommitted local changes in the dashboard folder.";
-    } else {
-      await performReset();
-      status.blockedReason = null;
-      status.changelog = [];
-      status.diverged = false;
-      status.localOnlyCommits = [];
-      status.resetLosesWork = false;
-    }
-
-    const currentCommit: string = await runGit(["rev-parse", "HEAD"]);
-    status.currentCommit = currentCommit;
-    status.remoteCommit = remoteCommit;
-    status.currentSubject = await getSubject(currentCommit);
-    status.updateAvailable = currentCommit !== remoteCommit;
-    await refreshVersionStatus();
-    await refreshRestartStatus(currentCommit);
-    status.lastError = null;
-  } catch (error) {
-    status.lastError = (error as Error).message;
-  } finally {
-    status.lastCheckAt = new Date().toISOString();
-    updateInProgress = false;
-  }
-  return getUpdateStatus();
+  return runAndReportTransaction({ forceReset: true });
 }

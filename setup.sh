@@ -102,30 +102,17 @@ if [[ "${agents_found}" -eq 0 ]]; then
   warn "No supported AI CLI was detected. Custom commands and shell-only sessions still work."
 fi
 
-# 4. Dashboard repo + npm dependencies
+# 4. Dashboard repo + npm dependencies + frontend build
 step "Dashboard"
+is_fresh_clone=0
 if [[ -d "${INSTALL_DIR}/.git" ]]; then
-  git -C "${INSTALL_DIR}" fetch origin main
-  # npm install regenerates package-lock metadata depending on the npm version;
-  # discard that noise so it does not count as a local change
-  git -C "${INSTALL_DIR}" checkout -- package-lock.json 2>/dev/null || true
-  if git -C "${INSTALL_DIR}" merge --ff-only origin/main >/dev/null 2>&1; then
-    ok "Repo updated at ${INSTALL_DIR}"
-  elif [[ -z "$(git -C "${INSTALL_DIR}" status --porcelain)" ]]; then
-    # Divergent history (e.g. the remote was rewritten with force push). With no
-    # local changes, realigning the clone with the remote loses nothing.
-    git -C "${INSTALL_DIR}" reset --hard origin/main
-    ok "Divergent history: repo realigned with origin/main at ${INSTALL_DIR}"
-  else
-    warn "Local history diverges from remote and there are uncommitted local changes."
-    echo   "      Check ${INSTALL_DIR} (git status) and then realign with:"
-    echo   "        git -C ${INSTALL_DIR} reset --hard origin/main"
-    exit 1
-  fi
+  ok "Repo already present at ${INSTALL_DIR}"
 else
   git clone "${REPO_URL}" "${INSTALL_DIR}"
   ok "Repo cloned at ${INSTALL_DIR}"
+  is_fresh_clone=1
 fi
+
 # All dependencies are public. On corporate machines, npm often points to a private
 # registry with expired credentials (E401), either via ~/.npmrc or via npm_config_* /
 # NPM_CONFIG_* environment variables that override even the project's .npmrc. The retry
@@ -148,16 +135,46 @@ npm_install_with_clean_config() {
   )
 }
 
-if (cd "${INSTALL_DIR}" && npm install); then
-  ok "npm dependencies installed"
-elif { warn "npm install failed with this machine's npm config. Retrying with a clean config..."; npm_install_with_clean_config; }; then
-  ok "npm dependencies installed (corporate npm config ignored for this project only)"
+if [[ "${is_fresh_clone}" -eq 1 || ! -x "${INSTALL_DIR}/node_modules/.bin/tsx" ]]; then
+  # A brand-new checkout (or an existing one that was cloned by hand and never had `npm install`
+  # run in it) has no node_modules yet, so the update transaction below - which needs tsx and
+  # proper-lockfile, both hoisted to the ROOT node_modules by this npm workspace - can't even be
+  # launched until a first plain `npm install` has happened. Every later run of this script goes
+  # through the transaction instead, once this initial install has bootstrapped it.
+  if (cd "${INSTALL_DIR}" && npm install); then
+    ok "npm dependencies installed"
+  elif { warn "npm install failed with this machine's npm config. Retrying with a clean config..."; npm_install_with_clean_config; }; then
+    ok "npm dependencies installed (corporate npm config ignored for this project only)"
+  else
+    warn "npm install failed even with a clean config. Diagnostics:"
+    echo   "      npm config ls -l | grep -iE 'registry|auth|proxy'"
+    echo   "      If the corporate network blocks registry.npmjs.org, renew the credentials"
+    echo   "      for the internal registry (npm login) and retry:"
+    echo   "        cd ${INSTALL_DIR} && npm install"
+    exit 1
+  fi
+fi
+
+# Fetches, fast-forwards (or tags-and-resets a content-identical divergence), installs
+# dependencies if the lockfile changed, builds the frontend, and publishes it - all under the same
+# cross-process lock the running server itself uses (server/src/updateTransaction.ts), so this can
+# safely run whether or not `npm run dev` is already up in another terminal. See that module's
+# header comment for why this one code path is shared instead of this script doing its own
+# git/npm/build: a lock that only protected the server's OWN process would do nothing here, since
+# this script is a completely separate OS process.
+step "Update transaction (fetch, install, build, publish)"
+if (cd "${INSTALL_DIR}" && node --import tsx server/src/updateTransaction.ts --run); then
+  ok "Dashboard is up to date and its frontend is published"
 else
-  warn "npm install failed even with a clean config. Diagnostics:"
-  echo   "      npm config ls -l | grep -iE 'registry|auth|proxy'"
-  echo   "      If the corporate network blocks registry.npmjs.org, renew the credentials"
-  echo   "      for the internal registry (npm login) and retry:"
-  echo   "        cd ${INSTALL_DIR} && npm install"
+  transaction_result="${INSTALL_DIR}/.update-state/transaction-result.json"
+  if [[ -f "${transaction_result}" ]]; then
+    blocked_reason="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).blockedReason || JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).error || 'unknown')" "${transaction_result}" 2>/dev/null || echo "unknown")"
+    warn "Update transaction did not complete: ${blocked_reason}"
+  else
+    warn "Update transaction did not complete (no result file was written)."
+  fi
+  echo   "      Resolve the issue above, then rerun this script, or run manually:"
+  echo   "        cd ${INSTALL_DIR} && node --import tsx server/src/updateTransaction.ts --run"
   exit 1
 fi
 
@@ -215,10 +232,10 @@ else
 fi
 
 # 6. ai.local: hostname + reverse proxy, so the dashboard is reachable at
-#    http://ai.local with no port suffix, while Vite keeps listening on its
-#    normal unprivileged port 5173 (macOS refuses to bind :80 without root).
+#    http://ai.local with no port suffix, while the dashboard's own server keeps listening on
+#    its normal unprivileged port 3001 (macOS refuses to bind :80 without root).
 #    Caddy is installed as a brew service (a LaunchDaemon running as root, brew's
-#    standard way to let a service bind privileged ports) and proxies 80 -> 5173
+#    standard way to let a service bind privileged ports) and proxies 80 -> 3001
 #    using the repo's Caddyfile.
 step "ai.local"
 
@@ -285,26 +302,40 @@ else
   caddy_config_done=0
 fi
 
-if [[ "${caddy_config_done}" -eq 1 ]]; then
-  ok "Caddy already configured to proxy ai.local -> 5173"
-  if have_sudo_tty && run_as_root brew services list 2>/dev/null | grep -qE '^caddy\s+started'; then
-    run_as_root brew services restart caddy >/dev/null
-    ok "Caddy reloaded with the current dashboard config"
-  fi
-elif ! have_sudo_tty; then
-  warn "No terminal available to prompt for sudo. To finish ai.local setup manually:"
-  echo   "        echo '${caddyfile_import}' >> $(brew --prefix)/etc/Caddyfile"
-  echo   "        sudo brew services start caddy"
-else
-  echo "${caddyfile_import}" >> "${brew_caddyfile}"
-  ok "Caddy configured to proxy ai.local -> 5173"
-  # brew services runs Caddy as a root LaunchDaemon (sudo needed once here, not for
-  # "npm run dev"), so it can bind port 80 and keeps running across reboots.
+# Restarts Caddy if it's already running (picks up a possibly-changed Caddyfile, e.g. this very
+# update switching its upstream from Vite's port to the dashboard server's), or starts it if it
+# isn't. The previous version of this script only ever restarted an already-started Caddy and
+# silently did nothing otherwise, which could leave ai.local unreachable after an apparently
+# successful run - fixed here since this whole section was already being rewritten.
+start_or_restart_caddy() {
   if run_as_root brew services list 2>/dev/null | grep -qE '^caddy\s+started'; then
     run_as_root brew services restart caddy >/dev/null
   else
     run_as_root brew services start caddy >/dev/null
   fi
+}
+
+if [[ "${caddy_config_done}" -eq 1 ]]; then
+  ok "Caddy already configured to proxy ai.local"
+  if have_sudo_tty; then
+    start_or_restart_caddy
+    ok "Caddy is running with the current dashboard config"
+  else
+    warn "No terminal available to prompt for sudo: could not confirm Caddy is running."
+    echo   "      Run manually: sudo brew services restart caddy"
+    exit 1
+  fi
+elif ! have_sudo_tty; then
+  warn "No terminal available to prompt for sudo. To finish ai.local setup manually:"
+  echo   "        echo '${caddyfile_import}' >> $(brew --prefix)/etc/Caddyfile"
+  echo   "        sudo brew services start caddy"
+  exit 1
+else
+  echo "${caddyfile_import}" >> "${brew_caddyfile}"
+  ok "Caddy configured to proxy ai.local"
+  # brew services runs Caddy as a root LaunchDaemon (sudo needed once here, not for
+  # "npm run dev"), so it can bind port 80 and keeps running across reboots.
+  start_or_restart_caddy
   ok "Caddy running as a system service (survives reboots)"
 fi
 

@@ -29,6 +29,12 @@ import {
   type ThemePreference,
 } from "./theme";
 import { getInitialKeyBarPrefs, persistKeyBarPrefs, type KeyBarPref } from "./keyBar";
+import {
+  getInitialRestoreTarget,
+  persistRestoreTargetToSession,
+  resolveRestoredScreen,
+  type MobileScreen,
+} from "./mobileSession";
 import { retryDelayMs } from "./retry";
 import type {
   CreateInstancePayload,
@@ -84,7 +90,23 @@ export function App() {
   const [themePreference, setThemePreference] = useState<ThemePreference>(getInitialThemePreference);
   const [keyBarPrefs, setKeyBarPrefs] = useState<KeyBarPref[]>(getInitialKeyBarPrefs);
   const isMobile: boolean = useIsMobile();
-  const [mobileScreen, setMobileScreen] = useState<"home" | "terminal">("home");
+  // Restored synchronously from sessionStorage, but ONLY when the initial isMobile value is
+  // true: `isMobile` above is already settled for this render by the time this initializer runs,
+  // so a desktop load never picks up a stale "terminal" from a previous mobile session - without
+  // that guard, a desktop tab could start hidden-but-"terminal" internally and jump straight into
+  // it the moment the window narrows past the mobile breakpoint. Whether this restored screen is
+  // still valid (does the remembered instance actually exist) can't be known yet at this point -
+  // instances haven't loaded - so that correction happens once load() resolves, see
+  // instancesLoaded below.
+  const [mobileScreen, setMobileScreen] = useState<MobileScreen>(() =>
+    isMobile ? getInitialRestoreTarget().screen : "home"
+  );
+  // True once the initial instances list has actually loaded (see load()'s success branch
+  // below). Gates two things that would otherwise be wrong during the loading window: the
+  // terminal-with-no-instance fallback (350ish lines down) and the sessionStorage/history sync
+  // effect (just below it) - both need to know the real instance list before they can safely act,
+  // or they'd wrongly treat "still loading" the same as "there is no such instance".
+  const [instancesLoaded, setInstancesLoaded] = useState<boolean>(false);
   // True while the desktop rail has an inline rename open; suppresses the active terminal's
   // own visibility-focus so a rename on a just-selected row doesn't lose focus to xterm two
   // rAF later (see TerminalView's suppressAutoFocus prop).
@@ -158,21 +180,33 @@ export function App() {
           setLoadFailure(null);
           setConfig(loadedConfig);
           setInstances(loadedInstances);
-          const rememberedId: string | null = localStorage.getItem("ccdash.activeInstanceId");
+          // On mobile, a per-tab session target (sessionStorage) takes priority over the
+          // global "last viewed instance" (localStorage): that's what keeps two mobile tabs on
+          // different instances from restoring the same one (see mobileSession.ts's header
+          // comment). Desktop never had a session target to begin with, so it always falls
+          // through to the global one, unchanged from before.
+          const sessionTarget = isMobile ? getInitialRestoreTarget() : null;
+          const sessionInstanceExists: boolean =
+            sessionTarget?.instanceId !== null &&
+            sessionTarget !== null &&
+            loadedInstances.some((candidate) => candidate.id === sessionTarget.instanceId);
+          const rememberedId: string | null =
+            sessionInstanceExists && sessionTarget !== null
+              ? sessionTarget.instanceId
+              : localStorage.getItem("ccdash.activeInstanceId");
           const rememberedInstance: Instance | undefined = loadedInstances.find(
             (candidate) => candidate.id === rememberedId
           );
           const initialInstance: Instance | undefined = rememberedInstance ?? loadedInstances[0];
           setActiveInstanceId(initialInstance?.id ?? null);
-          // Restore the mobile terminal screen on a real reload (pull-to-refresh, gate
-          // login) so it lands back where the user was instead of the home listing. Only
-          // when the remembered instance still exists: rememberedInstance is undefined
-          // both when nothing was ever saved and when it was since deleted, and either
-          // way home is the right landing spot.
-          if (isMobile && rememberedInstance !== undefined && localStorage.getItem("ccdash.mobileScreen") === "terminal") {
-            setMobileScreen("terminal");
-            window.history.pushState({ mobileScreen: "terminal" }, "");
+          // Corrects the synchronous, optimistic restoration from mount (mobileScreen's own
+          // useState initializer): that one couldn't yet know whether the remembered instance
+          // still exists, only what was saved. resolveRestoredScreen degrades to home when it
+          // doesn't - a deleted instance is not a terminal worth showing.
+          if (sessionTarget !== null) {
+            setMobileScreen(resolveRestoredScreen(sessionTarget, sessionInstanceExists));
           }
+          setInstancesLoaded(true);
         })
         .catch((error: Error) => {
           if (cancelled) {
@@ -327,39 +361,85 @@ export function App() {
     }
   }, [activeInstanceId]);
 
-  // Paired with the restore-on-load above, so a real reload while inside a mobile
-  // terminal comes back to the terminal instead of the home listing.
+  // The one place that keeps sessionStorage AND window.history.state in sync with React state,
+  // instead of every call site (enterMobileTerminal, MobileTerminalChrome's onSelectInstance,
+  // confirmDelete picking a fallback instance, ...) having to remember to do it. Reacting to
+  // STATE rather than to specific callbacks is what makes this correct regardless of which of
+  // those call sites actually changed activeInstanceId - see mobileSession.ts's header comment
+  // for why the target has to include instanceId, not just the screen, and this repo's git
+  // history (699ac35 -> this change) for the race this replaces: writing on every render
+  // (including the very first, before load() had resolved anything) used to overwrite the real
+  // stored target with "home"/null before it was ever read back.
+  //
+  // Gated on instancesLoaded so it never runs during the ambiguous window between mount and
+  // load() resolving: if a crash happens in that window, the next load simply restores whatever
+  // was there from the START of this session, which is exactly as good as before this feature
+  // existed - never worse.
   useEffect(() => {
-    if (isMobile) {
-      localStorage.setItem("ccdash.mobileScreen", mobileScreen);
+    if (!isMobile || !instancesLoaded) {
+      return;
     }
-  }, [isMobile, mobileScreen]);
+    persistRestoreTargetToSession({ screen: mobileScreen, instanceId: activeInstanceId });
 
-  // Hardware/gesture back and the in-app back button share this one handler:
-  // both just call history.back(), so there is a single place that closes the terminal
+    const desiredHistoryState = mobileScreen === "terminal" ? { mobileScreen: "terminal", instanceId: activeInstanceId } : null;
+    const currentHistoryState = window.history.state as { mobileScreen?: unknown; instanceId?: unknown } | null;
+    if (desiredHistoryState === null) {
+      return;
+    }
+    if (currentHistoryState?.mobileScreen !== "terminal") {
+      // Home -> terminal: exactly one new entry, so a single Back always lands on home.
+      window.history.pushState(desiredHistoryState, "");
+    } else if (currentHistoryState.instanceId !== desiredHistoryState.instanceId) {
+      // Already viewing a terminal, just switched instance: update the CURRENT entry instead of
+      // pushing another one, or every instance switch would pile up a new Back stop.
+      window.history.replaceState(desiredHistoryState, "");
+    }
+  }, [isMobile, instancesLoaded, mobileScreen, activeInstanceId]);
+
+  // Hardware/gesture back and forward share this one handler. Derives both the screen AND which
+  // instance from event.state (pushed/replaced by the effect above) instead of always forcing
+  // "home": that old behavior made Forward, after a Back out of a terminal, do nothing useful.
   useEffect(() => {
-    const handlePopState = (): void => setMobileScreen("home");
+    const handlePopState = (event: PopStateEvent): void => {
+      const state = event.state as { mobileScreen?: unknown; instanceId?: unknown } | null;
+      if (state?.mobileScreen === "terminal") {
+        setMobileScreen("terminal");
+        if (typeof state.instanceId === "string") {
+          setActiveInstanceId(state.instanceId);
+        }
+      } else {
+        setMobileScreen("home");
+      }
+    };
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
   }, []);
 
-  // Deleting the last-viewed instance (or closing it) can leave activeInstanceId null
-  // while still "inside" the terminal screen; fall back to home rather than show nothing
+  // Deleting the last-viewed instance (or closing it) can leave activeInstanceId null, or
+  // pointing at an instance that no longer exists (e.g. popstate restoring a stale entry for one
+  // deleted meanwhile), while still "inside" the terminal screen; fall back to home rather than
+  // show nothing. Gated on instancesLoaded for the same reason as the sync effect above: during
+  // the loading window activeInstanceId is legitimately still settling, not actually invalid.
   useEffect(() => {
-    if (isMobile && mobileScreen === "terminal" && activeInstanceId === null) {
+    if (!isMobile || !instancesLoaded || mobileScreen !== "terminal") {
+      return;
+    }
+    const activeInstanceStillExists: boolean = instances.some((candidate) => candidate.id === activeInstanceId);
+    if (!activeInstanceStillExists) {
       setMobileScreen("home");
     }
-  }, [isMobile, mobileScreen, activeInstanceId]);
+  }, [isMobile, instancesLoaded, mobileScreen, activeInstanceId, instances]);
 
   // Update is not user-reachable on mobile: no toolbar/rail to host a "check for updates"
   // entry point there, and the small screen isn't a good fit for the commit-comparison UI.
   // A required update still applies itself automatically via the countdown effect below,
   // regardless of screen size; only the optional, user-initiated path is unavailable here.
 
+  // History/sessionStorage sync is handled entirely by the effect above, reacting to state - this
+  // only needs to set the state itself.
   const enterMobileTerminal = useCallback((instanceId: string): void => {
     setActiveInstanceId(instanceId);
     setMobileScreen("terminal");
-    window.history.pushState({ mobileScreen: "terminal" }, "");
   }, []);
 
   const closeMobileTerminal = useCallback((): void => {
