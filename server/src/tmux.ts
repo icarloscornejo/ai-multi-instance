@@ -1,4 +1,6 @@
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import { dirname } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -69,13 +71,75 @@ export async function hasSession(sessionName: string): Promise<boolean> {
   }
 }
 
-// tmux's own, unambiguous way of saying "no such session" - both when a session with this
-// name never existed and when the whole tmux server isn't even running (nothing has ever
-// been created on this socket yet). Matched against stderr rather than exit code alone
-// because execFile's timeout rejection (killed: true) also produces a non-zero exit, and that
-// case must NOT be read as "absent" - see getSessionPresence below for why the distinction is
-// load-bearing, not cosmetic.
-const DEFINITELY_NO_SUCH_SESSION_PATTERN = /can't find session|no server running/i;
+// tmux says "there is no such session" in three different, equally definitive shapes, and
+// which one you get depends on the tmux VERSION and on whether its server socket exists:
+//
+//   - "can't find session: <name>"                              server up, this session isn't
+//   - "no server running on <path>"                             socket present, server dead
+//   - "error connecting to <path> (No such file or directory)"  socket file itself is gone
+//
+// The third shape is what tmux 3.7+ prints when the socket does not exist (older tmux printed
+// "no server running" for that case too - this is a version wording drift, not a bug in our
+// logic). All three mean the same thing here: no session, and nothing a user could have work
+// in.
+//
+// Matched as a WHOLE LINE against the LAST non-empty line of the error text, never as a
+// substring, for two reasons this classifier was burned by:
+//   1. The socket path is interpolated into the message BEFORE the errno string, and the path
+//      can come from TMUX_TMPDIR (accident- or attacker-controlled). A substring match on
+//      "no such file or directory" - or on "can't find session" / "no server running" - would
+//      fire for a path that merely CONTAINS that text while the real errno is "(Permission
+//      denied)", which must stay "unknown": "absent" is what authorizes creation and cleanup.
+//   2. runTmux surfaces `stderr || execError.message`; with empty stderr, Node's own message
+//      is a "Command failed: tmux ..." header line followed by the diagnostic on its own
+//      line. Taking the last non-empty line skips the header. A bare `$` anchor on the whole
+//      multi-line string would instead fail the match and silently send us back to the
+//      deadlock this change exists to fix.
+//
+// Anything else - a permission error, a spawn failure ("spawn tmux ENOENT" is the BINARY
+// missing, not the socket), a timeout - is deliberately NOT matched and stays "unknown".
+const NO_SUCH_SESSION_LINE_PATTERNS: readonly RegExp[] = [
+  /^can't find session\b.*$/i,
+  /^no server running on .+$/i,
+  /^error connecting to .+ \(no such file or directory\)$/i,
+];
+
+// Only the socket-missing shape: used to decide whether to emit the survived-directory
+// warning below. The capture group is the socket path tmux was trying to reach.
+const SOCKET_MISSING_LINE_PATTERN = /^error connecting to (.+) \(no such file or directory\)$/i;
+
+function lastNonEmptyLine(text: string): string | undefined {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  return lines[lines.length - 1];
+}
+
+function isDefinitivelyNoSuchSession(errorMessage: string): boolean {
+  const line = lastNonEmptyLine(errorMessage);
+  return line !== undefined && NO_SUCH_SESSION_LINE_PATTERNS.some((pattern) => pattern.test(line));
+}
+
+// The socket file is gone but its PARENT directory still exists: something ran a tmux server
+// here and the socket (or the server) was removed out from under us. tmux can outlive its
+// socket and recreate it on SIGUSR1, so there is a slim chance a server with live sessions is
+// still running and we are about to start a second one that shadows it. We still return
+// "absent" (blocking on this would reintroduce the deadlock for every ordinary "server died"
+// case, which is the common one), but we make noise so a puzzling empty session has a trail.
+function warnIfSocketDirectorySurvived(socketPath: string): void {
+  try {
+    if (existsSync(dirname(socketPath))) {
+      console.warn(
+        `[server] tmux socket ${socketPath} is missing but its directory survives; treating ` +
+          "the session as absent and recreating it. If a tmux server is somehow still running, " +
+          "recover its sessions with `tmux kill-server` or a manual socket restore before continuing."
+      );
+    }
+  } catch {
+    // A stat failure here must never be what stops us classifying presence.
+  }
+}
 
 export type SessionPresence = "present" | "absent" | "unknown";
 
@@ -91,20 +155,46 @@ export async function getSessionPresence(sessionName: string): Promise<SessionPr
     await runTmux(["has-session", "-t", sessionName]);
     return "present";
   } catch (error) {
-    if (error instanceof TmuxError && !error.killed && DEFINITELY_NO_SUCH_SESSION_PATTERN.test(error.message)) {
-      return "absent";
+    // A timeout (killed: true) is NOT proof the session is gone even though it also exits
+    // non-zero - it stays "unknown" so the caller retries rather than risking a destructive
+    // decision on a stalled tmux.
+    if (!(error instanceof TmuxError) || error.killed || !isDefinitivelyNoSuchSession(error.message)) {
+      return "unknown";
     }
-    return "unknown";
+    const line = lastNonEmptyLine(error.message);
+    const socketMissing = line !== undefined ? SOCKET_MISSING_LINE_PATTERN.exec(line) : null;
+    if (socketMissing !== null) {
+      warnIfSocketDirectorySurvived(socketMissing[1]);
+    }
+    return "absent";
   }
 }
 
-// Set only via a value ("1"/"0"), never via mere presence/absence of the option: relying on
+// Set only via an explicit value, never via mere presence/absence of the option: relying on
 // "does this custom option exist at all" is ambiguous across tmux versions for options that
 // were simply never set (see this file's own comment on tmux 3.7's "=" prefix behavior for
 // precedent on that kind of cross-version fragility), and a legacy session created before this
 // marker existed must read the exact same way as one where the read itself merely failed -
 // both must default to "preserve, do not destroy" (see isSessionInitIncomplete below).
 const SESSION_INIT_MARKER_OPTION = "@ccdash_init_incomplete";
+
+// Three live values, plus two "preserve, never destroy" catch-alls:
+//
+//   "created"    - session exists, the provider launch has NOT been attempted yet. The ONLY
+//                  state safe to destroy-and-recreate: no command was ever sent, so nothing a
+//                  user could have work in.
+//   "launching"  - the provider launch MAY have been applied. sendCommandToSession delivers
+//                  the command text and Enter as two separate tmux calls, and a timeout kills
+//                  the tmux CLIENT without undoing what the SERVER already ran - so the agent
+//                  may be live. Never destroyed on marker basis.
+//   "0"          - fully initialized.
+//   "1"          - LEGACY, from before this three-state protocol. A "1" session could be
+//                  sitting in the post-launch state with a running agent, so the first attach
+//                  after this upgrade must not be what kills it: treated as "0" (preserve).
+//   absent / unreadable - legacy session with no marker, or a failed read. Preserve.
+const MARKER_CREATED = "created";
+const MARKER_LAUNCHING = "launching";
+const MARKER_COMPLETE = "0";
 
 export async function createSession(sessionName: string, workingDirectory: string): Promise<void> {
   // The marker is set in the SAME tmux invocation that creates the session (chained with a
@@ -135,7 +225,7 @@ export async function createSession(sessionName: string, workingDirectory: strin
     "-t",
     sessionName,
     SESSION_INIT_MARKER_OPTION,
-    "1",
+    MARKER_CREATED,
   ]);
   // The tmux status bar is redundant inside the dashboard's embedded terminal
   await runTmux(["set-option", "-t", sessionName, "status", "off"]);
@@ -143,30 +233,41 @@ export async function createSession(sessionName: string, workingDirectory: strin
   await reduceScrollStep();
 }
 
-// Called once initialization (createSession, and the provider launch for a non-shell-only
-// instance) has fully completed - the ONLY thing that clears the marker. Its being cleared is
-// therefore positive proof the session went through a complete init, which is what lets
-// isSessionInitIncomplete safely distinguish "confirmed still mid-init" (marker reads "1")
-// from every other case, including one this process cannot tell apart from "confirmed done":
-// a legacy session, a read that failed outright, or one already marked complete.
-export async function markSessionInitComplete(sessionName: string): Promise<void> {
-  await runTmux(["set-option", "-t", sessionName, SESSION_INIT_MARKER_OPTION, "0"]);
+// Moves the marker to "launching" - called right BEFORE sendCommandToSession, so that if the
+// launch command is applied by the tmux server but then times out on the client, the marker
+// already records "a launch may have happened, do not destroy". Not used for shell-only
+// instances (they never launch a provider and go straight from "created" to complete).
+export async function markSessionLaunching(sessionName: string): Promise<void> {
+  await runTmux(["set-option", "-t", sessionName, SESSION_INIT_MARKER_OPTION, MARKER_LAUNCHING]);
 }
 
-export type SessionInitState = "confirmed-incomplete" | "not-confirmed-incomplete";
+// Called once initialization (createSession, and the provider launch for a non-shell-only
+// instance) has fully completed - the ONLY thing that sets the marker to "0". Its reading "0"
+// is therefore positive proof the session went through a complete init.
+export async function markSessionInitComplete(sessionName: string): Promise<void> {
+  await runTmux(["set-option", "-t", sessionName, SESSION_INIT_MARKER_OPTION, MARKER_COMPLETE]);
+}
 
-// Only an explicit "1" proves incompleteness. Every other outcome - the option reading "0",
-// the option never having been set (a legacy session predating this marker), or the read
-// itself throwing (a timeout, a wedged tmux server) - collapses into the SAME
-// "not-confirmed-incomplete" result. That collapsing is deliberate, not a shortcut: the
-// invariant this whole mechanism exists to protect is that destroying a session must require
-// POSITIVE proof it was left incomplete, never the mere absence of proof it's ready. Getting
-// this wrong the other way (destroying on ambiguity) is what nearly shipped here twice before
-// landing on this design - see the terminal.ts callers for the full history.
+export type SessionInitState = "confirmed-incomplete" | "confirmed-launching" | "not-confirmed-incomplete";
+
+// Only "created" authorizes destroy-and-recreate. "launching" is reported separately so the
+// caller can preserve it. EVERYTHING else - "0", the legacy "1" (which could be a live
+// post-launch session), the option never having been set, or the read itself throwing (a
+// timeout, a wedged tmux server) - collapses into "not-confirmed-incomplete". That collapsing
+// is deliberate: the invariant this whole mechanism exists to protect is that destroying a
+// session must require POSITIVE proof it was left mid-init BEFORE any launch, never the mere
+// absence of proof it's ready. Getting this wrong the other way (destroying on ambiguity) is
+// what nearly shipped here twice before - see the terminal.ts callers for the full history.
 export async function isSessionInitIncomplete(sessionName: string): Promise<SessionInitState> {
   try {
-    const value = await runTmux(["show-options", "-t", sessionName, "-v", SESSION_INIT_MARKER_OPTION]);
-    return value.trim() === "1" ? "confirmed-incomplete" : "not-confirmed-incomplete";
+    const value = (await runTmux(["show-options", "-t", sessionName, "-v", SESSION_INIT_MARKER_OPTION])).trim();
+    if (value === MARKER_CREATED) {
+      return "confirmed-incomplete";
+    }
+    if (value === MARKER_LAUNCHING) {
+      return "confirmed-launching";
+    }
+    return "not-confirmed-incomplete";
   } catch {
     return "not-confirmed-incomplete";
   }
@@ -201,6 +302,15 @@ export async function sendCommandToSession(sessionName: string, command: string)
   await runTmux(["send-keys", "-t", sessionName, "Enter"]);
 }
 
+// tmux's "new-session -s NAME" for a NAME that already exists fails with exactly
+// "duplicate session: NAME". A caller's create attempt hitting this is positive proof the
+// session was NOT created by that attempt - so its rollback path must NOT kill it (it belongs
+// to whoever created it first, possibly with a live agent in it). Kept here, next to the
+// other tmux stderr classifiers, so callers never match raw strings themselves.
+export function isDuplicateSessionError(error: unknown): boolean {
+  return error instanceof TmuxError && /^duplicate session:/i.test(error.message.trim());
+}
+
 // Idempotent: killing a session that's already gone is treated as success, not failure - a
 // caller that already confirmed absence via getSessionPresence, or one recreating a session
 // that vanished on its own between its own probe and this call, should not have to
@@ -211,7 +321,7 @@ export async function killSession(sessionName: string): Promise<void> {
   try {
     await runTmux(["kill-session", "-t", sessionName]);
   } catch (error) {
-    if (error instanceof TmuxError && !error.killed && DEFINITELY_NO_SUCH_SESSION_PATTERN.test(error.message)) {
+    if (error instanceof TmuxError && !error.killed && isDefinitivelyNoSuchSession(error.message)) {
       return;
     }
     throw error;

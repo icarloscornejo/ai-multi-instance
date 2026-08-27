@@ -24,7 +24,12 @@ vi.mock("./tmux", () => ({
   killSession: vi.fn(),
   getSessionPresence: vi.fn(),
   isSessionInitIncomplete: vi.fn(),
+  markSessionLaunching: vi.fn(),
   markSessionInitComplete: vi.fn(),
+  // A plain predicate, not stateful: real impl in tmux.ts matches "duplicate session:" in the
+  // error message. Tests that need it truthy set it per-case; the default (undefined ->
+  // falsy) means "not a duplicate", the common path.
+  isDuplicateSessionError: vi.fn(),
 }));
 
 vi.mock("@lydell/node-pty", () => ({
@@ -39,6 +44,7 @@ import {
   bridgeTerminal,
   closeSocketSafely,
   ensureSessionReady,
+  initializeInstanceSession,
   spawnWithRetry,
   validateTerminalSize,
 } from "./terminal";
@@ -148,7 +154,9 @@ beforeEach(() => {
   vi.mocked(tmux.killSession).mockReset();
   vi.mocked(tmux.getSessionPresence).mockReset();
   vi.mocked(tmux.isSessionInitIncomplete).mockReset();
+  vi.mocked(tmux.markSessionLaunching).mockReset();
   vi.mocked(tmux.markSessionInitComplete).mockReset();
+  vi.mocked(tmux.isDuplicateSessionError).mockReset();
   vi.mocked(nodePty.spawn).mockReset();
 });
 
@@ -286,32 +294,79 @@ describe("ensureSessionReady", () => {
     expect(tmux.markSessionInitComplete).toHaveBeenCalledWith("ccdash-abc123");
   });
 
-  // The original finding this guards against: a timeout (or any failure) firing between
-  // new-session and the provider launch used to leave a session that "exists" but was never
-  // handed a provider, and every future attach would silently accept the empty session
-  // forever. Now: initializeSession only reaches markSessionInitComplete on full success, so
-  // this failure leaves the marker at "1" and the NEXT ensureSessionReady call sees
-  // "confirmed-incomplete" and recreates it instead of accepting it.
-  it("kills a session that failed mid-initialization, so the next attempt recreates it fully instead of finding it half-done", async () => {
+  // Inverted from its previous form on purpose (round-2 audit finding): sendCommandToSession
+  // delivers the command text and Enter as two separate tmux calls, and a timeout on either
+  // kills the tmux CLIENT while the SERVER may already have run it - the agent may be live.
+  // Killing the session in that state destroys real work, so the catch must NOT kill once the
+  // launch point was passed. initializeSession moves the marker to "launching" first
+  // (markSessionLaunching), so a future attach also preserves it (see the "confirmed-launching"
+  // test below).
+  it("does NOT kill a session when the provider launch may already have been applied (send failed after markSessionLaunching)", async () => {
     vi.mocked(tmux.getSessionPresence).mockResolvedValue("absent");
     vi.mocked(tmux.createSession).mockResolvedValue(undefined);
+    vi.mocked(tmux.markSessionLaunching).mockResolvedValue(undefined);
     vi.mocked(tmux.sendCommandToSession).mockRejectedValueOnce(new Error("tmux command timed out"));
 
     await expect(ensureSessionReady(makeInstance({ shellOnly: false }))).rejects.toThrow("tmux command timed out");
-    expect(tmux.killSession).toHaveBeenCalledWith("ccdash-abc123");
+    expect(tmux.killSession).not.toHaveBeenCalled();
     expect(tmux.markSessionInitComplete).not.toHaveBeenCalled();
-
-    // Simulate the kill having worked and the process retrying: getSessionPresence now
-    // reports the session gone again, and the next attempt succeeds cleanly, recreating it
-    // (and this time launching the provider, and marking it complete) from scratch.
-    vi.mocked(tmux.sendCommandToSession).mockResolvedValueOnce(undefined);
-    await ensureSessionReady(makeInstance({ shellOnly: false }));
-    expect(tmux.createSession).toHaveBeenCalledTimes(2);
-    expect(tmux.sendCommandToSession).toHaveBeenCalledTimes(2);
-    expect(tmux.markSessionInitComplete).toHaveBeenCalledTimes(1);
   });
 
-  it("recreates a session confirmed incomplete (marker reads '1'), killing it first", async () => {
+  it("marks the session 'launching' BEFORE sending the launch command, never after", async () => {
+    const calls: string[] = [];
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("absent");
+    vi.mocked(tmux.createSession).mockImplementation(async () => {
+      calls.push("createSession");
+    });
+    vi.mocked(tmux.markSessionLaunching).mockImplementation(async () => {
+      calls.push("markSessionLaunching");
+    });
+    vi.mocked(tmux.sendCommandToSession).mockImplementation(async () => {
+      calls.push("sendCommandToSession");
+    });
+
+    await ensureSessionReady(makeInstance({ shellOnly: false }));
+    expect(calls).toEqual(["createSession", "markSessionLaunching", "sendCommandToSession"]);
+  });
+
+  it("still cleans up when markSessionLaunching fails - nothing was launched yet - and never sends the command", async () => {
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("absent");
+    vi.mocked(tmux.createSession).mockResolvedValue(undefined);
+    vi.mocked(tmux.markSessionLaunching).mockRejectedValueOnce(new Error("tmux command timed out"));
+
+    await expect(ensureSessionReady(makeInstance({ shellOnly: false }))).rejects.toThrow("tmux command timed out");
+    expect(tmux.sendCommandToSession).not.toHaveBeenCalled();
+    expect(tmux.killSession).toHaveBeenCalledWith("ccdash-abc123");
+  });
+
+  it("does NOT kill a session when createSession fails with 'duplicate session' - this call did not create it", async () => {
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("absent");
+    vi.mocked(tmux.createSession).mockRejectedValueOnce(new Error("duplicate session: ccdash-abc123"));
+    vi.mocked(tmux.isDuplicateSessionError).mockReturnValue(true);
+
+    await expect(ensureSessionReady(makeInstance())).rejects.toThrow("duplicate session");
+    expect(tmux.killSession).not.toHaveBeenCalled();
+  });
+
+  it("DOES kill on a genuine (non-duplicate) createSession failure - the legitimate rollback still works", async () => {
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("absent");
+    vi.mocked(tmux.createSession).mockRejectedValueOnce(new Error("new-session failed: bad cwd"));
+    vi.mocked(tmux.isDuplicateSessionError).mockReturnValue(false);
+
+    await expect(ensureSessionReady(makeInstance())).rejects.toThrow("new-session failed");
+    expect(tmux.killSession).toHaveBeenCalledWith("ccdash-abc123");
+  });
+
+  it("preserves a session whose marker reads 'launching' - a provider launch that may be live", async () => {
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("present");
+    vi.mocked(tmux.isSessionInitIncomplete).mockResolvedValue("confirmed-launching");
+    await ensureSessionReady(makeInstance({ shellOnly: false }));
+    expect(tmux.killSession).not.toHaveBeenCalled();
+    expect(tmux.createSession).not.toHaveBeenCalled();
+    expect(tmux.enableMouseMode).toHaveBeenCalledWith("ccdash-abc123");
+  });
+
+  it("recreates a session confirmed incomplete (marker reads 'created'), killing it first", async () => {
     vi.mocked(tmux.getSessionPresence).mockResolvedValue("present");
     vi.mocked(tmux.isSessionInitIncomplete).mockResolvedValue("confirmed-incomplete");
     vi.mocked(tmux.killSession).mockResolvedValue(undefined);
@@ -380,6 +435,55 @@ describe("ensureSessionReady", () => {
     await ensureSessionReady(instance);
     await ensureSessionReady(instance);
     expect(tmux.getSessionPresence).toHaveBeenCalledTimes(2);
+  });
+});
+
+// The parameterised sequence POST /api/instances (routes.ts) reuses. The attach path exercises
+// it via ensureSessionReady above; these cover the `onSessionCreated` hook routes.ts wedges in
+// to persist the instance between "session exists" and "provider launched".
+describe("initializeInstanceSession (onSessionCreated hook)", () => {
+  it("runs the hook after createSession and before markSessionLaunching / sendCommandToSession", async () => {
+    const calls: string[] = [];
+    vi.mocked(tmux.createSession).mockImplementation(async () => {
+      calls.push("createSession");
+    });
+    vi.mocked(tmux.markSessionLaunching).mockImplementation(async () => {
+      calls.push("markSessionLaunching");
+    });
+    vi.mocked(tmux.sendCommandToSession).mockImplementation(async () => {
+      calls.push("sendCommandToSession");
+    });
+
+    await initializeInstanceSession(makeInstance({ shellOnly: false }), async () => {
+      calls.push("hook");
+    });
+    expect(calls).toEqual(["createSession", "hook", "markSessionLaunching", "sendCommandToSession"]);
+  });
+
+  it("treats a hook failure as a pre-launch failure: kills the session and propagates", async () => {
+    vi.mocked(tmux.createSession).mockResolvedValue(undefined);
+    vi.mocked(tmux.isDuplicateSessionError).mockReturnValue(false);
+
+    await expect(
+      initializeInstanceSession(makeInstance({ shellOnly: false }), async () => {
+        throw new Error("saveState failed");
+      })
+    ).rejects.toThrow("saveState failed");
+    expect(tmux.killSession).toHaveBeenCalledWith("ccdash-abc123");
+    expect(tmux.sendCommandToSession).not.toHaveBeenCalled();
+  });
+
+  it("does NOT kill when the launch fails after the hook already ran (a live agent may be in the session)", async () => {
+    vi.mocked(tmux.createSession).mockResolvedValue(undefined);
+    vi.mocked(tmux.markSessionLaunching).mockResolvedValue(undefined);
+    vi.mocked(tmux.sendCommandToSession).mockRejectedValueOnce(new Error("tmux command timed out"));
+    const hook = vi.fn(async () => {});
+
+    await expect(initializeInstanceSession(makeInstance({ shellOnly: false }), hook)).rejects.toThrow(
+      "tmux command timed out"
+    );
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect(tmux.killSession).not.toHaveBeenCalled();
   });
 });
 

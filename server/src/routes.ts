@@ -6,11 +6,11 @@ import path from "node:path";
 import { promisify } from "node:util";
 import express, { type Request, type Response, type NextFunction, type Router } from "express";
 import { AUTH_COOKIE_NAME, checkPassword, isAuthEnabled, issueToken, readCookie, requireAuth, setStoredPassword, verifyToken } from "./auth";
-import { buildLaunchCommand } from "./launch";
 import { isAgentProvider, PROVIDERS, sessionKeyFor } from "./providers";
 import { pathExists } from "./paths";
 import { loadState, saveState } from "./store";
-import { createSession, exitCopyMode, getPaneCurrentPath, killSession, markSessionInitComplete, sendCommandToSession } from "./tmux";
+import { exitCopyMode, getPaneCurrentPath, killSession } from "./tmux";
+import { initializeInstanceSession } from "./terminal";
 import { getTunnelStatus, readTunnelLog, startTunnel, stopTunnel } from "./tunnel";
 import { applyUpdate, checkForUpdate, getUpdateStatus, resetToRemote } from "./updater";
 import type {
@@ -710,27 +710,31 @@ apiRouter.post(
       await writeSessionSnapshot(instance, resumeSessionId, sessionFile ? { sessionFile } : {});
     }
 
+    // Same guarded create+launch sequence the attach path uses (terminal.ts's
+    // initializeInstanceSession), with the instance persisted in the hook that fires right
+    // after the session exists and BEFORE the provider launch: once the launch may have been
+    // applied, a failure must not strand a live agent in a session with no instance record
+    // pointing at it (no attach route, no DELETE). `persisted` tells the two failure kinds
+    // apart - a create failure before the hook is a real 500 with nothing saved; a
+    // post-launch failure keeps the 201 and the running session, the user attaches or
+    // deletes explicitly.
+    let persisted = false;
     try {
-      await createSession(instance.tmuxSession, instance.locationPath);
-      if (!shellOnly) {
-        await sendCommandToSession(instance.tmuxSession, buildLaunchCommand(instance, { resumeSessionId }));
-      }
-      // Mirrors terminal.ts's initializeSession: createSession sets an init-incomplete
-      // marker atomically with session creation (tmux.ts), and clearing it here - only once
-      // every step above has actually succeeded - is what proves to a FUTURE attach
-      // (ensureSessionReady) that this session doesn't need to be recreated. Skipping this
-      // would leave every session created through this endpoint reading as "confirmed
-      // incomplete" forever, so the very first terminal attach to it would destroy and
-      // recreate a session that never had a single problem.
-      await markSessionInitComplete(instance.tmuxSession);
+      await initializeInstanceSession(instance, async () => {
+        state.instances.push(instance);
+        await saveState(state);
+        persisted = true;
+      });
     } catch (error) {
-      // The location is a permanent user folder: only the session is cleaned up, not the disk
-      await killSession(instance.tmuxSession).catch(() => undefined);
-      throw error;
+      if (!persisted) {
+        throw error;
+      }
+      console.error(
+        `[server] instance ${instance.id}: provider launch did not confirm, keeping the session`,
+        (error as Error).message
+      );
     }
 
-    state.instances.push(instance);
-    await saveState(state);
     response.status(201).json(instance);
   })
 );

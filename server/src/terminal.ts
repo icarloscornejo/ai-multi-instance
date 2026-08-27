@@ -22,9 +22,11 @@ import {
   createSession,
   enableMouseMode,
   getSessionPresence,
+  isDuplicateSessionError,
   isSessionInitIncomplete,
   killSession,
   markSessionInitComplete,
+  markSessionLaunching,
   sendCommandToSession,
 } from "./tmux";
 import type { InstanceRecord } from "./types";
@@ -299,16 +301,45 @@ const sessionInitInFlight = new Map<string, Promise<void>>();
 //    sequence, with the exact same half-initialized consequence, even with no cancellation
 //    involved at all: killing tmux's own client process on timeout does not undo commands
 //    the tmux SERVER already applied (new-session already ran; only the later provider
-//    launch timed out). That failure mode is handled by the catch below: if anything in
-//    this sequence throws after the session started existing, the (now-broken) session is
-//    killed before the error propagates, so the next attempt - this same caller retrying,
-//    or a concurrent one released from the in-flight map below - recreates it from scratch.
-//    markSessionInitComplete is only ever reached on the success path, after every step
-//    above it succeeded, which is what makes clearing the marker meaningful proof at all.
-async function initializeSession(instance: InstanceRecord): Promise<void> {
+//    launch timed out). The catch below cleans that up, but ONLY when it is provably safe:
+//
+//    - never once the launch command may have been delivered (`launchMayHaveBeenApplied`).
+//      sendCommandToSession sends the command text and Enter as two separate tmux calls; a
+//      timeout on either kills the client, not the running agent. The flag is set
+//      synchronously right after markSessionLaunching's await and before sendCommandToSession,
+//      so any failure from the send onward preserves. markSessionLaunching itself failing
+//      still cleans up: nothing was launched yet.
+//    - never when the error is `duplicate session` - positive proof this call did not create
+//      the session, so it is not ours to kill.
+//
+//    The marker is the complementary guard for the case where THIS process dies before the
+//    catch runs: "created" -> a future attach recreates; "launching" -> a future attach
+//    preserves. See tmux.ts's isSessionInitIncomplete.
+//
+//    Residual race, deliberately not closed here: a timeout on new-session itself is
+//    ambiguous (applied or not), so with two dashboard PROCESSES one could still kill a
+//    session the other just created, via an error that isn't "duplicate session". Closing
+//    that needs an ownership token set atomically with new-session and a server-side
+//    check-and-kill; out of scope (high complexity, requires concurrent dashboards).
+//
+// Exported and parameterised with `onSessionCreated` because POST /api/instances (routes.ts)
+// needs to run the EXACT same guarded sequence, with one extra step wedged in: it persists
+// the instance record right after the session exists and BEFORE the provider launch, so a
+// launch that half-applies can never leave a live agent in a session with no instance record
+// pointing at it. The attach path (initializeSession below) passes no hook.
+export async function initializeInstanceSession(
+  instance: InstanceRecord,
+  onSessionCreated?: () => Promise<void>
+): Promise<void> {
+  let launchMayHaveBeenApplied = false;
   try {
     await createSession(instance.tmuxSession, instance.locationPath);
+    if (onSessionCreated !== undefined) {
+      await onSessionCreated();
+    }
     if (instance.shellOnly !== true) {
+      await markSessionLaunching(instance.tmuxSession);
+      launchMayHaveBeenApplied = true;
       await sendCommandToSession(
         instance.tmuxSession,
         buildLaunchCommand(instance, { resumeSessionId: instance.sessionId ?? undefined })
@@ -316,15 +347,21 @@ async function initializeSession(instance: InstanceRecord): Promise<void> {
     }
     await markSessionInitComplete(instance.tmuxSession);
   } catch (error) {
-    try {
-      await killSession(instance.tmuxSession);
-    } catch {
-      // Best-effort: if the session never actually got created (e.g. the very first
-      // tmux call itself failed/timed out before "new-session" ran), this just fails
-      // harmlessly and there is nothing to clean up.
+    if (!launchMayHaveBeenApplied && !isDuplicateSessionError(error)) {
+      try {
+        await killSession(instance.tmuxSession);
+      } catch {
+        // Best-effort: if the session never actually got created (e.g. the very first
+        // tmux call itself failed/timed out before "new-session" ran), this just fails
+        // harmlessly and there is nothing to clean up.
+      }
     }
     throw error;
   }
+}
+
+async function initializeSession(instance: InstanceRecord): Promise<void> {
+  await initializeInstanceSession(instance);
 }
 
 // Ensures the instance's tmux session exists and is fully initialized - joining an already
@@ -347,12 +384,13 @@ async function initializeSession(instance: InstanceRecord): Promise<void> {
 //      the opposite twice over (sessions and their output survive dashboard restarts).
 //
 // The design that survived: the marker (tmux.ts's SESSION_INIT_MARKER_OPTION) proves
-// INCOMPLETENESS, never readiness, and only a POSITIVE "1" reading counts as proof - a
-// legacy session with no marker, a session whose marker read failed, and a session already
-// marked complete are all indistinguishable to this function ON PURPOSE, and all three are
-// preserved untouched. The invariant this exists to protect: destroying a session must
-// require positive evidence it was left incomplete, never the mere absence of evidence it's
-// fine. See tmux.ts's isSessionInitIncomplete/getSessionPresence for the full mechanism.
+// INCOMPLETENESS, never readiness, and only a "created" reading (this process made it, no
+// launch attempted yet) counts as proof it is safe to recreate. A "launching" session (a
+// provider launch that may have been applied - a live agent could be in it), a legacy "1"
+// session, a session with no marker, a failed marker read, and an already-complete session
+// are all preserved untouched. The invariant this exists to protect: destroying a session
+// must require positive evidence it was left incomplete BEFORE any launch, never the mere
+// absence of evidence it's fine. See tmux.ts's isSessionInitIncomplete/getSessionPresence.
 export async function ensureSessionReady(instance: InstanceRecord): Promise<void> {
   const existing = sessionInitInFlight.get(instance.tmuxSession);
   if (existing !== undefined) {
@@ -377,18 +415,19 @@ export async function ensureSessionReady(instance: InstanceRecord): Promise<void
 
     // presence === "present" from here on.
     const initState = await isSessionInitIncomplete(instance.tmuxSession);
-    if (initState === "not-confirmed-incomplete") {
-      // Legacy session, already-complete session, or an unreadable marker: preserve as-is.
-      // Migrate sessions that were alive before mouse mode existed (createSession already
-      // enables it for new ones); set-option is idempotent, no cost in repeating it.
+    if (initState !== "confirmed-incomplete") {
+      // "not-confirmed-incomplete" (legacy session, legacy "1" marker, already-complete
+      // session, unreadable marker) OR "confirmed-launching" (a provider launch that may
+      // already be running an agent): preserve as-is. Only a "created" marker - set by this
+      // version, before any launch - authorizes recreation. Migrate sessions that were alive
+      // before mouse mode existed; set-option is idempotent, no cost in repeating it.
       await enableMouseMode(instance.tmuxSession);
       return;
     }
 
-    // Confirmed incomplete: this exact process created this session and never finished
-    // initializing it (a crash, a killed provider launch) - the marker reading "1" is
-    // positive proof no user work could exist in it yet, since it's only cleared after the
-    // provider launch commands were sent. Safe to recreate from scratch.
+    // Confirmed incomplete: this exact process created this session and never got as far as
+    // attempting the provider launch - the marker reading "created" is positive proof no user
+    // work could exist in it yet. Safe to recreate from scratch.
     await killSession(instance.tmuxSession).catch(() => {
       // Best-effort: if the session already vanished on its own between the presence check
       // above and here, there is nothing left to clean up.

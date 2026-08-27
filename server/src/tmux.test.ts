@@ -1,3 +1,4 @@
+import { tmpdir } from "node:os";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // child_process.execFile has its own util.promisify.custom implementation (resolving to
@@ -19,6 +20,7 @@ import {
   TmuxError,
   createSession,
   getSessionPresence,
+  isDuplicateSessionError,
   isSessionInitIncomplete,
   killSession,
 } from "./tmux";
@@ -75,16 +77,98 @@ describe("getSessionPresence", () => {
     runTmuxMock.mockRejectedValue(execError({ stderr: "server communication error" }));
     expect(await getSessionPresence("ccdash-abc")).toBe("unknown");
   });
+
+  // tmux 3.7+ prints this instead of "no server running" when the socket file itself is gone.
+  // A socket dir that does not exist keeps warnIfSocketDirectorySurvived quiet in the test log.
+  it("returns 'absent' for the tmux 3.7 socket-missing wording", async () => {
+    runTmuxMock.mockRejectedValue(
+      execError({ stderr: "error connecting to /ccdash-nonexistent-xyz/tmux-501/default (No such file or directory)" })
+    );
+    expect(await getSessionPresence("ccdash-abc")).toBe("absent");
+  });
+
+  it("warns but still returns 'absent' when the socket is gone yet its directory survives", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // dirname of this path is tmpdir() itself, which always exists.
+    runTmuxMock.mockRejectedValue(
+      execError({ stderr: `error connecting to ${tmpdir()}/ccdash-probe-socket (No such file or directory)` })
+    );
+    expect(await getSessionPresence("ccdash-abc")).toBe("absent");
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(String(warnSpy.mock.calls[0]?.[0])).toContain("is missing but its directory survives");
+    warnSpy.mockRestore();
+  });
+
+  // A connect error that is NOT ENOENT (here EACCES) means the socket exists but we can't
+  // reach it - the server may be alive with the user's work in it. Must stay "unknown".
+  it("returns 'unknown' for 'error connecting to ... (Permission denied)'", async () => {
+    runTmuxMock.mockRejectedValue(
+      execError({ stderr: "error connecting to /private/tmp/tmux-501/default (Permission denied)" })
+    );
+    expect(await getSessionPresence("ccdash-abc")).toBe("unknown");
+  });
+
+  // The socket path is interpolated BEFORE the errno string and can come from TMUX_TMPDIR.
+  // A path that merely contains an absence phrase must not flip a real permission error to
+  // "absent" - the classifier matches the LAST line as a whole, not a substring anywhere.
+  it("returns 'unknown' when the socket path contains an absence phrase but the real errno is a permission error", async () => {
+    for (const poisonPath of [
+      "/tmp/can't find session/default",
+      "/tmp/no server running on x/default",
+      "/tmp/(No such file or directory)/default",
+    ]) {
+      runTmuxMock.mockRejectedValue(
+        execError({ stderr: `error connecting to ${poisonPath} (Permission denied)` })
+      );
+      expect(await getSessionPresence("ccdash-abc")).toBe("unknown");
+    }
+  });
+
+  it("classifies on the LAST non-empty line, tolerating a warning line before the real diagnostic", async () => {
+    runTmuxMock.mockRejectedValue(
+      execError({ stderr: "some deprecation warning\nno server running on /tmp/tmux-501/default" })
+    );
+    expect(await getSessionPresence("ccdash-abc")).toBe("absent");
+  });
+
+  // runTmux surfaces `stderr || execError.message`; with empty stderr the message is Node's
+  // "Command failed: ..." header plus the diagnostic on its own line.
+  it("still classifies via execError.message when stderr is empty", async () => {
+    runTmuxMock.mockRejectedValue(
+      execError({ stderr: "", message: "Command failed: tmux has-session -t ccdash-abc\nno server running on /tmp/tmux-501/default" })
+    );
+    expect(await getSessionPresence("ccdash-abc")).toBe("absent");
+  });
+
+  // "spawn tmux ENOENT" is the tmux BINARY missing, not the socket - misreading it as an
+  // absent session would spin an infinite create-and-fail loop.
+  it("returns 'unknown' for 'spawn tmux ENOENT' (missing binary, not missing socket)", async () => {
+    runTmuxMock.mockRejectedValue(execError({ stderr: "", message: "spawn tmux ENOENT" }));
+    expect(await getSessionPresence("ccdash-abc")).toBe("unknown");
+  });
 });
 
 describe("isSessionInitIncomplete", () => {
-  it("returns 'confirmed-incomplete' only when the marker reads exactly '1'", async () => {
-    runTmuxMock.mockResolvedValue({ stdout: "1\n", stderr: "" });
+  it("returns 'confirmed-incomplete' only when the marker reads exactly 'created'", async () => {
+    runTmuxMock.mockResolvedValue({ stdout: "created\n", stderr: "" });
     expect(await isSessionInitIncomplete("ccdash-abc")).toBe("confirmed-incomplete");
+  });
+
+  it("returns 'confirmed-launching' when the marker reads 'launching' (a provider launch that may be live)", async () => {
+    runTmuxMock.mockResolvedValue({ stdout: "launching\n", stderr: "" });
+    expect(await isSessionInitIncomplete("ccdash-abc")).toBe("confirmed-launching");
   });
 
   it("returns 'not-confirmed-incomplete' when the marker reads '0' (already complete)", async () => {
     runTmuxMock.mockResolvedValue({ stdout: "0\n", stderr: "" });
+    expect(await isSessionInitIncomplete("ccdash-abc")).toBe("not-confirmed-incomplete");
+  });
+
+  // The legacy value from before the three-state protocol. A "1" session could be sitting in
+  // the post-launch state with a running agent, so the first attach after this upgrade must
+  // NOT read it as destroyable.
+  it("returns 'not-confirmed-incomplete' for the legacy '1' marker (never destroy on upgrade)", async () => {
+    runTmuxMock.mockResolvedValue({ stdout: "1\n", stderr: "" });
     expect(await isSessionInitIncomplete("ccdash-abc")).toBe("not-confirmed-incomplete");
   });
 
@@ -110,7 +194,7 @@ describe("createSession", () => {
   // for a whole release. tmux.real.test.ts covers the part this test structurally cannot: that
   // the real tmux binary treats this exact argv as "create the session AND set the marker",
   // not as "create the session, then run a doomed shell-command".
-  it("chains the init-incomplete marker into the same tmux invocation that creates the session", async () => {
+  it("chains the init marker into the same tmux invocation that creates the session", async () => {
     runTmuxMock.mockResolvedValue({ stdout: "", stderr: "" });
     await createSession("ccdash-abc", "/tmp/project");
     const firstCallArguments = runTmuxMock.mock.calls[0]?.[1] as string[];
@@ -126,8 +210,23 @@ describe("createSession", () => {
       "-t",
       "ccdash-abc",
       "@ccdash_init_incomplete",
-      "1",
+      "created",
     ]);
+  });
+});
+
+describe("isDuplicateSessionError", () => {
+  it("is true only for tmux's 'duplicate session' rejection", async () => {
+    runTmuxMock.mockRejectedValue(execError({ stderr: "duplicate session: ccdash-abc" }));
+    let caught: unknown;
+    try {
+      await createSession("ccdash-abc", "/tmp/project");
+    } catch (error) {
+      caught = error;
+    }
+    expect(isDuplicateSessionError(caught)).toBe(true);
+    expect(isDuplicateSessionError(new Error("duplicate session: ccdash-abc"))).toBe(false);
+    expect(isDuplicateSessionError(execError({ stderr: "can't find session: ccdash-abc" }))).toBe(false);
   });
 });
 
