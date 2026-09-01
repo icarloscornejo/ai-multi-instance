@@ -3,6 +3,10 @@ import { useEffect, useRef, type ReactNode, type RefObject } from "react";
 // Tracks nested modals/sheets so Escape closes only the topmost one instead of the whole stack
 const openModalCloseHandlers: (() => void)[] = [];
 
+// Stable no-op so a non-dismissable Modal still occupies the Escape stack (keeping a modal
+// underneath it from catching Escape) without doing anything when Escape is pressed.
+const NOOP = (): void => {};
+
 const FOCUSABLE_SELECTOR: string =
   'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
@@ -91,10 +95,22 @@ interface ModalProps {
   // right-aligned in the header row instead of forcing callers to duplicate the dialog shell
   // just to add one.
   headerActions?: ReactNode;
+  // When false, Escape and a backdrop click do NOT close the modal. NewInstanceModal sets
+  // this while a launch is streaming so the progress log the user asked for is not dismissed
+  // mid-flight. The server-side work does not depend on the modal staying open; this is
+  // purely so the trace stays visible.
+  dismissable?: boolean;
 }
 
-export function Modal({ title, onClose, children, widthClassName = "w-[420px]", headerActions }: ModalProps) {
-  useModalEscapeStack(onClose);
+export function Modal({
+  title,
+  onClose,
+  children,
+  widthClassName = "w-[420px]",
+  headerActions,
+  dismissable = true,
+}: ModalProps) {
+  useModalEscapeStack(dismissable ? onClose : NOOP);
   const dialogRef = useRef<HTMLDivElement>(null);
   useFocusTrap(dialogRef);
 
@@ -102,7 +118,7 @@ export function Modal({ title, onClose, children, widthClassName = "w-[420px]", 
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-overlay"
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget) {
+        if (dismissable && event.target === event.currentTarget) {
           onClose();
         }
       }}

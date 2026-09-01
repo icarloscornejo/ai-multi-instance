@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { api, ApiError } from "../api";
+import { api, ApiError, type LaunchEvent } from "../api";
+import { applyLaunchEvent, type LaunchStepView } from "../launchSteps";
 import type { AgentProvider, BranchAction, CreateInstancePayload, Instance, LocationBranches, LocationInfo } from "../types";
 import { Modal } from "./Modal";
 import { BranchSearchModal, type SourceSelection } from "./BranchSearchModal";
@@ -19,8 +20,12 @@ const EFFORT_OPTIONS: { value: string; label: string }[] = [
 interface NewInstanceModalProps {
   instances: Instance[];
   enabledProviders: AgentProvider[];
-  onCreate: (payload: CreateInstancePayload) => Promise<void>;
+  onCreate: (payload: CreateInstancePayload, onProgress?: (event: LaunchEvent) => void) => Promise<void>;
   onClose: () => void;
+}
+
+function formatStepDuration(ms: number): string {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
 }
 
 function describeBranch(branchInfo: LocationBranches, branchAction: BranchAction | null): string {
@@ -47,6 +52,7 @@ export function NewInstanceModal({ instances, enabledProviders, onCreate, onClos
   const [shellOnly, setShellOnly] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState<boolean>(false);
+  const [launchSteps, setLaunchSteps] = useState<LaunchStepView[]>([]);
 
   const [branchInfo, setBranchInfo] = useState<LocationBranches | null>(null);
   const [branchAction, setBranchAction] = useState<BranchAction | null>(null);
@@ -133,18 +139,22 @@ export function NewInstanceModal({ instances, enabledProviders, onCreate, onClos
   const launchInstance = async (resumeSession?: boolean): Promise<void> => {
     setSubmitting(true);
     setErrorMessage(null);
+    setLaunchSteps([]);
     try {
-      await onCreate({
-        locationPath: locationPath.trim(),
-        label: trimmedLabel,
-        provider,
-        command: shellOnly ? undefined : command.trim() === "" ? undefined : command.trim(),
-        model: shellOnly ? undefined : model === "" ? undefined : model,
-        effort: shellOnly ? undefined : effort === "" ? undefined : effort,
-        branchAction: branchAction ?? undefined,
-        shellOnly: shellOnly || undefined,
-        resumeSession,
-      });
+      await onCreate(
+        {
+          locationPath: locationPath.trim(),
+          label: trimmedLabel,
+          provider,
+          command: shellOnly ? undefined : command.trim() === "" ? undefined : command.trim(),
+          model: shellOnly ? undefined : model === "" ? undefined : model,
+          effort: shellOnly ? undefined : effort === "" ? undefined : effort,
+          branchAction: branchAction ?? undefined,
+          shellOnly: shellOnly || undefined,
+          resumeSession,
+        },
+        (event) => setLaunchSteps((previousSteps) => applyLaunchEvent(previousSteps, event))
+      );
     } catch (error) {
       setErrorMessage(error instanceof ApiError ? error.message : "Unexpected error creating the instance.");
       setSubmitting(false);
@@ -197,7 +207,7 @@ export function NewInstanceModal({ instances, enabledProviders, onCreate, onClos
 
   return (
     <>
-      <Modal title="New instance" onClose={onClose} widthClassName="w-[560px]">
+      <Modal title="New instance" onClose={onClose} widthClassName="w-[560px]" dismissable={!submitting}>
         <div>
           <label className={fieldLabelClassName}>Source</label>
           <button
@@ -342,7 +352,7 @@ export function NewInstanceModal({ instances, enabledProviders, onCreate, onClos
         {errorMessage !== null && <div className={errorTextClassName}>{errorMessage}</div>}
 
         <div className="flex justify-end gap-[10px]">
-          <button type="button" onClick={onClose} className={btnGhost}>
+          <button type="button" onClick={onClose} disabled={submitting} className={btnGhost}>
             Cancel
           </button>
           <button
@@ -363,6 +373,34 @@ export function NewInstanceModal({ instances, enabledProviders, onCreate, onClos
             {submitting ? "Launching..." : "Launch"}
           </button>
         </div>
+
+        {launchSteps.length > 0 && (
+          <ol className="flex flex-col gap-[6px] border-t border-border pt-[12px]">
+            {launchSteps.map((step) => (
+              <li key={step.id} className="flex items-start gap-[8px] text-[11.5px]">
+                <span className="mt-[1px] flex h-[13px] w-[13px] shrink-0 items-center justify-center">
+                  {step.status === "running" && <span className="spinner h-[11px] w-[11px]" />}
+                  {step.status === "done" && <span className="text-diff-added">✓</span>}
+                  {step.status === "warning" && <span className="text-status-warn">!</span>}
+                  {step.status === "failed" && <span className="text-diff-removed">✗</span>}
+                </span>
+                <span className="flex-1">
+                  <span className={step.status === "failed" ? "text-diff-removed" : "text-txt-body"}>
+                    {step.label}
+                  </span>
+                  {step.message !== undefined && (
+                    <span className="mt-[2px] block text-txt-dim">{step.message}</span>
+                  )}
+                </span>
+                {step.status === "done" && step.ms !== undefined && (
+                  <span className="shrink-0 font-mono text-[10.5px] text-txt-dimmer">
+                    {formatStepDuration(step.ms)}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ol>
+        )}
       </Modal>
 
       {sourcePickerOpen && locations !== null && (

@@ -1,15 +1,15 @@
-import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
 import express, { type Request, type Response, type NextFunction, type Router } from "express";
 import { AUTH_COOKIE_NAME, checkPassword, isAuthEnabled, issueToken, readCookie, requireAuth, setStoredPassword, verifyToken } from "./auth";
 import { isAgentProvider, PROVIDERS, sessionKeyFor } from "./providers";
 import { pathExists } from "./paths";
 import { loadState, saveState } from "./store";
 import { exitCopyMode, getPaneCurrentPath, killSession } from "./tmux";
+import { isRemoteUnreachableError, NETWORK_GIT_TIMEOUT_MS, runGit } from "./git";
+import { LaunchProgress } from "./launchProgress";
 import { initializeInstanceSession } from "./terminal";
 import { getTunnelStatus, readTunnelLog, startTunnel, stopTunnel } from "./tunnel";
 import { applyUpdate, checkForUpdate, getUpdateStatus, resetToRemote } from "./updater";
@@ -54,12 +54,9 @@ function getLanUrl(): string | null {
   return null;
 }
 
-const execFileAsync = promisify(execFile);
-
 async function currentBranch(cwd: string): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync("git", ["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"]);
-    return stdout.trim();
+    return await runGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
   } catch {
     // Not a git repo, git not installed, or the folder does not exist anymore
     return null;
@@ -67,7 +64,7 @@ async function currentBranch(cwd: string): Promise<string | null> {
 }
 
 async function localBranches(cwd: string): Promise<string[]> {
-  const { stdout } = await execFileAsync("git", ["-C", cwd, "for-each-ref", "--format=%(refname:short)", "refs/heads"]);
+  const stdout: string = await runGit(cwd, ["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
   return stdout
     .split("\n")
     .map((branch) => branch.trim())
@@ -94,7 +91,7 @@ function localProtectedBranch(branches: string[]): string | null {
 // up). Maps branch name to that worktree's path, so it can be offered for cleanup
 // (removing the worktree along with the branch).
 async function branchesCheckedOutInWorktrees(cwd: string): Promise<Map<string, string>> {
-  const { stdout } = await execFileAsync("git", ["-C", cwd, "worktree", "list", "--porcelain"]);
+  const stdout: string = await runGit(cwd, ["worktree", "list", "--porcelain"]);
   const resolvedCwd: string = path.resolve(cwd);
   const branches: Map<string, string> = new Map();
   let currentWorktreePath: string | null = null;
@@ -465,7 +462,7 @@ apiRouter.post(
         return;
       }
       try {
-        await execFileAsync("git", ["-C", locationPath, "checkout", switchTarget]);
+        await runGit(locationPath, ["checkout", switchTarget]);
       } catch (error) {
         response
           .status(409)
@@ -483,10 +480,10 @@ apiRouter.post(
         if (worktreePath !== undefined) {
           // Checked out elsewhere: force-remove that worktree (discarding any uncommitted
           // changes in it) before the branch itself can be deleted.
-          await execFileAsync("git", ["-C", locationPath, "worktree", "remove", "--force", worktreePath]);
+          await runGit(locationPath, ["worktree", "remove", "--force", worktreePath]);
           removedWorktree = true;
         }
-        await execFileAsync("git", ["-C", locationPath, "branch", "-D", branch]);
+        await runGit(locationPath, ["branch", "-D", branch]);
         deleted.push(branch);
       } catch (error) {
         failed.push({ branch, error: (error as Error).message });
@@ -494,7 +491,7 @@ apiRouter.post(
     }
     if (removedWorktree) {
       try {
-        await execFileAsync("git", ["-C", locationPath, "worktree", "prune"]);
+        await runGit(locationPath, ["worktree", "prune"]);
       } catch {
         // Best-effort cleanup of any leftover worktree metadata
       }
@@ -587,6 +584,10 @@ apiRouter.get(
   })
 );
 
+const REMOTE_UNREACHABLE_MESSAGE: string =
+  "Could not reach 'origin' to update the base branch. If it is a corporate remote, check the VPN. " +
+  "Creating a new branch needs the remote; checking out a branch that already exists locally works offline.";
+
 apiRouter.post(
   "/instances",
   wrapAsync(async (request, response) => {
@@ -594,6 +595,12 @@ apiRouter.post(
     const state: DashboardState = await loadState();
     const { locations } = state.config;
 
+    // ===================================================================================
+    // Phase 1 - validation, no side effects. Everything that can be rejected on the input
+    // alone runs here and still answers with its own HTTP status (400/409), exactly as
+    // before. The provider checks used to run AFTER the git block, which meant an invalid
+    // provider cost a ~15s fetch before the rejection; they are hoisted here now.
+    // ===================================================================================
     if (locations.length === 0) {
       response.status(409).json({ error: "Configure locations first." });
       return;
@@ -624,9 +631,11 @@ apiRouter.post(
     }
 
     const branchAction: BranchAction | undefined = payload.branchAction;
+    let branchActionBranch = "";
+    let branchActionBase = "";
     if (branchAction !== undefined) {
-      const branch: string = typeof branchAction.branch === "string" ? branchAction.branch.trim() : "";
-      if (branch === "" || (branchAction.type !== "checkout" && branchAction.type !== "create")) {
+      branchActionBranch = typeof branchAction.branch === "string" ? branchAction.branch.trim() : "";
+      if (branchActionBranch === "" || (branchAction.type !== "checkout" && branchAction.type !== "create")) {
         response.status(400).json({ error: "Provide a valid branch action." });
         return;
       }
@@ -634,27 +643,7 @@ apiRouter.post(
         response.status(400).json({ error: "Provide the base branch to create from." });
         return;
       }
-      try {
-        if (branchAction.type === "checkout") {
-          await execFileAsync("git", ["-C", locationPath, "checkout", branch]);
-        } else {
-          const baseBranch: string = branchAction.baseBranch.trim();
-          await execFileAsync("git", ["-C", locationPath, "fetch", "origin", baseBranch]);
-          const activeBranch: string | null = await currentBranch(locationPath);
-          if (activeBranch === baseBranch) {
-            // The base branch is checked out here: fast-forward it in place, never overwrite local commits
-            await execFileAsync("git", ["-C", locationPath, "merge", "--ff-only", `origin/${baseBranch}`]);
-          } else {
-            // Not checked out: update its ref directly. A plain (non "+") refspec is fast-forward-only,
-            // git refuses on its own if the local base branch has diverged from origin
-            await execFileAsync("git", ["-C", locationPath, "fetch", "origin", `${baseBranch}:${baseBranch}`]);
-          }
-          await execFileAsync("git", ["-C", locationPath, "checkout", "-b", branch, baseBranch]);
-        }
-      } catch (error) {
-        response.status(409).json({ error: `Could not switch branches: ${(error as Error).message}` });
-        return;
-      }
+      branchActionBase = branchAction.type === "create" ? (branchAction.baseBranch as string).trim() : "";
     }
 
     const shellOnly: boolean = payload.shellOnly === true;
@@ -676,6 +665,7 @@ apiRouter.post(
       response.status(400).json({ error: "Provide a custom command." });
       return;
     }
+
     const instanceId: string = randomUUID().slice(0, 8);
     const instance: InstanceRecord = {
       id: instanceId,
@@ -701,41 +691,134 @@ apiRouter.post(
     };
 
     const resumeKey: string = sessionKeyFor(provider, locationPath, requestedLabel);
-    let resumeSessionId: string | undefined =
+    const resumeSessionId: string | undefined =
       payload.resumeSession === false ? undefined : state.sessionsByKey[resumeKey];
-    if (resumeSessionId !== undefined) {
-      instance.sessionId = resumeSessionId;
-      const sessionFile: string | undefined =
-        provider === "codex" ? await findCodexSessionFile(resumeSessionId) : undefined;
-      await writeSessionSnapshot(instance, resumeSessionId, sessionFile ? { sessionFile } : {});
-    }
 
-    // Same guarded create+launch sequence the attach path uses (terminal.ts's
-    // initializeInstanceSession), with the instance persisted in the hook that fires right
-    // after the session exists and BEFORE the provider launch: once the launch may have been
-    // applied, a failure must not strand a live agent in a session with no instance record
-    // pointing at it (no attach route, no DELETE). `persisted` tells the two failure kinds
-    // apart - a create failure before the hook is a real 500 with nothing saved; a
-    // post-launch failure keeps the 201 and the running session, the user attaches or
-    // deletes explicitly.
+    // ===================================================================================
+    // Phase 2 - execution, with side effects. The status (kept at 201) and headers are on
+    // the wire from flushHeaders() on, so NOTHING below may throw out of the handler: a
+    // failure becomes a terminal `error` event, `finally` always ends the response. See
+    // index.ts's error middleware for the headersSent guard that backs this up.
+    // ===================================================================================
+    response.status(201);
+    response.setHeader("Content-Type", "application/x-ndjson");
+    response.setHeader("Cache-Control", "no-store");
+    // Belt and braces against a proxy that might otherwise buffer the whole body.
+    response.setHeader("X-Accel-Buffering", "no");
+    response.flushHeaders();
+
+    const progress = new LaunchProgress((line) => {
+      response.write(line);
+    });
+    // A client that navigates away or a proxy that drops the connection: stop writing, but
+    // never abort the tmux session / agent coming up behind it.
+    request.on("close", () => progress.markSinkClosed());
+    response.on("error", () => progress.markSinkClosed());
+
+    const sessionStepLabel: Record<"create-session" | "launch-agent", string> = {
+      "create-session": "Starting tmux session",
+      "launch-agent": shellOnly ? "Opening shell" : `Launching ${instance.command}`,
+    };
+
     let persisted = false;
     try {
-      await initializeInstanceSession(instance, async () => {
-        state.instances.push(instance);
-        await saveState(state);
-        persisted = true;
-      });
-    } catch (error) {
-      if (!persisted) {
-        throw error;
+      if (resumeSessionId !== undefined) {
+        progress.stepStart("prepare-resume", "Preparing session resume");
+        instance.sessionId = resumeSessionId;
+        const sessionFile: string | undefined =
+          provider === "codex" ? await findCodexSessionFile(resumeSessionId) : undefined;
+        await writeSessionSnapshot(instance, resumeSessionId, sessionFile ? { sessionFile } : {});
+        progress.stepDone("prepare-resume");
       }
-      console.error(
-        `[server] instance ${instance.id}: provider launch did not confirm, keeping the session`,
-        (error as Error).message
-      );
-    }
 
-    response.status(201).json(instance);
+      if (branchAction !== undefined) {
+        try {
+          if (branchAction.type === "checkout") {
+            progress.stepStart("checkout-branch", `Checking out ${branchActionBranch}`);
+            await runGit(locationPath, ["checkout", branchActionBranch]);
+            progress.stepDone("checkout-branch");
+          } else {
+            progress.stepStart("fetch-base", `Fetching ${branchActionBase} from origin`);
+            await runGit(locationPath, ["fetch", "origin", branchActionBase], NETWORK_GIT_TIMEOUT_MS);
+            progress.stepDone("fetch-base");
+
+            progress.stepStart("update-base", `Updating ${branchActionBase}`);
+            const activeBranch: string | null = await currentBranch(locationPath);
+            if (activeBranch === branchActionBase) {
+              // The base branch is checked out here: fast-forward it in place, never overwrite local commits
+              await runGit(locationPath, ["merge", "--ff-only", `origin/${branchActionBase}`]);
+            } else {
+              // Not checked out: update its ref directly. A plain (non "+") refspec is fast-forward-only,
+              // git refuses on its own if the local base branch has diverged from origin
+              await runGit(locationPath, ["fetch", "origin", `${branchActionBase}:${branchActionBase}`], NETWORK_GIT_TIMEOUT_MS);
+            }
+            progress.stepDone("update-base");
+
+            progress.stepStart("create-branch", `Creating branch ${branchActionBranch}`);
+            await runGit(locationPath, ["checkout", "-b", branchActionBranch, branchActionBase]);
+            progress.stepDone("create-branch");
+          }
+        } catch (error) {
+          // An unreachable remote (corporate host with no VPN) is the common case here, and
+          // the raw git/ssh message does not point at the fix.
+          progress.fail(
+            isRemoteUnreachableError(error)
+              ? REMOTE_UNREACHABLE_MESSAGE
+              : `Could not switch branches: ${(error as Error).message}`
+          );
+          return;
+        }
+      }
+
+      // Same guarded create+launch sequence the attach path uses (terminal.ts's
+      // initializeInstanceSession), with the instance persisted in the hook that fires right
+      // after the session exists and BEFORE the provider launch: once the launch may have been
+      // applied, a failure must not strand a live agent in a session with no instance record
+      // pointing at it (no attach route, no DELETE). `persisted` tells the two failure kinds
+      // apart - a create failure before the hook is a real `error` with nothing saved; a
+      // post-launch failure keeps `done` (with the instance) plus a `step-warning`, and the
+      // user attaches or deletes explicitly.
+      try {
+        await initializeInstanceSession(
+          instance,
+          async () => {
+            progress.stepStart("persist", "Saving instance");
+            state.instances.push(instance);
+            await saveState(state);
+            persisted = true;
+            progress.stepDone("persist");
+          },
+          (step, phase) => {
+            if (phase === "start") {
+              progress.stepStart(step, sessionStepLabel[step]);
+            } else {
+              progress.stepDone(step);
+            }
+          }
+        );
+      } catch (error) {
+        if (!persisted) {
+          progress.fail(`Could not create the instance: ${(error as Error).message}`);
+          return;
+        }
+        console.error(
+          `[server] instance ${instance.id}: provider launch did not confirm, keeping the session`,
+          (error as Error).message
+        );
+        progress.stepWarning(
+          "launch-agent",
+          "The agent launch could not be confirmed. The session is running - attach to check on it."
+        );
+      }
+
+      progress.done(instance);
+    } catch (error) {
+      // A failure with no more specific handler (writeSessionSnapshot, an unexpected throw).
+      // Never rethrow: headers are already sent.
+      progress.fail(`Could not create the instance: ${(error as Error).message}`);
+    } finally {
+      response.end();
+    }
   })
 );
 

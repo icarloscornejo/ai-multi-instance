@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ApiError, api, setUnauthorizedHandler } from "./api";
+import { ApiError, api, setUnauthorizedHandler, type LaunchEvent } from "./api";
 import { ConnectionLostScreen } from "./components/ConnectionLostScreen";
 import { DeleteConfirmModal } from "./components/DeleteConfirmModal";
 import { EmptyState } from "./components/EmptyState";
@@ -456,8 +456,11 @@ export function App() {
     [activeInstanceId]
   );
 
-  const createInstance = async (payload: CreateInstancePayload): Promise<void> => {
-    const createdInstance: Instance = await api.createInstance(payload);
+  const createInstance = async (
+    payload: CreateInstancePayload,
+    onProgress?: (event: LaunchEvent) => void
+  ): Promise<void> => {
+    const createdInstance: Instance = await api.createInstance(payload, onProgress);
     setInstances((previousInstances) => [...previousInstances, createdInstance]);
     setIsNewInstanceModalOpen(false);
     if (isMobile) {

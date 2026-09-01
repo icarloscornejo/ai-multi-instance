@@ -66,8 +66,15 @@ app.use("/api", apiRouter);
 const webDistPath: string = path.resolve(import.meta.dirname, "../../web/dist");
 app.use(express.static(webDistPath));
 
-app.use((error: Error, _request: Request, response: Response, _next: NextFunction) => {
+app.use((error: Error, _request: Request, response: Response, next: NextFunction) => {
   console.error("[server] unhandled error:", error.message);
+  // A route that already committed a streaming response (POST /api/instances once it starts
+  // emitting NDJSON progress) has its status and headers on the wire; calling response.json()
+  // here would throw ERR_HTTP_HEADERS_SENT and mask the original error. Hand those to Express's
+  // default finalizer, which just destroys the socket.
+  if (response.headersSent) {
+    return next(error);
+  }
   response.status(500).json({ error: error.message });
 });
 

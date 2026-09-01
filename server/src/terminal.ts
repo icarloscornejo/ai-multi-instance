@@ -327,23 +327,43 @@ const sessionInitInFlight = new Map<string, Promise<void>>();
 // the instance record right after the session exists and BEFORE the provider launch, so a
 // launch that half-applies can never leave a live agent in a session with no instance record
 // pointing at it. The attach path (initializeSession below) passes no hook.
+// `onProgress` (POST /api/instances passes it, the attach path does not) is fired around the
+// two visible sub-steps for a streaming progress log. It is deliberately the weakest possible
+// hook: synchronous, never awaited, wrapped so a throwing implementation is swallowed here.
+// Nothing about the guarded sequence, its error handling, or `launchMayHaveBeenApplied`
+// depends on it - with the callback absent or broken, this function does the exact same tmux
+// calls and reaches the exact same outcome.
+type SessionProgressStep = "create-session" | "launch-agent";
+
 export async function initializeInstanceSession(
   instance: InstanceRecord,
-  onSessionCreated?: () => Promise<void>
+  onSessionCreated?: () => Promise<void>,
+  onProgress?: (step: SessionProgressStep, phase: "start" | "done") => void
 ): Promise<void> {
+  const reportProgress = (step: SessionProgressStep, phase: "start" | "done"): void => {
+    try {
+      onProgress?.(step, phase);
+    } catch {
+      // A progress sink failure must never interrupt initialization - see the note above.
+    }
+  };
   let launchMayHaveBeenApplied = false;
   try {
+    reportProgress("create-session", "start");
     await createSession(instance.tmuxSession, instance.locationPath);
+    reportProgress("create-session", "done");
     if (onSessionCreated !== undefined) {
       await onSessionCreated();
     }
     if (instance.shellOnly !== true) {
+      reportProgress("launch-agent", "start");
       await markSessionLaunching(instance.tmuxSession);
       launchMayHaveBeenApplied = true;
       await sendCommandToSession(
         instance.tmuxSession,
         buildLaunchCommand(instance, { resumeSessionId: instance.sessionId ?? undefined })
       );
+      reportProgress("launch-agent", "done");
     }
     await markSessionInitComplete(instance.tmuxSession);
   } catch (error) {

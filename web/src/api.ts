@@ -12,15 +12,11 @@ import type {
   UpdateInstancePayload,
   UpdateStatus,
 } from "./types";
+import { ApiError } from "./apiError";
+import { consumeLaunchStream, type LaunchEvent } from "./launchSteps";
 
-export class ApiError extends Error {
-  readonly status: number;
-
-  constructor(message: string, status: number) {
-    super(message);
-    this.status = status;
-  }
-}
+export { ApiError } from "./apiError";
+export type { LaunchEvent } from "./launchSteps";
 
 // App.tsx registers this once at startup so any request (not just the initial load) can
 // flip the app into the password-gate screen the moment the auth cookie is missing/expired
@@ -104,8 +100,40 @@ export const api = {
       `/api/instances/resumable?provider=${encodeURIComponent(provider)}&path=${encodeURIComponent(locationPath)}&label=${encodeURIComponent(label)}`
     ),
 
-  createInstance: (payload: CreateInstancePayload): Promise<Instance> =>
-    requestJson("/api/instances", { method: "POST", body: JSON.stringify(payload) }),
+  // POST /api/instances streams NDJSON progress (server/src/routes.ts). Phase-1 validation
+  // still fails as a normal JSON error with its status code (handled below, before the body
+  // is read); phase-2 execution failures arrive as an `error` event inside the 201 body and
+  // consumeLaunchStream turns them back into a thrown ApiError.
+  createInstance: async (
+    payload: CreateInstancePayload,
+    onProgress?: (event: LaunchEvent) => void
+  ): Promise<Instance> => {
+    const response: Response = await fetch("/api/instances", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (response.status === 401) {
+      onUnauthorized?.();
+    }
+    if (!response.ok) {
+      const body = (await response.json().catch(() => ({}))) as { error?: string };
+      throw new ApiError(body.error ?? `Error ${response.status}`, response.status);
+    }
+    if (response.body === null) {
+      // No streaming body available (a proxy or test shim that buffers). Fall back to the
+      // plain JSON contract: the server still ends the stream with a `done`/`error` line,
+      // and the last non-empty line is what matters.
+      const text: string = await response.text();
+      const lastLine: string = text.trim().split("\n").filter((line) => line.trim() !== "").pop() ?? "";
+      const event = JSON.parse(lastLine) as { type?: string; instance?: Instance; error?: string; message?: string };
+      if (event.type === "done" && event.instance !== undefined) {
+        return event.instance;
+      }
+      throw new ApiError(event.message ?? event.error ?? "Instance creation failed.", 500);
+    }
+    return consumeLaunchStream(response.body, onProgress);
+  },
 
   updateInstance: (instanceId: string, payload: UpdateInstancePayload): Promise<Instance> =>
     requestJson(`/api/instances/${instanceId}`, { method: "PATCH", body: JSON.stringify(payload) }),
