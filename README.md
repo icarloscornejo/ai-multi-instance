@@ -34,6 +34,27 @@ Open <http://ai.local> (`http://localhost` also works). Existing installations m
 5. **Terminal zoom**: `A-` / `A+` buttons or `Cmd +` / `Cmd -` with focus inside the terminal. The size persists per instance.
 6. **Update** (button in the tab bar): fetches the latest version from GitHub and applies it (fast-forward + npm install) if there are no local changes in the folder. Server/web code changes hot-reload automatically (`tsx watch` and Vite); other changes (dependencies, config) need `npm run dev` restarted manually. Sessions live in tmux so relaunching does not interrupt anything.
 
+If the server crashes, `data/server.log` (or `data/server-dev.log` under `npm run dev`) has a stack trace - it didn't before, and figuring out *why* the dashboard went down used to mean nothing to go on.
+
+### Optional: keep it running without a terminal open
+
+By default the dashboard only runs while you have `npm run dev` open, same as always - nothing below is enabled unless you ask for it. If you'd rather it start at login and restart itself after a crash instead of needing a terminal:
+
+```bash
+npm run service:install    # sets it up as a per-user launchd service and starts it
+npm run service:uninstall  # removes it, back to npm run dev only
+```
+
+Once installed, the service owns port 3001, so a plain `npm run dev` will fail fast with `EADDRINUSE` until you stop the service first:
+
+```bash
+npm run service:status    # is it running, and what's its PID
+npm run service:stop      # stop it (e.g. before npm run dev)
+npm run service:restart   # restart it (e.g. after a server/src/ update, which the service doesn't hot-reload)
+npm run service:start     # start it again
+npm run service:log       # tail data/server.log
+```
+
 ## Mobile
 
 On a phone or narrow viewport the dashboard switches to a dedicated mobile shell instead of the desktop split view:

@@ -3,6 +3,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import lockfile from "proper-lockfile";
 import { isCommitPublished, readManifest } from "./frontendPublish";
+import { isSupervised } from "./serverLog";
 import {
   lockTargetPath as transactionLockPath,
   spawnAndAwaitUpdateTransaction,
@@ -107,11 +108,19 @@ export function isMajorBump(localVersion: string | null, remoteVersion: string |
 }
 
 // Three effects a changed path can have, no longer just two: `tsx watch` restarts the server
-// process automatically for anything under server/src, with nothing else needed. A change that
-// feeds the frontend BUILD (web/src, plus everything else Vite reads to produce it) is also
-// unattended, but on a different, asynchronous timeline: LAN/tunnel visitors are served the
-// prebuilt web/dist (server/src/index.ts, server/src/tunnel.ts - Caddy proxies to Express, not to
-// Vite's dev server), reconstructed by updateTransaction.ts, so "auto" here means "no manual
+// process automatically for anything under server/src, with nothing else needed - UNDER
+// `npm run dev` ONLY. Under the launchd service (see setup.sh's plist) the process runs via
+// `npm start` (plain `tsx`, deliberately not `tsx watch` - see setup.sh's launchd section for why
+// a watcher would be a zombie parent under a supervisor), so a server/src/ change there is NOT
+// already live the way "auto" promises: it needs `npm run service:restart`. Reusing "manual" for
+// that case (rather than adding a third kind) keeps UpdateScreen.tsx's existing manual-restart
+// messaging correct with no UI change, and it also keeps refreshRestartStatus's auto-clear below
+// from firing for a change that isn't actually live.
+//
+// A change that feeds the frontend BUILD (web/src, plus everything else Vite reads to produce it)
+// is also unattended, but on a different, asynchronous timeline: LAN/tunnel visitors are served
+// the prebuilt web/dist (server/src/index.ts, server/src/tunnel.ts - Caddy proxies to Express, not
+// to Vite's dev server), reconstructed by updateTransaction.ts, so "auto" here means "no manual
 // relaunch needed", not "already live" - see reconcileFrontendPublish below for what actually
 // gates that. Anything else (root package.json, vite.config.ts's own config semantics changing in
 // a way a rebuild can't paper over, unrelated root configs) still needs a manual relaunch.
@@ -125,12 +134,16 @@ function affectsFrontendBuild(changedPath: string): boolean {
   );
 }
 
-function classifyRestartKind(changedPaths: string[]): RestartKind {
+// Exported so updater.test.ts can exercise both the supervised and unsupervised branches
+// explicitly; production call sites below omit `supervised` and get the real environment.
+export function classifyRestartKind(changedPaths: string[], supervised: boolean = isSupervised()): RestartKind {
   if (changedPaths.length === 0) {
     return "none";
   }
   const needsManualRestart: boolean = changedPaths.some(
-    (changedPath) => !changedPath.startsWith("server/src/") && !affectsFrontendBuild(changedPath)
+    (changedPath) =>
+      (!changedPath.startsWith("server/src/") && !affectsFrontendBuild(changedPath)) ||
+      (supervised && changedPath.startsWith("server/src/"))
   );
   return needsManualRestart ? "manual" : "auto";
 }

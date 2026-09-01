@@ -19,10 +19,42 @@ import { createAttachBuffer } from "./attachBuffer";
 import { registerHeartbeat, startHeartbeat } from "./heartbeat";
 import { countSystemDynamicPtys, getPtmxMax } from "./ptyCapacity";
 import { apiRouter } from "./routes";
+import { formatCrashLine, startServerLog } from "./serverLog";
 import { loadState } from "./store";
 import { reconcileFrontendPublishOnStartup } from "./updater";
 import { bridgeTerminal, closeSocketSafely, getLivePtyCount, validateTerminalSize } from "./terminal";
 import type { DashboardState } from "./types";
+
+// Everything below this line runs before express() (line ~59): a failure in that wiring must
+// still reach server.log, not just a crash after the app exists. Note the limit this can't cover
+// - see serverLog.ts's startServerLog header comment - a failure during evaluation of the static
+// imports ABOVE this line (ESM evaluates those before any statement here runs) can't reach this
+// log either way; those land in data/launchd-stderr.log instead.
+startServerLog();
+
+// Both handlers exit(1) deliberately. Registering a listener for either event DISABLES Node's own
+// default behavior for it (which, since Node 15, is to crash) - logging without exiting would
+// turn today's clean, restartable crash into a process that keeps the port bound and looks alive
+// to launchd, which is strictly worse than the bug this is fixing. console.error alone is durable
+// here with no extra write: when stdout/stderr point at a regular file (as they do under launchd,
+// and as serverLog.ts's tee makes true for the terminal case too), Node's writes are synchronous
+// on POSIX, so the stack is on disk before process.exit(1) returns.
+process.on("uncaughtException", (error: Error) => {
+  console.error(formatCrashLine("uncaughtException", error));
+  process.exit(1);
+});
+process.on("unhandledRejection", (reason: unknown) => {
+  console.error(formatCrashLine("unhandledRejection", reason));
+  process.exit(1);
+});
+
+// Distinguishes "crashed" from "you ran npm run service:stop" in the log. This handler overrides
+// the default SIGTERM termination, so it must exit explicitly; tunnel.ts:513's own
+// process.on("exit") cloudflared cleanup still runs after this exit() call.
+process.on("SIGTERM", () => {
+  console.error("--- server stopping (SIGTERM) ---");
+  process.exit(0);
+});
 
 // Extra diagnostic context appended ONLY to the console line (via recordAttachFailure's lazy
 // buildDetail - see attachErrors.ts), never to anything sent to a client - see
@@ -95,8 +127,14 @@ const webSocketServer = new WebSocketServer({ noServer: true, maxPayload: MAX_WS
 // silent tolerance: a process that failed to bind its port but kept running would look alive
 // to a supervisor (or npm run dev) while serving nothing, which is worse than a clean crash a
 // supervisor can actually restart from.
-httpServer.on("error", (error: Error) => {
-  console.error("[server] fatal http server error:", error.message);
+httpServer.on("error", (error: NodeJS.ErrnoException) => {
+  if (error.code === "EADDRINUSE") {
+    console.error(
+      `[server] port ${serverPort} is already in use - another "npm run dev"/"npm start" is probably already running. If you installed the optional launchd service (npm run service:install), stop it first: npm run service:stop`
+    );
+  } else {
+    console.error("[server] fatal http server error:", error.message);
+  }
   process.exit(1);
 });
 webSocketServer.on("error", (error: Error) => {

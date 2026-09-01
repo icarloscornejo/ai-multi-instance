@@ -339,7 +339,7 @@ else
   ok "Caddy running as a system service (survives reboots)"
 fi
 
-# 6. Final checklist: what must be done manually by design
+# 7. Final checklist: what must be done manually by design
 printf '\n\033[1;35m=== Done. Manual steps ===\033[0m\n'
 if [[ -z "${CLAUDE_CODE_USE_VERTEX:-}" ]]; then
   warn "CLAUDE_CODE_USE_VERTEX is not set in this shell."
@@ -356,5 +356,9 @@ cat <<EOF
 
   2. On the initial screen, add the folder paths where terminals will open.
      You can open multiple instances in the same folder at once.
+
+  Optional: if you'd rather the dashboard stay up on its own (survives crashes, starts at
+  login) instead of running "npm run dev" by hand, run: npm run service:install
+  It's off by default and never enabled by this script - see README.md's Usage section.
 
 EOF

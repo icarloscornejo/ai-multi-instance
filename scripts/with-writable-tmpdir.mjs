@@ -6,9 +6,34 @@
 // current user can actually write to, exports it as TMPDIR, and only then
 // launches the real command.
 import { execFileSync, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+// Same data/ directory server/src/serverLog.ts derives from import.meta.dirname; this script
+// lives one level up, at the repo root's scripts/, so it needs its own relative resolution.
+const dataDirectory = path.resolve(import.meta.dirname, "..", "data");
+
+// The one place in the whole system that can observe an abnormal exit of the process tree this
+// wraps (`npm start` under launchd, or `npm run dev` by hand): serverLog.ts's uncaughtException/
+// unhandledRejection handlers only run for a JS-level crash, never for a SIGSEGV/SIGKILL/OOM in
+// the native node-pty addon, which kills the process outright with no handler ever running (see
+// serverLog.ts's "muertes por señal" comment). Appended synchronously, before this script's own
+// exit/re-signal below, so it lands even though this process is about to terminate itself.
+// Caveat worth knowing: the direct child observed here is `npm` (or `concurrently`), not the
+// innermost tsx/node process a few levels down - npm does not always forward a grandchild's exact
+// termination signal, so `signal` may read null here even for a genuine native crash further
+// down. Still strictly better than the previous state, which recorded nothing at all.
+function logChildExit(supervised, code, signal) {
+  const logPath = path.join(dataDirectory, supervised ? "server.log" : "server-dev.log");
+  const line = `[${new Date().toISOString()}] child process exited code=${code ?? "null"} signal=${signal ?? "null"}\n`;
+  try {
+    mkdirSync(dataDirectory, { recursive: true });
+    appendFileSync(logPath, line);
+  } catch {
+    // Best-effort, matches serverLog.ts's tolerance for a disk/permission failure here.
+  }
+}
 
 function normalize(dir) {
   // os.tmpdir() strips a trailing slash but env.TMPDIR / getconf output may keep
@@ -83,6 +108,7 @@ function main() {
   }
 
   child.on("exit", (code, signal) => {
+    logChildExit(process.env.AI_MULTI_INSTANCE_SUPERVISED === "1", code, signal);
     if (signal) process.kill(process.pid, signal);
     else process.exit(code ?? 1);
   });

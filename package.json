@@ -11,7 +11,14 @@
     "dev": "node scripts/with-writable-tmpdir.mjs concurrently --kill-others-on-fail -n server,web -c blue,magenta \"npm run dev -w server\" \"npm run dev -w web\"",
     "build": "npm run build -w web",
     "start": "node scripts/with-writable-tmpdir.mjs npm run start -w server",
-    "test": "npm run test -w server && npm run test -w web"
+    "test": "npm run test -w server && npm run test -w web",
+    "service:install": "bash scripts/install-service.sh",
+    "service:uninstall": "bash scripts/uninstall-service.sh",
+    "service:start": "launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ai-multi-instance.server.plist",
+    "service:stop": "launchctl bootout gui/$(id -u)/com.ai-multi-instance.server",
+    "service:restart": "launchctl kickstart -k gui/$(id -u)/com.ai-multi-instance.server",
+    "service:status": "launchctl print gui/$(id -u)/com.ai-multi-instance.server",
+    "service:log": "tail -f data/server.log"
   },
   "devDependencies": {
     "concurrently": "^9.1.2"
