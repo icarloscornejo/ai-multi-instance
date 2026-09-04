@@ -6,7 +6,7 @@
 // current user can actually write to, exports it as TMPDIR, and only then
 // launches the real command.
 import { execFileSync, spawn } from "node:child_process";
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -61,6 +61,34 @@ function darwinUserTempDir() {
   }
 }
 
+// tmux stores its server socket at $TMUX_TMPDIR/tmux-<uid>/default. It does NOT honor $TMPDIR
+// (that is a common misconception): with TMUX_TMPDIR unset, tmux goes straight to /tmp. On macOS
+// the periodic cleaner (/etc/periodic/daily/110.clean-tmps) deletes anything under /tmp not
+// accessed in 3+ days, which silently kills the whole tmux server and every dashboard session
+// with it - see server/src/tmux.ts's warnIfSocketDirectorySurvived, which is exactly that event
+// being detected after the fact. Pinning TMUX_TMPDIR to a directory under $HOME (never touched by
+// any macOS auto-cleaner) is what keeps sessions alive for as long as the machine stays up.
+//
+// One-time cost: the first server start after this lands looks at the new path, finds no server,
+// and recreates the sessions once. From then on they are stable.
+export function resolveTmuxTmpdir(env = process.env) {
+  // Honor an explicit TMUX_TMPDIR the user set deliberately, as long as it works.
+  if (env.TMUX_TMPDIR && isWritable(env.TMUX_TMPDIR)) {
+    return normalize(env.TMUX_TMPDIR);
+  }
+  // Same parent as resolveWritableTmpdir's own $HOME fallback below, for consistency.
+  const pinned = path.join(os.homedir(), ".cache", "ai-multi-instance", "tmux");
+  try {
+    mkdirSync(pinned, { recursive: true });
+    // tmux is strict about the tmux-<uid> subdir it creates (must be 0700, owned by the caller);
+    // keeping the parent 0700 too avoids any surprise from a permissive umask.
+    chmodSync(pinned, 0o700);
+    return normalize(pinned);
+  } catch {
+    return undefined;
+  }
+}
+
 export function resolveWritableTmpdir(env = process.env) {
   const candidates = [
     env.TMPDIR,
@@ -98,9 +126,18 @@ function main() {
     );
   }
 
+  const childEnv = { ...process.env, TMPDIR: tmpdir };
+
+  // Independent of TMPDIR above: tmux ignores TMPDIR and would otherwise put its socket in /tmp,
+  // where macOS reaps it after 3 idle days (taking every session with it). See resolveTmuxTmpdir.
+  const tmuxTmpdir = resolveTmuxTmpdir();
+  if (tmuxTmpdir) {
+    childEnv.TMUX_TMPDIR = tmuxTmpdir;
+  }
+
   const child = spawn(command, args, {
     stdio: "inherit",
-    env: { ...process.env, TMPDIR: tmpdir },
+    env: childEnv,
   });
 
   for (const signal of ["SIGINT", "SIGTERM"]) {
