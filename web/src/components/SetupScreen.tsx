@@ -355,13 +355,29 @@ function TunnelSection() {
 
   return (
     <div className="flex flex-col gap-[8px]">
-      <h2 className="text-[12.5px] font-semibold text-txt-bright">Remote access</h2>
+      <div className="flex items-center gap-[8px]">
+        <h2 className="text-[12.5px] font-semibold text-txt-bright">Remote access</h2>
+        {status !== null && (
+          <span className="rounded-full border border-border-strong px-[8px] py-[1px] text-[10px] font-medium text-txt-secondary">
+            {knownMode === "named" ? "Named Tunnel" : "Quick Tunnel"}
+          </span>
+        )}
+      </div>
       <p className="text-[11.5px] leading-[1.5] text-txt-secondary">
         Expose this dashboard over a public HTTPS URL via Cloudflare, so you can open it from your phone off the LAN.
         {knownMode === "named"
           ? " It uses a fixed hostname on your own domain and stays reachable across restarts."
           : " The URL is temporary and changes every time the tunnel restarts."}
       </p>
+      {status !== null && knownMode === "quick" && (
+        <p className={hintTextClassName}>
+          Want a permanent URL on your own domain instead? Run{" "}
+          <code className="rounded-sm bg-app px-[4px] py-[1px]">
+            bash scripts/setup-named-tunnel.sh &lt;machine&gt;-mi.&lt;your-domain&gt;
+          </code>{" "}
+          from a terminal on this machine, then reload this page.
+        </p>
+      )}
 
       {needsPassword && (
         <div className="flex flex-col gap-[8px] rounded-sm border border-border-strong bg-app p-[10px]">
