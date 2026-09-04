@@ -17,6 +17,10 @@ export type TunnelState = "stopped" | "starting" | "running" | "error";
 export type TunnelPhase = "checking-caddy" | "launching" | "verifying";
 
 export interface TunnelStatus {
+  // Which remote-access backend produced this status. "quick" is the zero-config default
+  // (this module); "named" is the opt-in Cloudflare Named Tunnel (see namedTunnel.ts), which
+  // the routes layer dispatches to when data/named-tunnel/tunnel.json exists.
+  mode: "quick" | "named";
   state: TunnelState;
   phase: TunnelPhase | null;
   url: string | null;
@@ -38,7 +42,7 @@ export function extractTunnelUrl(output: string): string | null {
 
 const START_TIMEOUT_MS = 20_000;
 
-const status: TunnelStatus = { state: "stopped", phase: null, url: null, error: null, warning: null };
+const status: TunnelStatus = { mode: "quick", state: "stopped", phase: null, url: null, error: null, warning: null };
 let child: ChildProcess | null = null;
 let startPromise: Promise<TunnelStatus> | null = null;
 
@@ -166,7 +170,7 @@ function checkCaddyReachable(): Promise<CaddyPreflight> {
 const EDGE_VERIFY_ATTEMPT_TIMEOUT_MS = 3_000;
 const EDGE_VERIFY_BACKOFFS_MS = [1_500];
 
-type EdgeVerifyResult =
+export type EdgeVerifyResult =
   | { outcome: "ok" }
   | { outcome: "transport-error"; message: string }
   | { outcome: "bad-response"; status: number | undefined; bodySnippet: string };
@@ -198,7 +202,7 @@ async function verifyEdgeOnce(url: string): Promise<EdgeVerifyResult> {
 // being flaky) says nothing about whether the tunnel works for anyone else, so it is retried
 // and, if still unresolved, treated as inconclusive rather than a failure by the caller. A bad
 // HTTP response (wrong status, missing app-shell markers) is definitive and returned immediately.
-async function verifyEdge(url: string, log: (line: string) => void): Promise<EdgeVerifyResult> {
+export async function verifyEdge(url: string, log: (line: string) => void): Promise<EdgeVerifyResult> {
   let lastResult: EdgeVerifyResult = { outcome: "transport-error", message: "no attempts made" };
   for (let attempt = 0; attempt <= EDGE_VERIFY_BACKOFFS_MS.length; attempt++) {
     lastResult = await verifyEdgeOnce(url);

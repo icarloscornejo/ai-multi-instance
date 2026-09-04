@@ -290,13 +290,17 @@ function TunnelSection() {
     };
   }, [isAllowedHost, status?.state]);
 
+  // The mode is decided server-side; until a real status comes back, carry forward whatever the
+  // last fetch said (defaulting to "quick") so the optimistic literals below stay well-typed.
+  const knownMode: TunnelStatus["mode"] = status?.mode ?? "quick";
+
   const attemptStart = async (): Promise<void> => {
     setErrorMessage(null);
-    setStatus({ state: "starting", phase: "checking-caddy", url: null, error: null, warning: null });
+    setStatus({ mode: knownMode, state: "starting", phase: "checking-caddy", url: null, error: null, warning: null });
     try {
       setStatus(await api.startTunnel());
     } catch (error) {
-      setStatus({ state: "stopped", phase: null, url: null, error: null, warning: null });
+      setStatus({ mode: knownMode, state: "stopped", phase: null, url: null, error: null, warning: null });
       if (error instanceof ApiError && error.status === 409) {
         setNeedsPassword(true);
         return;
@@ -354,7 +358,9 @@ function TunnelSection() {
       <h2 className="text-[12.5px] font-semibold text-txt-bright">Remote access</h2>
       <p className="text-[11.5px] leading-[1.5] text-txt-secondary">
         Expose this dashboard over a public HTTPS URL via Cloudflare, so you can open it from your phone off the LAN.
-        The URL is temporary and changes every time the tunnel restarts.
+        {knownMode === "named"
+          ? " It uses a fixed hostname on your own domain and stays reachable across restarts."
+          : " The URL is temporary and changes every time the tunnel restarts."}
       </p>
 
       {needsPassword && (

@@ -18,7 +18,15 @@
     "service:stop": "launchctl bootout gui/$(id -u)/com.ai-multi-instance.server",
     "service:restart": "launchctl kickstart -k gui/$(id -u)/com.ai-multi-instance.server",
     "service:status": "launchctl print gui/$(id -u)/com.ai-multi-instance.server",
-    "service:log": "tail -f data/server.log"
+    "service:log": "tail -f data/server.log",
+    "tunnel:setup": "bash scripts/setup-named-tunnel.sh",
+    "tunnel:install": "bash scripts/install-tunnel-service.sh",
+    "tunnel:uninstall": "bash scripts/uninstall-tunnel-service.sh",
+    "tunnel:start": "mkdir -p data/named-tunnel && touch data/named-tunnel/enabled && launchctl kickstart gui/$(id -u)/com.ai-multi-instance.tunnel",
+    "tunnel:stop": "rm -f data/named-tunnel/enabled && launchctl kill SIGTERM gui/$(id -u)/com.ai-multi-instance.tunnel 2>/dev/null; true",
+    "tunnel:restart": "mkdir -p data/named-tunnel && touch data/named-tunnel/enabled && launchctl kickstart -k gui/$(id -u)/com.ai-multi-instance.tunnel",
+    "tunnel:status": "launchctl print gui/$(id -u)/com.ai-multi-instance.tunnel",
+    "tunnel:log": "tail -f data/cloudflared.log"
   },
   "devDependencies": {
     "concurrently": "^9.1.2"

@@ -19,6 +19,8 @@ import { createAttachBuffer } from "./attachBuffer";
 import { registerHeartbeat, startHeartbeat } from "./heartbeat";
 import { countSystemDynamicPtys, getPtmxMax } from "./ptyCapacity";
 import { apiRouter } from "./routes";
+import { getTunnelMode } from "./namedTunnel";
+import { isLocalRequestHost } from "./requestHost";
 import { formatCrashLine, startServerLog } from "./serverLog";
 import { loadState } from "./store";
 import { reconcileFrontendPublishOnStartup } from "./updater";
@@ -168,6 +170,14 @@ httpServer.on("upgrade", (request, socket, head) => {
   );
 
   void (async () => {
+    // Same fail-closed rule as the REST API (see routes.ts): in named-tunnel mode the connector
+    // outlives this process, so a passwordless state must never be reachable through the public
+    // URL. The terminal WebSocket is the most sensitive thing here, so this check comes first.
+    if (getTunnelMode() === "named" && !isAuthEnabled() && !isLocalRequestHost(request.headers.host)) {
+      socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
+      socket.destroy();
+      return;
+    }
     // The WS upgrade is the real attack surface (it reads/writes the terminal
     // directly), so it needs the same cookie check as the REST API even though
     // the static HTML/assets stay open.

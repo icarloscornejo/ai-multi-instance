@@ -12,6 +12,8 @@ import { isRemoteUnreachableError, NETWORK_GIT_TIMEOUT_MS, runGit } from "./git"
 import { LaunchProgress } from "./launchProgress";
 import { initializeInstanceSession } from "./terminal";
 import { getTunnelStatus, readTunnelLog, startTunnel, stopTunnel } from "./tunnel";
+import { getNamedTunnelStatus, getTunnelMode, startNamedTunnel, stopNamedTunnel } from "./namedTunnel";
+import { isLocalRequestHost } from "./requestHost";
 import { applyUpdate, checkForUpdate, getUpdateStatus, resetToRemote } from "./updater";
 import type {
   BranchAction,
@@ -232,6 +234,52 @@ async function enrichCodexStatus(snapshot: Record<string, unknown>): Promise<Rec
 
 export const apiRouter: Router = express.Router();
 
+// Fail closed at the public edge. In named-tunnel mode the cloudflared connector outlives this
+// process, so if the password ever disappears (data/auth-password.json deleted, DASHBOARD_PASSWORD
+// dropped from the launchd environment) while the connector is still up, isAuthEnabled() goes
+// false and every route below - including the terminal API - would answer the public URL with no
+// login at all. Reject those requests before they reach anything. Local and LAN paths are
+// untouched, which is exactly where the user goes to set a password back. Registered before the
+// /auth/* routes on purpose: from the public URL with no password, you cannot even set one - that
+// has to be done locally.
+apiRouter.use((request: Request, response: Response, next: NextFunction): void => {
+  if (getTunnelMode() === "named" && !isAuthEnabled() && !isLocalRequestHost(request.headers.host)) {
+    response.status(503).json({
+      error: "This dashboard has no password set. Set one from the local network (ai.local) before using the public URL.",
+    });
+    return;
+  }
+  next();
+});
+
+// The tunnel controls (start/stop/status/logs) must never be usable through the public URL, even
+// by an authenticated visitor: whoever finds that URL could otherwise tear down or spin up the
+// tunnel, or read the connector log. The UI already hides these off ai.local (SetupScreen.tsx),
+// this is the server-side backstop for that policy. Authentication stays a separate, additional
+// requirement via requireAuth below.
+function requireLocalHost(request: Request, response: Response, next: NextFunction): void {
+  if (!isLocalRequestHost(request.headers.host)) {
+    response.status(403).json({ error: "Tunnel controls are only available on the local network." });
+    return;
+  }
+  next();
+}
+
+// The auth cookie is bearer-equivalent and long-lived (~180 days). Mark it Secure whenever it is
+// issued to the public hostname, so a browser will never send it back over plain HTTP to that
+// host. ai.local and LAN access are plain HTTP by design (see Caddyfile) and must keep getting a
+// non-Secure cookie, so this is conditional on the request host, not unconditional. The decision
+// is keyed to the Host header rather than X-Forwarded-Proto because this app sets no `trust proxy`
+// and should not start trusting arbitrary forwarded headers for a security decision.
+function authCookieOptions(request: Request, maxAgeMs: number) {
+  return {
+    httpOnly: true,
+    sameSite: "lax" as const,
+    secure: !isLocalRequestHost(request.headers.host),
+    maxAge: maxAgeMs,
+  };
+}
+
 function resolveHomePath(rawPath: string): string {
   return path.resolve(rawPath.trim().replace(/^~(?=\/|$)/, process.env.HOME ?? "~"));
 }
@@ -251,11 +299,7 @@ apiRouter.post(
       return;
     }
     const { value, maxAgeMs } = await issueToken();
-    response.cookie(AUTH_COOKIE_NAME, value, {
-      httpOnly: true,
-      sameSite: "lax",
-      maxAge: maxAgeMs,
-    });
+    response.cookie(AUTH_COOKIE_NAME, value, authCookieOptions(request, maxAgeMs));
     response.json({ ok: true });
   })
 );
@@ -281,11 +325,7 @@ apiRouter.post(
     }
     setStoredPassword(trimmedPassword);
     const { value, maxAgeMs } = await issueToken();
-    response.cookie(AUTH_COOKIE_NAME, value, {
-      httpOnly: true,
-      sameSite: "lax",
-      maxAge: maxAgeMs,
-    });
+    response.cookie(AUTH_COOKIE_NAME, value, authCookieOptions(request, maxAgeMs));
     response.json({ ok: true });
   })
 );
@@ -525,29 +565,42 @@ apiRouter.post(
   })
 );
 
-apiRouter.get("/tunnel", (_request, response) => {
-  response.json(getTunnelStatus());
-});
+// getTunnelMode() picks the backend: "named" when data/named-tunnel/tunnel.json exists (opt-in,
+// written by scripts/setup-named-tunnel.sh), "quick" otherwise (the zero-config default). The
+// two share the TunnelStatus shape and this same set of routes.
+apiRouter.get(
+  "/tunnel",
+  requireLocalHost,
+  wrapAsync(async (_request, response) => {
+    response.json(getTunnelMode() === "named" ? await getNamedTunnelStatus() : getTunnelStatus());
+  })
+);
 
 apiRouter.post(
   "/tunnel/start",
+  requireLocalHost,
   wrapAsync(async (_request, response) => {
     if (!isAuthEnabled()) {
       response.status(409).json({ error: "Set DASHBOARD_PASSWORD before exposing the dashboard to the internet." });
       return;
     }
-    response.json(await startTunnel());
+    response.json(getTunnelMode() === "named" ? await startNamedTunnel() : await startTunnel());
   })
 );
 
-apiRouter.post("/tunnel/stop", (_request, response) => {
-  response.json(stopTunnel());
-});
+apiRouter.post(
+  "/tunnel/stop",
+  requireLocalHost,
+  wrapAsync(async (_request, response) => {
+    response.json(getTunnelMode() === "named" ? await stopNamedTunnel() : stopTunnel());
+  })
+);
 
-// Full stdout+stderr from the current/last cloudflared run, for diagnosing failures that
-// only show up after the tunnel already reported a URL (edge disconnects, protocol errors),
-// which getTunnelStatus's short-lived error field never captures (see tunnel.ts).
-apiRouter.get("/tunnel/logs", (_request, response) => {
+// Full cloudflared output for diagnosing failures that only show up after the tunnel already
+// reported a URL (edge disconnects, protocol errors), which the short-lived status error field
+// never captures. Both modes write to the same data/cloudflared.log (quick via tunnel.ts's own
+// append, named via the LaunchAgent's --logfile), so one reader covers both.
+apiRouter.get("/tunnel/logs", requireLocalHost, (_request, response) => {
   response.type("text/plain").send(readTunnelLog());
 });
 

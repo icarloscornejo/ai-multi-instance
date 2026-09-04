@@ -98,6 +98,9 @@ export type TunnelState = "stopped" | "starting" | "running" | "error";
 export type TunnelPhase = "checking-caddy" | "launching" | "verifying";
 
 export interface TunnelStatus {
+  // Mirrors server/src/tunnel.ts's TunnelStatus.mode: "quick" is the zero-config trycloudflare.com
+  // default, "named" is the opt-in Cloudflare Named Tunnel on a fixed hostname.
+  mode: "quick" | "named";
   state: TunnelState;
   phase: TunnelPhase | null;
   url: string | null;
