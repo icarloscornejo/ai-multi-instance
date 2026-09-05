@@ -66,18 +66,22 @@ function darwinUserTempDir() {
 // the periodic cleaner (/etc/periodic/daily/110.clean-tmps) deletes anything under /tmp not
 // accessed in 3+ days, which silently kills the whole tmux server and every dashboard session
 // with it - see server/src/tmux.ts's warnIfSocketDirectorySurvived, which is exactly that event
-// being detected after the fact. Pinning TMUX_TMPDIR to a directory under $HOME (never touched by
-// any macOS auto-cleaner) is what keeps sessions alive for as long as the machine stays up.
+// being detected after the fact.
 //
-// One-time cost: the first server start after this lands looks at the new path, finds no server,
-// and recreates the sessions once. From then on they are stable.
+// Originally pinned to ~/.cache/ai-multi-instance; moved to ~/Library/Application Support since
+// that is the actual macOS convention for an app's own persistent state (as opposed to
+// ~/Library/Caches, which any cache-sweeping tool is entitled to clear on its own schedule).
+//
+// One-time cost, same as the previous move off /tmp: the first server start after this lands
+// looks at the new path, finds no server, and recreates the sessions once. From then on they
+// are stable.
 export function resolveTmuxTmpdir(env = process.env) {
   // Honor an explicit TMUX_TMPDIR the user set deliberately, as long as it works.
   if (env.TMUX_TMPDIR && isWritable(env.TMUX_TMPDIR)) {
     return normalize(env.TMUX_TMPDIR);
   }
   // Same parent as resolveWritableTmpdir's own $HOME fallback below, for consistency.
-  const pinned = path.join(os.homedir(), ".cache", "ai-multi-instance", "tmux");
+  const pinned = path.join(os.homedir(), "Library", "Application Support", "ai-multi-instance", "tmux");
   try {
     mkdirSync(pinned, { recursive: true });
     // tmux is strict about the tmux-<uid> subdir it creates (must be 0700, owned by the caller);
@@ -94,7 +98,7 @@ export function resolveWritableTmpdir(env = process.env) {
     env.TMPDIR,
     os.tmpdir(),
     darwinUserTempDir(),
-    path.join(os.homedir(), ".cache", "ai-multi-instance", "tmp"),
+    path.join(os.homedir(), "Library", "Application Support", "ai-multi-instance", "tmp"),
     "/tmp",
   ].filter(Boolean);
 
@@ -134,6 +138,12 @@ function main() {
   if (tmuxTmpdir) {
     childEnv.TMUX_TMPDIR = tmuxTmpdir;
   }
+
+  // When no -L/-S is given, tmux prefers $TMUX over $TMUX_TMPDIR to find its socket, so starting
+  // this server from inside someone's own tmux pane would otherwise make it attach to THEIR
+  // server instead of the pinned one above; strip both so the pinned TMUX_TMPDIR always wins.
+  delete childEnv.TMUX;
+  delete childEnv.TMUX_PANE;
 
   const child = spawn(command, args, {
     stdio: "inherit",

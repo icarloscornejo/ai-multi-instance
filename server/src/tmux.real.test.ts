@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -24,15 +25,32 @@ const execFileAsync = promisify(execFile);
 // not through the argv this test is trying to verify. A brand-new TMUX_TMPDIR means tmux talks
 // to its own private server here, one this test starts and tears down itself - the user's
 // default-socket sessions (their real, in-progress agent work) are never touched.
+//
+// BUT: when no -L/-S is passed, tmux prefers $TMUX over $TMUX_TMPDIR to locate the socket, and
+// $TMUX is set inside any tmux pane - exactly where this suite runs when a dashboard agent calls
+// `npm test`. Without clearing TMUX (and TMUX_PANE, which tmux commands also read), every
+// command below, including this file's own kill-server, silently targets the REAL dashboard
+// server instead of the throwaway one, killing the user's live sessions. This is not
+// hypothetical: it is the confirmed root cause of the "tmux server dies every 10-40 min" bug.
+async function socketPathOf(sessionName: string): Promise<string> {
+  const { stdout } = await execFileAsync("tmux", ["display-message", "-p", "-t", sessionName, "#{socket_path}"]);
+  return stdout.trim();
+}
 
 describe("createSession (real tmux)", () => {
   let isolatedSocketDir: string;
   let previousTmuxTmpdir: string | undefined;
+  let previousTmux: string | undefined;
+  let previousTmuxPane: string | undefined;
 
   beforeAll(async () => {
     isolatedSocketDir = await mkdtemp(join(tmpdir(), "ccdash-tmux-test-"));
     previousTmuxTmpdir = process.env.TMUX_TMPDIR;
+    previousTmux = process.env.TMUX;
+    previousTmuxPane = process.env.TMUX_PANE;
     process.env.TMUX_TMPDIR = isolatedSocketDir;
+    delete process.env.TMUX;
+    delete process.env.TMUX_PANE;
   });
 
   afterAll(async () => {
@@ -41,6 +59,8 @@ describe("createSession (real tmux)", () => {
     } else {
       process.env.TMUX_TMPDIR = previousTmuxTmpdir;
     }
+    if (previousTmux !== undefined) process.env.TMUX = previousTmux;
+    if (previousTmuxPane !== undefined) process.env.TMUX_PANE = previousTmuxPane;
     await rm(isolatedSocketDir, { recursive: true, force: true });
   });
 
@@ -48,6 +68,9 @@ describe("createSession (real tmux)", () => {
     const sessionName = "ccdash-real-test-session";
     await createSession(sessionName, tmpdir());
     try {
+      // Guard against a broken isolation silently retargeting the real dashboard server: fail
+      // loud here, before any kill-session/kill-server below can touch a live session.
+      expect(await socketPathOf(sessionName)).toContain(isolatedSocketDir);
       // A wrong separator (see tmux.ts's comment on this exact argv) makes new-session treat
       // the rest of the argv as a doomed shell-command: the session dies immediately and
       // isSessionInitIncomplete can only ever see it as absent, never as "confirmed-incomplete".
@@ -69,6 +92,7 @@ describe("createSession (real tmux)", () => {
   it("rejects a duplicate create without touching the existing session's marker", async () => {
     const sessionName = "ccdash-real-dup-session";
     await createSession(sessionName, tmpdir());
+    expect(await socketPathOf(sessionName)).toContain(isolatedSocketDir);
     await markSessionInitComplete(sessionName);
     try {
       await expect(createSession(sessionName, tmpdir())).rejects.toThrow(/duplicate session/i);
@@ -85,6 +109,7 @@ describe("createSession (real tmux)", () => {
   it("treats a legacy '1' marker as preserve, never 'confirmed-incomplete'", async () => {
     const sessionName = "ccdash-real-legacy-session";
     await createSession(sessionName, tmpdir());
+    expect(await socketPathOf(sessionName)).toContain(isolatedSocketDir);
     try {
       await execFileAsync("tmux", ["set-option", "-t", sessionName, "@ccdash_init_incomplete", "1"]);
       expect(await isSessionInitIncomplete(sessionName)).toBe("not-confirmed-incomplete");
@@ -101,17 +126,28 @@ describe("createSession (real tmux)", () => {
 describe("getSessionPresence with no server (real tmux, ENOENT)", () => {
   let emptySocketDir: string;
   let previousTmuxTmpdir: string | undefined;
+  let previousTmux: string | undefined;
+  let previousTmuxPane: string | undefined;
 
   beforeAll(async () => {
     emptySocketDir = await mkdtemp(join(tmpdir(), "ccdash-tmux-noserver-"));
     previousTmuxTmpdir = process.env.TMUX_TMPDIR;
+    previousTmux = process.env.TMUX;
+    previousTmuxPane = process.env.TMUX_PANE;
     process.env.TMUX_TMPDIR = emptySocketDir;
+    delete process.env.TMUX;
+    delete process.env.TMUX_PANE;
   });
 
   afterEach(async () => {
-    // Paranoia: if something did spin a server up, kill it so the next assertion still sees
-    // the socket-missing case.
-    await execFileAsync("tmux", ["kill-server"]).catch(() => undefined);
+    // Paranoia: if something did spin a server up in OUR isolated dir, kill it so the next
+    // assertion still sees the socket-missing case. Gated on the socket actually existing in
+    // emptySocketDir (never an unqualified kill-server) so this can never reach the real
+    // dashboard server even if TMUX/TMUX_TMPDIR isolation above were ever broken again.
+    const socketPath = join(emptySocketDir, `tmux-${process.getuid?.() ?? 501}`, "default");
+    if (existsSync(socketPath)) {
+      await execFileAsync("tmux", ["kill-server"]).catch(() => undefined);
+    }
   });
 
   afterAll(async () => {
@@ -120,6 +156,8 @@ describe("getSessionPresence with no server (real tmux, ENOENT)", () => {
     } else {
       process.env.TMUX_TMPDIR = previousTmuxTmpdir;
     }
+    if (previousTmux !== undefined) process.env.TMUX = previousTmux;
+    if (previousTmuxPane !== undefined) process.env.TMUX_PANE = previousTmuxPane;
     await rm(emptySocketDir, { recursive: true, force: true });
   });
 
