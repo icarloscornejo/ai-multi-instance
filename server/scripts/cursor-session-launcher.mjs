@@ -11,7 +11,10 @@ try {
   const sessionId = output.trim().split(/\s+/).at(-1);
   if (!sessionId) throw new Error("Cursor Agent did not return a chat ID.");
 
-  const cacheRoot = path.join(os.homedir(), ".cache", "ai-multi-instance");
+  // ~/Library/Application Support, not ~/.cache - see scripts/with-writable-tmpdir.mjs's
+  // resolveTmuxTmpdir comment: third-party junk cleaners target folders named "cache" anywhere
+  // under $HOME.
+  const cacheRoot = path.join(os.homedir(), "Library", "Application Support", "ai-multi-instance");
   await fs.mkdir(cacheRoot, { recursive: true });
   const snapshotPath = path.join(cacheRoot, `${instanceId}.json`);
   await fs.writeFile(

@@ -7,7 +7,10 @@ const [instanceId, expectedCwd, startedAtRaw] = process.argv.slice(2);
 const startedAt = Number(startedAtRaw);
 const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const sessionsRoot = path.join(codexHome, "sessions");
-const cacheRoot = path.join(os.homedir(), ".cache", "ai-multi-instance");
+// ~/Library/Application Support, not ~/.cache - see scripts/with-writable-tmpdir.mjs's
+// resolveTmuxTmpdir comment: third-party junk cleaners target folders named "cache" anywhere
+// under $HOME.
+const cacheRoot = path.join(os.homedir(), "Library", "Application Support", "ai-multi-instance");
 const claimsRoot = path.join(cacheRoot, "codex-claims");
 
 async function jsonlFiles(directory) {

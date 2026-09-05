@@ -34,7 +34,7 @@ describe("Cursor dashboard status line", () => {
 
     expect(output).toBe("GPT-5.6 Sol · 13% context");
     const snapshot = JSON.parse(
-      await readFile(path.join(home, ".cache", "ai-multi-instance", "cursor-instance.json"), "utf8"),
+      await readFile(path.join(home, "Library", "Application Support", "ai-multi-instance", "cursor-instance.json"), "utf8"),
     );
     expect(snapshot).toMatchObject({
       provider: "cursor",
@@ -52,7 +52,7 @@ describe("Cursor dashboard status line", () => {
   it("derives used context from the remaining percentage and preserves a custom status line", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "cursor-statusline-"));
     const cursorDir = path.join(home, ".cursor");
-    const cacheDir = path.join(home, ".cache", "ai-multi-instance");
+    const cacheDir = path.join(home, "Library", "Application Support", "ai-multi-instance");
     await mkdir(cursorDir, { recursive: true });
     await mkdir(cacheDir, { recursive: true });
     await writeFile(
@@ -74,7 +74,7 @@ describe("Cursor dashboard status line", () => {
 
     expect(output).toBe("custom status");
     const snapshot = JSON.parse(
-      await readFile(path.join(home, ".cache", "ai-multi-instance", "cursor-instance.json"), "utf8"),
+      await readFile(path.join(home, "Library", "Application Support", "ai-multi-instance", "cursor-instance.json"), "utf8"),
     );
     expect(snapshot).toMatchObject({
       sessionId: "chat-created-before-statusline",

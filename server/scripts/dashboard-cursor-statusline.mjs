@@ -91,7 +91,10 @@ function runShellCommand(command, input) {
 }
 
 async function writeSnapshot(payload, instanceId) {
-  const cacheRoot = path.join(os.homedir(), ".cache", "ai-multi-instance");
+  // ~/Library/Application Support, not ~/.cache - see scripts/with-writable-tmpdir.mjs's
+  // resolveTmuxTmpdir comment: third-party junk cleaners target folders named "cache" anywhere
+  // under $HOME.
+  const cacheRoot = path.join(os.homedir(), "Library", "Application Support", "ai-multi-instance");
   const existing = await readSnapshot(cacheRoot, instanceId);
   const cwd = stringAt(payload, ["workspace", "current_dir"]) ?? stringAt(payload, ["cwd"]);
   const contextSize = numberAt(payload, ["context_window", "context_window_size"]);

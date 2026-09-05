@@ -48,7 +48,7 @@ describe("Codex session watcher", () => {
 
     const snapshots = await Promise.all(
       ["instance-a", "instance-b"].map(async (instanceId) =>
-        JSON.parse(await fs.readFile(path.join(home, ".cache", "ai-multi-instance", `${instanceId}.json`), "utf8"))
+        JSON.parse(await fs.readFile(path.join(home, "Library", "Application Support", "ai-multi-instance", `${instanceId}.json`), "utf8"))
       )
     );
     expect(new Set(snapshots.map((snapshot) => snapshot.sessionId))).toEqual(new Set(ids));

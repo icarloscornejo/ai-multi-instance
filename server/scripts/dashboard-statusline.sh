@@ -75,7 +75,10 @@ extra_limit_usd=""
 day_total_usd=""
 burn_per_hour=""
 
-cache_dir="$HOME/.cache/ai-multi-instance"
+# ~/Library/Application Support, not ~/.cache - see scripts/with-writable-tmpdir.mjs's
+# resolveTmuxTmpdir comment: third-party junk cleaners target folders named "cache" anywhere
+# under $HOME.
+cache_dir="$HOME/Library/Application Support/ai-multi-instance"
 mkdir -p "$cache_dir"
 
 get_oauth_token() {
