@@ -17,6 +17,8 @@ import {
 import { buildLaunchCommand } from "./launch";
 import { computeMaxLivePtys, getPtmxMax } from "./ptyCapacity";
 import { pathExists } from "./paths";
+import { withSessionLock } from "./sessionLock";
+import { loadState } from "./store";
 import {
   TmuxError,
   createSession,
@@ -417,7 +419,16 @@ export async function ensureSessionReady(instance: InstanceRecord): Promise<void
     return existing;
   }
 
-  const readyPromise = (async () => {
+  // The actual work runs inside withSessionLock (sessionLock.ts), not just the single-flight
+  // map above - those are two different things. sessionInitInFlight only DEDUPLICATES
+  // concurrent attaches for the SAME session onto one shared execution; it does nothing for a
+  // DELETE (routes.ts) running concurrently, since DELETE never populates or checks this map.
+  // withSessionLock is what actually orders this against DELETE: both acquire the SAME lock
+  // for this tmuxSession, so whichever arrives first runs to completion before the other's
+  // body starts - closing the race where DELETE kills the session and, before it removes the
+  // registry entry, this recreates it (a fresh orphan through a different path than the one
+  // DELETE's own catch{} used to leak through).
+  const readyPromise = withSessionLock(instance.tmuxSession, async () => {
     const presence = await getSessionPresence(instance.tmuxSession);
 
     if (presence === "unknown") {
@@ -429,6 +440,17 @@ export async function ensureSessionReady(instance: InstanceRecord): Promise<void
     }
 
     if (presence === "absent") {
+      // Re-check the registry from inside the lock, not the `instance` argument (a snapshot
+      // taken before this lock was acquired, possibly stale): a DELETE that just ran under
+      // this same lock, for this same session, may have removed the record in the meantime.
+      // Recreating a session for an instance that is being deleted would resurrect exactly
+      // the "live session, no registry entry" state this whole locking scheme exists to
+      // prevent - just with the roles reversed.
+      const currentState = await loadState();
+      const stillRegistered = currentState.instances.some((candidate) => candidate.id === instance.id);
+      if (!stillRegistered) {
+        throw new Error(`Instance ${instance.id} was deleted while its session was being prepared.`);
+      }
       await initializeSession(instance);
       return;
     }
@@ -453,7 +475,7 @@ export async function ensureSessionReady(instance: InstanceRecord): Promise<void
       // above and here, there is nothing left to clean up.
     });
     await initializeSession(instance);
-  })();
+  });
 
   sessionInitInFlight.set(instance.tmuxSession, readyPromise);
   try {

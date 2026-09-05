@@ -6,11 +6,12 @@ import express, { type Request, type Response, type NextFunction, type Router } 
 import { AUTH_COOKIE_NAME, checkPassword, isAuthEnabled, issueToken, readCookie, requireAuth, setStoredPassword, verifyToken } from "./auth";
 import { isAgentProvider, PROVIDERS, sessionKeyFor } from "./providers";
 import { pathExists } from "./paths";
-import { loadState, saveState } from "./store";
-import { exitCopyMode, getPaneCurrentPath, killSession } from "./tmux";
+import { loadState, saveState, updateState } from "./store";
+import { exitCopyMode, getPaneCurrentPath, getSessionPresence, killSession } from "./tmux";
 import { isRemoteUnreachableError, NETWORK_GIT_TIMEOUT_MS, runGit } from "./git";
 import { LaunchProgress } from "./launchProgress";
 import { initializeInstanceSession } from "./terminal";
+import { withSessionLock } from "./sessionLock";
 import { getTunnelStatus, readTunnelLog, startTunnel, stopTunnel } from "./tunnel";
 import { getNamedTunnelStatus, getTunnelMode, startNamedTunnel, stopNamedTunnel } from "./namedTunnel";
 import { isLocalRequestHost } from "./requestHost";
@@ -34,6 +35,27 @@ function wrapAsync(handler: AsyncHandler) {
     handler(request, response).catch(next);
   };
 }
+
+// Thrown from inside a POST /instances updateState mutator when the commit-time revalidation
+// (label+locationPath, id, or tmuxSession uniqueness) fails against the LATEST state - not the
+// snapshot loaded at the top of the handler. That earlier snapshot only rejects the common
+// case cheaply, before paying for git/tmux; this is the one that actually protects the
+// invariant, since another request could have inserted a colliding instance in between. Thrown
+// (rather than returned) so it propagates out of initializeInstanceSession's onSessionCreated
+// hook while `launchMayHaveBeenApplied` is still false, which makes that function's own catch
+// kill the tmux session it just created - the request must never succeed with an unregistered
+// live session.
+class InstanceCommitConflictError extends Error {}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Short backoff between DELETE's kill retries - not a network call, just giving a momentarily
+// wedged tmux server (a slow filesystem, a busy socket) a couple of chances to clear before
+// this gives up and refuses to touch the registry. Kept short: this runs inline in an HTTP
+// response the user is waiting on.
+const DELETE_KILL_RETRY_DELAYS_MS: readonly number[] = [300, 900];
 
 // Picks a private IPv4 address other devices on the same LAN can reach (e.g. Wi-Fi at
 // home): the first non-internal IPv4 in a standard private range, skipping VPN/virtual
@@ -136,7 +158,12 @@ async function findStaleBranches(cwd: string): Promise<StaleBranchesResponse> {
 }
 
 function resolveLiveStatusSnapshotPath(instance: InstanceRecord): string {
-  return path.join(os.homedir(), ".cache", "ai-multi-instance", `${instance.id}.json`);
+  // ~/Library/Application Support, not ~/.cache - see with-writable-tmpdir.mjs's
+  // resolveTmuxTmpdir comment: a folder literally named "cache" anywhere under $HOME is a
+  // target for third-party junk cleaners (CleanMyMac and similar), which have deleted files
+  // out from under this app before. Application Support is the macOS convention these tools
+  // are built to leave alone.
+  return path.join(os.homedir(), "Library", "Application Support", "ai-multi-instance", `${instance.id}.json`);
 }
 
 async function readLiveSessionId(instance: InstanceRecord): Promise<string | null> {
@@ -832,22 +859,45 @@ apiRouter.post(
       // post-launch failure keeps `done` (with the instance) plus a `step-warning`, and the
       // user attaches or deletes explicitly.
       try {
-        await initializeInstanceSession(
-          instance,
-          async () => {
-            progress.stepStart("persist", "Saving instance");
-            state.instances.push(instance);
-            await saveState(state);
-            persisted = true;
-            progress.stepDone("persist");
-          },
-          (step, phase) => {
-            if (phase === "start") {
-              progress.stepStart(step, sessionStepLabel[step]);
-            } else {
-              progress.stepDone(step);
+        // Locked around the whole create+persist+launch sequence for this tmuxSession - see
+        // sessionLock.ts. The name is a fresh random id, so contention here is only a
+        // theoretical safeguard, not something expected to actually happen; the lock is held
+        // for the SAME reason DELETE holds it (routes.ts's DELETE handler below), for
+        // uniformity of "nothing else touches this session name while this is in flight".
+        await withSessionLock(instance.tmuxSession, () =>
+          initializeInstanceSession(
+            instance,
+            async () => {
+              progress.stepStart("persist", "Saving instance");
+              await updateState(async (draft) => {
+                const nameCollision: boolean = draft.instances.some(
+                  (existing) => existing.locationPath === locationPath && existing.label === requestedLabel
+                );
+                const idCollision: boolean = draft.instances.some((existing) => existing.id === instance.id);
+                const sessionCollision: boolean = draft.instances.some(
+                  (existing) => existing.tmuxSession === instance.tmuxSession
+                );
+                if (nameCollision || idCollision || sessionCollision) {
+                  throw new InstanceCommitConflictError(
+                    nameCollision
+                      ? `An instance named '${requestedLabel}' is already running here`
+                      : "Could not register the new instance: id collision, please retry"
+                  );
+                }
+                draft.instances.push(instance);
+                return { result: undefined, nextState: draft };
+              });
+              persisted = true;
+              progress.stepDone("persist");
+            },
+            (step, phase) => {
+              if (phase === "start") {
+                progress.stepStart(step, sessionStepLabel[step]);
+              } else {
+                progress.stepDone(step);
+              }
             }
-          }
+          )
         );
       } catch (error) {
         if (!persisted) {
@@ -1008,31 +1058,83 @@ apiRouter.get(
 apiRouter.delete(
   "/instances/:id",
   wrapAsync(async (request, response) => {
-    const state: DashboardState = await loadState();
-    const instance = state.instances.find((candidate) => candidate.id === request.params.id);
-    if (instance === undefined) {
+    const instanceId: string = request.params.id;
+    const preState: DashboardState = await loadState();
+    const preInstance = preState.instances.find((candidate) => candidate.id === instanceId);
+    if (preInstance === undefined) {
       response.status(404).json({ error: "Instance not found." });
       return;
     }
 
-    // Read the pane's live session id before killing it, so a future instance reusing
-    // this exact location+label can pick up the conversation where it left off.
-    const liveSessionId: string | null = await readLiveSessionId(instance);
-    if (liveSessionId !== null) {
-      state.sessionsByKey[sessionKeyFor(instance.provider, instance.locationPath, instance.label)] = liveSessionId;
-    }
+    // Everything below runs under this instance's tmux session lock (sessionLock.ts) - the
+    // whole point being to close the race where an attach's ensureSessionReady (terminal.ts)
+    // recreates the session in the gap between this killing it and this removing the
+    // registry entry, which would produce a fresh orphan through a different path than the
+    // one this endpoint itself used to leak through.
+    await withSessionLock(preInstance.tmuxSession, async () => {
+      // Read the pane's live session id before killing it, so a future instance reusing this
+      // exact location+label can pick up the conversation where it left off. Persisted in its
+      // OWN transaction, before any kill attempt: it is non-destructive, and losing it would
+      // cost a future resume even on the ordinary happy path, so there's no reason to gate it
+      // on how the kill goes.
+      const liveSessionId: string | null = await readLiveSessionId(preInstance);
+      if (liveSessionId !== null) {
+        const resumeKey: string = sessionKeyFor(preInstance.provider, preInstance.locationPath, preInstance.label);
+        await updateState(async (draft) => {
+          draft.sessionsByKey[resumeKey] = liveSessionId;
+          return { result: undefined, nextState: draft };
+        });
+      }
 
-    try {
-      await killSession(instance.tmuxSession);
-    } catch {
-      // The session may have died already (reboot); does not block deletion
-    }
+      // killSession (tmux.ts) only returns cleanly on a DEFINITIVE "no such session"; it
+      // rethrows for anything unconfirmed (a timeout, a wedged tmux server). Retried a couple
+      // of times with short backoff before falling back to a direct presence check - a
+      // momentary hiccup should not cost the user a stuck DELETE, but a kill that never
+      // confirms must never be treated as if it had.
+      let killConfirmed = false;
+      let lastKillError: Error | null = null;
+      for (let attempt = 0; attempt <= DELETE_KILL_RETRY_DELAYS_MS.length; attempt += 1) {
+        try {
+          await killSession(preInstance.tmuxSession);
+          killConfirmed = true;
+          break;
+        } catch (error) {
+          lastKillError = error as Error;
+          if (attempt < DELETE_KILL_RETRY_DELAYS_MS.length) {
+            await sleep(DELETE_KILL_RETRY_DELAYS_MS[attempt]);
+          }
+        }
+      }
 
-    // The location is a permanent user folder: deleting the instance only closes
-    // its terminal, it never touches the disk
-    state.instances = state.instances.filter((candidate) => candidate.id !== instance.id);
-    await saveState(state);
-    response.status(204).end();
+      if (!killConfirmed) {
+        // The retries above never got a definitive answer - ask once more, directly, since a
+        // session that quietly died on its own between retries still counts as gone.
+        const presence = await getSessionPresence(preInstance.tmuxSession);
+        killConfirmed = presence === "absent";
+      }
+
+      if (!killConfirmed) {
+        // Deliberately does NOT touch the registry: the session may still be alive with a
+        // live agent inside it. Losing the record here is exactly the bug this whole change
+        // exists to close - see the DELETE catch{} this replaced.
+        response.status(409).json({
+          error: `Could not confirm '${preInstance.label}' stopped: ${lastKillError?.message ?? "unknown tmux error"}. Nothing was deleted; try again.`,
+        });
+        return;
+      }
+
+      await updateState(async (draft) => {
+        const current = draft.instances.find((candidate) => candidate.id === instanceId);
+        if (current === undefined) {
+          // Already removed by a concurrent DELETE that won the race for this same instance
+          // (both held the session lock in turn, sequentially) - idempotent, nothing to save.
+          return { result: undefined };
+        }
+        draft.instances = draft.instances.filter((candidate) => candidate.id !== instanceId);
+        return { result: undefined, nextState: draft };
+      });
+      response.status(204).end();
+    });
   })
 );
 

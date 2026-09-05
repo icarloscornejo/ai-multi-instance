@@ -36,8 +36,19 @@ vi.mock("@lydell/node-pty", () => ({
   spawn: vi.fn(),
 }));
 
+// ensureSessionReady's "absent" branch re-checks the registry from inside the session lock
+// before recreating a session, to close the DELETE-vs-attach race (see terminal.ts's comment
+// on that check). Defaulted in beforeEach below to a state that already contains
+// makeInstance()'s id, so every pre-existing test in this file - which predates that check -
+// keeps passing without having to know about it; only the dedicated test for the check itself
+// overrides this to return a state where the instance is gone.
+vi.mock("./store", () => ({
+  loadState: vi.fn(),
+}));
+
 import * as nodePty from "@lydell/node-pty";
 import * as tmux from "./tmux";
+import { loadState } from "./store";
 import {
   AttachCancelledError,
   PtySpawnError,
@@ -158,6 +169,12 @@ beforeEach(() => {
   vi.mocked(tmux.markSessionInitComplete).mockReset();
   vi.mocked(tmux.isDuplicateSessionError).mockReset();
   vi.mocked(nodePty.spawn).mockReset();
+  vi.mocked(loadState).mockReset().mockResolvedValue({
+    schemaVersion: 2,
+    config: { locations: [], enabledProviders: [] },
+    instances: [makeInstance()],
+    sessionsByKey: {},
+  } as unknown as Awaited<ReturnType<typeof loadState>>);
 });
 
 describe("spawnWithRetry", () => {
@@ -273,6 +290,26 @@ describe("ensureSessionReady", () => {
     vi.mocked(tmux.isSessionInitIncomplete).mockResolvedValue("not-confirmed-incomplete");
     await ensureSessionReady(makeInstance());
     expect(tmux.killSession).not.toHaveBeenCalled();
+    expect(tmux.createSession).not.toHaveBeenCalled();
+  });
+
+  // The DELETE-vs-attach race this check exists to close: a concurrent DELETE (routes.ts) may
+  // have removed the instance from the registry while THIS call was waiting on
+  // getSessionPresence - both hold the same tmux session lock in turn (sessionLock.ts), so by
+  // the time this runs, DELETE's own commit (if it went first) is already visible via
+  // loadState. Recreating the session anyway would resurrect exactly the "live session, no
+  // registry entry" bug this whole change exists to close, just via the attach path instead of
+  // DELETE's old catch{}.
+  it("refuses to recreate an absent session for an instance the registry no longer has", async () => {
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("absent");
+    vi.mocked(loadState).mockResolvedValue({
+      schemaVersion: 2,
+      config: { locations: [], enabledProviders: [] },
+      instances: [],
+      sessionsByKey: {},
+    } as unknown as Awaited<ReturnType<typeof loadState>>);
+
+    await expect(ensureSessionReady(makeInstance())).rejects.toThrow(/deleted/);
     expect(tmux.createSession).not.toHaveBeenCalled();
   });
 

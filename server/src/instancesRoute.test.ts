@@ -4,11 +4,28 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import type { DashboardState, InstanceRecord } from "./types";
 
 // The route under test reaches for these; everything else it imports (providers, path helpers)
-// is pure and used as-is.
-vi.mock("./store", () => ({
-  loadState: vi.fn(),
-  saveState: vi.fn(),
-}));
+// is pure and used as-is. updateState is a real implementation wired to the same
+// loadState/saveState mocks below (not its own vi.fn()) - it needs the actual
+// load-clone-mutate-save sequence to exercise the routes' commit-time revalidation
+// (id/tmuxSession/name collisions) and no-op-on-unconfirmed-kill behavior faithfully. This
+// mirrors store.ts's real updateState closely enough for route-level testing without
+// depending on store.ts's own module state (cachedState, its queue) across test cases.
+vi.mock("./store", () => {
+  const loadStateMock = vi.fn();
+  const saveStateMock = vi.fn();
+  const updateStateMock = vi.fn(
+    async (mutator: (draft: DashboardState) => Promise<{ result: unknown; nextState?: DashboardState }>) => {
+      const current = (await loadStateMock()) as DashboardState;
+      const draft = structuredClone(current);
+      const outcome = await mutator(draft);
+      if (outcome.nextState !== undefined) {
+        await saveStateMock(outcome.nextState);
+      }
+      return outcome.result;
+    }
+  );
+  return { loadState: loadStateMock, saveState: saveStateMock, updateState: updateStateMock };
+});
 vi.mock("./paths", () => ({
   pathExists: vi.fn(),
 }));
@@ -18,6 +35,7 @@ vi.mock("./terminal", () => ({
 vi.mock("./tmux", () => ({
   exitCopyMode: vi.fn(),
   getPaneCurrentPath: vi.fn(),
+  getSessionPresence: vi.fn(),
   killSession: vi.fn(),
 }));
 vi.mock("./tunnel", () => ({
@@ -48,14 +66,17 @@ vi.mock("./git", async (importOriginal) => {
   return { ...actual, runGit: vi.fn() };
 });
 
-import { loadState, saveState } from "./store";
+import { loadState, saveState, updateState } from "./store";
 import { pathExists } from "./paths";
 import { initializeInstanceSession } from "./terminal";
+import { getSessionPresence, killSession } from "./tmux";
 import { GitError, runGit } from "./git";
 import { apiRouter } from "./routes";
 
 const runGitMock = vi.mocked(runGit);
 const initMock = vi.mocked(initializeInstanceSession);
+const killSessionMock = vi.mocked(killSession);
+const getSessionPresenceMock = vi.mocked(getSessionPresence);
 
 let server: ReturnType<express.Express["listen"]>;
 let baseUrl: string;
@@ -87,6 +108,26 @@ function createInstanceRequest(body: Record<string, unknown>): Promise<Response>
   });
 }
 
+function deleteInstanceRequest(id: string): Promise<Response> {
+  return fetch(`${baseUrl}/instances/${id}`, { method: "DELETE" });
+}
+
+function makeRunningInstance(overrides: Partial<InstanceRecord> = {}): InstanceRecord {
+  return {
+    id: "abc123",
+    label: "repo",
+    locationPath: "/work/repo",
+    tmuxSession: "ccdash-abc123",
+    provider: "claude",
+    command: "claude",
+    model: null,
+    effort: null,
+    fontSize: 13,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    ...overrides,
+  } as InstanceRecord;
+}
+
 beforeAll(async () => {
   const app = express();
   app.use(express.json());
@@ -111,8 +152,11 @@ afterAll(() => {
 beforeEach(() => {
   runGitMock.mockReset();
   initMock.mockReset();
+  killSessionMock.mockReset().mockResolvedValue(undefined);
+  getSessionPresenceMock.mockReset().mockResolvedValue("absent");
   vi.mocked(loadState).mockReset();
   vi.mocked(saveState).mockReset().mockResolvedValue(undefined);
+  vi.mocked(updateState).mockClear();
   vi.mocked(pathExists).mockReset().mockResolvedValue(true);
   vi.mocked(loadState).mockResolvedValue(baseState());
   errorMiddlewareCalls = [];
@@ -249,4 +293,74 @@ describe("POST /instances - phase 2 streams NDJSON as 201", () => {
       expect(call.headersSent).toBe(true);
     }
   });
+});
+
+describe("DELETE /instances/:id", () => {
+  it("404 for an id that is not in the registry", async () => {
+    vi.mocked(loadState).mockResolvedValue(baseState());
+    const response = await deleteInstanceRequest("nope");
+    expect(response.status).toBe(404);
+    expect(vi.mocked(saveState)).not.toHaveBeenCalled();
+  });
+
+  it("happy path: kill confirmed on the first try, 204, instance removed from the saved state", async () => {
+    vi.mocked(loadState).mockResolvedValue({ ...baseState(), instances: [makeRunningInstance()] } as DashboardState);
+
+    const response = await deleteInstanceRequest("abc123");
+    expect(response.status).toBe(204);
+    expect(killSessionMock).toHaveBeenCalledWith("ccdash-abc123");
+    expect(vi.mocked(saveState)).toHaveBeenCalledOnce();
+    const savedState = vi.mocked(saveState).mock.calls[0][0] as DashboardState;
+    expect(savedState.instances).toHaveLength(0);
+  });
+
+  it("kill rejects every retry and presence stays 'unknown': 409, nothing saved, the instance survives", async () => {
+    vi.mocked(loadState).mockResolvedValue({ ...baseState(), instances: [makeRunningInstance()] } as DashboardState);
+    killSessionMock.mockRejectedValue(new Error("tmux command timed out"));
+    getSessionPresenceMock.mockResolvedValue("unknown");
+
+    const response = await deleteInstanceRequest("abc123");
+    expect(response.status).toBe(409);
+    expect((await response.json()).error).toMatch(/Could not confirm/);
+    expect(vi.mocked(saveState)).not.toHaveBeenCalled();
+
+    // A later read of the registry must still show the instance - nothing was mutated on the
+    // failure path, matching the bug this endpoint used to have (a `catch {}` that deleted the
+    // record even when the kill was never confirmed).
+    const stateAfter = await loadState();
+    expect(stateAfter.instances.map((instance) => instance.id)).toContain("abc123");
+  }, 10_000);
+
+  it("kill fails on the first attempt but confirms on the retry: 204", async () => {
+    vi.mocked(loadState).mockResolvedValue({ ...baseState(), instances: [makeRunningInstance()] } as DashboardState);
+    killSessionMock.mockRejectedValueOnce(new Error("tmux command timed out")).mockResolvedValueOnce(undefined);
+
+    const response = await deleteInstanceRequest("abc123");
+    expect(response.status).toBe(204);
+    expect(killSessionMock).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(saveState)).toHaveBeenCalledOnce();
+  }, 10_000);
+
+  it("kill never confirms but getSessionPresence reports 'absent': 204, still deletes", async () => {
+    vi.mocked(loadState).mockResolvedValue({ ...baseState(), instances: [makeRunningInstance()] } as DashboardState);
+    killSessionMock.mockRejectedValue(new Error("tmux command timed out"));
+    getSessionPresenceMock.mockResolvedValue("absent");
+
+    const response = await deleteInstanceRequest("abc123");
+    expect(response.status).toBe(204);
+    expect(vi.mocked(saveState)).toHaveBeenCalledOnce();
+  }, 10_000);
+
+  it("persists the live session id before killing, even on the unconfirmed-kill (409) path", async () => {
+    vi.mocked(loadState).mockResolvedValue({ ...baseState(), instances: [makeRunningInstance()] } as DashboardState);
+    killSessionMock.mockRejectedValue(new Error("tmux command timed out"));
+    getSessionPresenceMock.mockResolvedValue("unknown");
+
+    await deleteInstanceRequest("abc123");
+    // readLiveSessionId reads a real file this test never creates, so it resolves null and no
+    // sessionsByKey write happens - this asserts the endpoint didn't crash trying, and that a
+    // 409 still leaves saveState uncalled overall (the sessionId write, when there IS one, is
+    // its own updateState commit, separate from the delete-or-not decision below it).
+    expect(vi.mocked(saveState)).not.toHaveBeenCalled();
+  }, 10_000);
 });

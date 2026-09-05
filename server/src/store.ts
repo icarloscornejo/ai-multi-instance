@@ -317,6 +317,60 @@ export async function saveState(state: DashboardState): Promise<void> {
   await saveQueue;
 }
 
+// What a mutator passed to updateState returns: `nextState` present means "commit this",
+// `nextState` absent (e.g. DELETE deciding an unconfirmed kill must not touch the registry)
+// means "nothing to save, but here is what to tell the caller anyway" - `result` still carries
+// that (a 409 payload, a rejection outcome), it just never reaches saveState. A mutator that
+// mutates `draft` in place but returns no `nextState` is safe: `draft` is a structuredClone,
+// thrown away by runOneUpdate below the moment the mutator returns, so an in-place edit with
+// no `nextState` still commits nothing.
+export interface UpdateOutcome<T> {
+  result: T;
+  nextState?: DashboardState;
+}
+
+// Serializes the whole "read latest committed state, decide a change, save it" sequence for
+// every caller that mutates `instances` (creation, PATCH, reorder, DELETE - see routes.ts).
+// Without this, `loadState()` handing back the SAME cached object (see loadState above) means
+// two concurrent read-modify-save callers can each clone a stale snapshot and the second
+// `saveState` silently overwrites the first caller's committed change - a lost update, not a
+// crash, so nothing would ever surface it short of a very unlucky manual test.
+//
+// `updateState`'s own queue (separate from saveState's saveQueue) is what closes that: every
+// call's mutator only starts once the previous call's mutator AND its save have both finished,
+// so each one always sees the true latest state, never a stale snapshot another caller is
+// about to overwrite. The mutator receives a structuredClone of the current state - never the
+// cached object itself - so it is free to mutate its argument directly; nothing it does can
+// leak into `cachedState` except through the `saveState` call this function makes on its
+// behalf.
+//
+// Deliberately NOT reentrant: a mutator that itself calls updateState (directly or via
+// something it awaits) would deadlock on its own queue tail - same rule as
+// sessionLock.ts's withSessionLock, and for the same reason.
+let updateQueueTail: Promise<unknown> = Promise.resolve();
+
+export async function updateState<T>(mutator: (draft: DashboardState) => Promise<UpdateOutcome<T>>): Promise<T> {
+  const myTurn: Promise<T> = updateQueueTail.then(
+    () => runOneUpdate(mutator),
+    () => runOneUpdate(mutator)
+  );
+  updateQueueTail = myTurn.then(
+    () => undefined,
+    () => undefined
+  );
+  return myTurn;
+}
+
+async function runOneUpdate<T>(mutator: (draft: DashboardState) => Promise<UpdateOutcome<T>>): Promise<T> {
+  const currentState: DashboardState = await loadState();
+  const draft: DashboardState = structuredClone(currentState);
+  const outcome: UpdateOutcome<T> = await mutator(draft);
+  if (outcome.nextState !== undefined) {
+    await saveState(outcome.nextState);
+  }
+  return outcome.result;
+}
+
 // Test-only escape hatch: cachedState/loadPromise/saveQueue are process-lifetime module
 // state, so a test suite that wants a clean slate between cases (a fresh "first load ever"
 // each time) needs an explicit reset rather than re-importing the module. Mirrors
@@ -325,4 +379,5 @@ export function _resetStoreStateForTests(): void {
   cachedState = null;
   loadPromise = null;
   saveQueue = Promise.resolve();
+  updateQueueTail = Promise.resolve();
 }
