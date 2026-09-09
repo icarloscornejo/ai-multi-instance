@@ -1068,12 +1068,16 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
             onClick={handleScrollToBottomClick}
             aria-label="Scroll to bottom"
             title="Scroll to bottom"
-            className="absolute bottom-[42px] right-[14px] flex h-[30px] w-[30px] items-center justify-center rounded-full border border-border-strong bg-surface text-txt-secondary shadow-lg"
+            // z-10: xterm draws internal canvases (e.g. .xterm-link-layer) with their own
+            // explicit z-index (up to 8, see @xterm/xterm/css/xterm.css) inside containerRef;
+            // without a higher z-index of our own this sibling button sits behind them and
+            // never receives (or shows through) a click.
+            className="absolute bottom-[42px] right-[14px] z-10 flex h-[30px] w-[30px] items-center justify-center rounded-full border border-border-strong bg-surface text-txt-secondary shadow-lg"
           >
             ↓
           </button>
         )}
-        <div className="absolute bottom-[12px] right-[14px] flex gap-[6px]">
+        <div className="absolute bottom-[12px] right-[14px] z-10 flex gap-[6px]">
           <button
             type="button"
             onClick={() => applyZoom(-1)}
