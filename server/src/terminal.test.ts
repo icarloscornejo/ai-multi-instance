@@ -19,7 +19,7 @@ vi.mock("./tmux", () => ({
   },
   hasSession: vi.fn(),
   createSession: vi.fn(),
-  enableMouseMode: vi.fn(),
+  disableTmuxMouseAndAltScreen: vi.fn(),
   sendCommandToSession: vi.fn(),
   killSession: vi.fn(),
   getSessionPresence: vi.fn(),
@@ -160,7 +160,7 @@ function createDeferred<T>(): { promise: Promise<T>; resolve: (value: T) => void
 beforeEach(() => {
   vi.mocked(tmux.hasSession).mockReset();
   vi.mocked(tmux.createSession).mockReset();
-  vi.mocked(tmux.enableMouseMode).mockReset();
+  vi.mocked(tmux.disableTmuxMouseAndAltScreen).mockReset();
   vi.mocked(tmux.sendCommandToSession).mockReset();
   vi.mocked(tmux.killSession).mockReset();
   vi.mocked(tmux.getSessionPresence).mockReset();
@@ -271,11 +271,11 @@ describe("spawnWithRetry", () => {
 });
 
 describe("ensureSessionReady", () => {
-  it("preserves an existing session with a 'not-confirmed-incomplete' marker (the legacy/already-ready case), touching only enableMouseMode", async () => {
+  it("preserves an existing session with a 'not-confirmed-incomplete' marker (the legacy/already-ready case), touching only disableTmuxMouseAndAltScreen", async () => {
     vi.mocked(tmux.getSessionPresence).mockResolvedValue("present");
     vi.mocked(tmux.isSessionInitIncomplete).mockResolvedValue("not-confirmed-incomplete");
     await ensureSessionReady(makeInstance());
-    expect(tmux.enableMouseMode).toHaveBeenCalledWith("ccdash-abc123");
+    expect(tmux.disableTmuxMouseAndAltScreen).toHaveBeenCalledWith("ccdash-abc123");
     expect(tmux.createSession).not.toHaveBeenCalled();
     expect(tmux.sendCommandToSession).not.toHaveBeenCalled();
     expect(tmux.killSession).not.toHaveBeenCalled();
@@ -400,7 +400,7 @@ describe("ensureSessionReady", () => {
     await ensureSessionReady(makeInstance({ shellOnly: false }));
     expect(tmux.killSession).not.toHaveBeenCalled();
     expect(tmux.createSession).not.toHaveBeenCalled();
-    expect(tmux.enableMouseMode).toHaveBeenCalledWith("ccdash-abc123");
+    expect(tmux.disableTmuxMouseAndAltScreen).toHaveBeenCalledWith("ccdash-abc123");
   });
 
   it("recreates a session confirmed incomplete (marker reads 'created'), killing it first", async () => {
@@ -639,7 +639,7 @@ describe("bridgeTerminal", () => {
   beforeEach(() => {
     vi.mocked(tmux.getSessionPresence).mockResolvedValue("present");
     vi.mocked(tmux.isSessionInitIncomplete).mockResolvedValue("not-confirmed-incomplete");
-    vi.mocked(tmux.enableMouseMode).mockResolvedValue(undefined);
+    vi.mocked(tmux.disableTmuxMouseAndAltScreen).mockResolvedValue(undefined);
   });
 
   // This is the regression test the audit called out by name (round 2, finding "the proposed

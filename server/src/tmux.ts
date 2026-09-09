@@ -202,14 +202,11 @@ export async function createSession(sessionName: string, workingDirectory: strin
   // would otherwise misread as "legacy, preserve" for a session this process itself just
   // created and hasn't finished initializing.
   //
-  // Bare ";", not "\;" like reduceScrollStep below: runTmux calls execFile directly, with no
-  // shell involved, so there is no shell to escape the ";" FROM in the first place. new-session
-  // treats any trailing, un-chained argument as its own optional shell-command, so a literal
-  // "\;" token here doesn't separate two commands - it gets absorbed as the start of that
-  // shell-command, which fails instantly and kills the session with exit code 0 and no stderr,
-  // silently. reduceScrollStep's "\;" is correct there because bind-key's own action argument
-  // is re-parsed as a command sequence at KEYPRESS time, a wholly different parse than the one
-  // this new-session invocation goes through right now - the two are not the same technique.
+  // Bare ";": runTmux calls execFile directly, with no shell involved, so there is no shell
+  // to escape the ";" FROM in the first place. new-session treats any trailing, un-chained
+  // argument as its own optional shell-command, so a literal "\;" token here doesn't separate
+  // two commands - it gets absorbed as the start of that shell-command, which fails instantly
+  // and kills the session with exit code 0 and no stderr, silently.
   //
   // tmux starts the user's default shell as a login shell, so Vertex env vars
   // arrive from .zprofile/.zshrc just as they would in a regular terminal
@@ -229,8 +226,7 @@ export async function createSession(sessionName: string, workingDirectory: strin
   ]);
   // The tmux status bar is redundant inside the dashboard's embedded terminal
   await runTmux(["set-option", "-t", sessionName, "status", "off"]);
-  await enableMouseMode(sessionName);
-  await reduceScrollStep();
+  await disableTmuxMouseAndAltScreen(sessionName);
 }
 
 // Moves the marker to "launching" - called right BEFORE sendCommandToSession, so that if the
@@ -273,27 +269,26 @@ export async function isSessionInitIncomplete(sessionName: string): Promise<Sess
   }
 }
 
-// Without this tmux does not report the mouse wheel: xterm translates it into arrow
-// keys and the native scroll of the session (or Claude Code) never receives it.
+// Native local scroll (xterm.js's own scrollback) needs two tmux defaults reversed:
+// - mouse off: with mouse mode on, tmux claims the wheel/touch gesture and encodes it as a
+//   report instead of letting it reach the outer client's own scroll; the client's own touch
+//   handling still forwards real wheel events to whatever app inside the pane asks for its own
+//   mouse tracking (tmux keeps honoring that regardless of this server-wide setting).
+// - terminal-overrides smcup@/rmcup@: without this tmux switches the outer client into its
+//   alternate screen on attach, which xterm.js never adds to its normal-buffer scrollback
+//   (see BufferService.scroll), so the local history would always be empty.
+// - terminal-overrides indn@: xterm-256color advertises indn (ESC[nS, multi-line scroll-up);
+//   tmux uses it to move several lines at once, but xterm.js 5.5 implements that sequence by
+//   discarding the scrolled-off lines instead of appending them to scrollback (see its own
+//   InputHandler.scrollUp). Disabling it makes tmux fall back to plain linefeeds, which xterm
+//   does push to scrollback, at the cost of one linefeed per line instead of one escape per
+//   burst - acceptable since this is local, not over the wire.
+// terminal-overrides is set with -s (server-wide, no -t): safe here because this tmux server's
+// socket is exclusive to the dashboard (see with-writable-tmpdir.mjs), nothing else shares it.
 // Idempotent, so it also migrates sessions that were already alive before this change.
-export async function enableMouseMode(sessionName: string): Promise<void> {
-  await runTmux(["set-option", "-t", sessionName, "mouse", "on"]);
-}
-
-// tmux's default wheel binding scrolls 5 lines per tick, which feels like a jump
-// instead of a smooth scroll. Rebinding to 3 lines balances feel (less jumpy than 5)
-// against effort (1-2 lines per tick required too many ticks to cover any distance).
-// bind-key is a server-wide setting (this app runs on the default tmux
-// socket, not a dedicated one), so this affects every tmux session on the machine —
-// acceptable here since this dashboard is the only tmux user. Idempotent.
-async function reduceScrollStep(): Promise<void> {
-  // "\;" (not a bare ";") is required: tmux's own argv parser splits on a bare ";"
-  // into two separate top-level commands even without a shell involved, which would
-  // run send-keys immediately instead of chaining it into the bind-key action.
-  for (const keyTable of ["copy-mode", "copy-mode-vi"]) {
-    await runTmux(["bind-key", "-T", keyTable, "WheelUpPane", "select-pane", "\\;", "send-keys", "-X", "-N", "3", "scroll-up"]);
-    await runTmux(["bind-key", "-T", keyTable, "WheelDownPane", "select-pane", "\\;", "send-keys", "-X", "-N", "3", "scroll-down"]);
-  }
+export async function disableTmuxMouseAndAltScreen(sessionName: string): Promise<void> {
+  await runTmux(["set-option", "-t", sessionName, "mouse", "off"]);
+  await runTmux(["set-option", "-s", "terminal-overrides", "xterm-256color:smcup@:rmcup@:indn@"]);
 }
 
 export async function sendCommandToSession(sessionName: string, command: string): Promise<void> {
@@ -332,23 +327,4 @@ export async function killSession(sessionName: string): Promise<void> {
 // the terminal; this reads the pane's live directory instead of the one it started in.
 export async function getPaneCurrentPath(sessionName: string): Promise<string> {
   return runTmux(["display-message", "-p", "-t", sessionName, "#{pane_current_path}"]);
-}
-
-// Scrolling up (mouse wheel or touch) puts the pane into copy-mode; "scroll to bottom"
-// means leaving it. No need to check pane_in_mode first: send-keys -X on a pane that
-// isn't in a mode fails outright ("not in a mode", verified against a live tmux server)
-// rather than being misread as a literal keystroke by whatever the pane is running, so
-// the no-op case is just a rejected command, safe to swallow. "cancel" is bound the same
-// way in both the copy-mode and copy-mode-vi tables, so this doesn't depend on the host's
-// mode-keys setting. Skipping the pre-check also halves this action's latency (one tmux
-// process spawn instead of two sequential ones).
-export async function exitCopyMode(sessionName: string): Promise<void> {
-  try {
-    await runTmux(["send-keys", "-X", "-t", sessionName, "cancel"]);
-  } catch (error) {
-    if (error instanceof TmuxError && error.message.includes("not in a mode")) {
-      return;
-    }
-    throw error;
-  }
 }

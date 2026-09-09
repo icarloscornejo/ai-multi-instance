@@ -2,7 +2,6 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
-import { api } from "../api";
 import { useIsMobile } from "../hooks/useIsMobile";
 import { useWakeRetry } from "../hooks/useWakeRetry";
 import { getHostFontSize, setHostFontSize } from "../hostPrefs";
@@ -126,119 +125,34 @@ interface TerminalViewProps {
   suppressAutoFocus?: boolean;
 }
 
-// tmux's mouse mode puts xterm's own touch-scroll to sleep (it only runs when
-// no mouse tracking is active) and attach runs tmux in the alt screen anyway, so
-// xterm's normal scrollback is empty regardless. Instead we translate swipes into
-// synthetic wheel events on xterm's element: its existing wheel handler already
-// encodes them with whatever mouse protocol tmux requested, and tmux's WheelPane
-// binding (see reduceScrollStep in server/src/tmux.ts) enters copy-mode and scrolls
-// 3 lines per tick, so we accumulate drag distance in 3-line steps to track the finger.
-const SYNTHETIC_WHEEL_TICK_LINES = 3;
-
-// When the pane's mouse tracking is owned by an app rather than tmux (confirmed by the
-// absence of tmux's copy-mode indicator after a real wheel report landed, see
-// gestureModeRef), there is no server-side wheel rebind to lean on: a WheelEvent's deltaY
-// is discarded by xterm's own mouse encoder (it always emits exactly one mouse report per
-// event, see @xterm/xterm's Terminal.ts wheel handler) and the app decides its own scroll
-// step per report. Measured against Claude Code's own fullscreen TUI by feel: 1 was too
-// slow, 3 (tmux's own WheelPane convention, see SYNTHETIC_WHEEL_TICK_LINES above) too fast.
-// Tune this if a given app turns out to use a different step per wheel report.
+// tmux runs with mouse mode off (see disableTmuxMouseAndAltScreen in server/src/tmux.ts), so
+// terminal.modes.mouseTrackingMode reflects only whatever the app running INSIDE the pane
+// asked for (a TUI like Claude Code's own fullscreen mode) - tmux itself no longer claims it.
+// When an app does own the mouse, xterm's own built-in touch-scroll goes to sleep (it only
+// runs while no mouse tracking is active) and a WheelEvent's deltaY is discarded by xterm's
+// mouse encoder (it always emits exactly one mouse report per event, see @xterm/xterm's
+// Terminal.ts wheel handler), so we drive the app's scroll ourselves by dispatching synthetic
+// wheel events. Measured against Claude Code's own fullscreen TUI by feel: 1 line per report
+// was too slow, 3 too fast.
 const APP_OWNED_TICK_LINES = 2;
-// Floor between dispatch passes while draining an app-owned gesture; there is no ack to
-// pace against (see gestureModeRef), so this is a plain rate limit instead.
+// Floor between dispatch passes while draining an app-owned gesture; the app decides its own
+// scroll step per report and there is nothing to acknowledge back, so this is a plain rate
+// limit instead of pacing against a round trip.
 const APP_OWNED_REPORT_INTERVAL_MS = 16;
 // A single touchmove or momentum tick can accumulate several lines' worth of finger
 // movement; without a cap here a fast swipe would fall further and further behind since
 // each pass only advances the timer by one report. This still self-limits report rate
 // (multiplied by APP_OWNED_REPORT_INTERVAL_MS between passes) instead of firing unboundedly.
 const APP_OWNED_MAX_REPORTS_PER_DISPATCH = 4;
-// Separate from MOMENTUM_DECAY_PER_TICK on purpose. That constant is calibrated for
-// copy-mode's actual call cadence while dispatching real ticks, which rides the ack round
-// trip (see the ack-gate onRender handler) and in practice lands slower than the 20ms idle
-// re-arm, only converging to the 20ms cadence once the coast has already slowed into gaps
-// between ticks. App-owned has no ack to ride: every call while coasting is spaced at a
-// flat MOMENTUM_TICK_INTERVAL_MS (see dispatchAppOwnedTicks), so applying the same 0.95
-// from the very first decay step made the coast die out noticeably faster than the
-// copy-mode-riding-network-latency feel this app was tuned around. Higher value = slower
-// decay = longer coast; tune by feel.
+// Every call while coasting is spaced at a flat MOMENTUM_TICK_INTERVAL_MS (see
+// dispatchAppOwnedTicks), so this is calibrated per call, not per elapsed time. Higher value =
+// slower decay = longer coast; tune by feel.
 const APP_OWNED_MOMENTUM_DECAY_PER_TICK = 0.98;
 
-// Ticks are paced by ack instead of a fixed timer: the next tick is only dispatched once
-// the previous one's redraw has actually landed (see the ack machinery above the touch
-// listeners in TerminalView), so the client never queues up more redraws than the real
-// round trip can clear regardless of link latency (localhost, LAN, or the Cloudflare
-// tunnel all self-adjust). If an ack never arrives (e.g. the tick didn't change anything
-// because scrollback is already at an edge), this timeout unblocks the next tick instead
-// of stalling the gesture forever.
-const ACK_TIMEOUT_MS = 90;
 // Floor for momentum's own re-check cadence while coasting after the finger lifts (there
-// is no touchmove to drive it, so it must re-arm itself); NOT a wire-pacing interval.
+// is no touchmove to drive it, so it must re-arm itself).
 const MOMENTUM_TICK_INTERVAL_MS = 20;
-// Per-momentum-tick decay applied to the release velocity while coasting; ~50 ticks/sec
-// (1000 / MOMENTUM_TICK_INTERVAL_MS) at 0.95 decays to a stop in a bit over a second, so
-// the coast reads as a gradual ease-out instead of stopping short right after the finger
-// lifts.
-const MOMENTUM_DECAY_PER_TICK = 0.95;
 const MOMENTUM_MIN_VELOCITY_PX_PER_MS = 0.02;
-
-// A landed tick has already jumped the content by a full 3-line step; instead of showing
-// that step as a snap, we offset the container back by that same amount right as it lands
-// and animate the offset to 0, so the eye reads a slide instead of a jump. The duration is
-// a running average of the real interval between acks (see slideIntervalEmaMs below) so
-// each slide finishes roughly when the next step's data is expected, clamped so a single
-// slow or fast outlier reading can't produce a slide that's imperceptibly short or drags
-// on well past the next step.
-const SLIDE_MIN_DURATION_MS = 60;
-const SLIDE_MAX_DURATION_MS = ACK_TIMEOUT_MS + 40;
-const SLIDE_INTERVAL_EMA_ALPHA = 0.3;
-// 1-line fine ticks (see FINE_SCROLL_VELOCITY_PX_PER_MS below) cost the same full-pane
-// round trip as a 3-line tick, so covering the same distance takes 3x as many round trips.
-// Clamping their slide to the same ceiling as a 3-line tick means the animation finishes
-// before the real redraw lands whenever a round trip runs long, leaving a frozen frame
-// until the next one arrives, which reads as the swipe losing and regaining momentum. A
-// wider ceiling here lets the slide track the real round trip instead of stopping short.
-const FINE_SLIDE_MAX_DURATION_MS = ACK_TIMEOUT_MS + 160;
-
-// Below this velocity the coast is in its slow tail, where a 3-line jump is most visible
-// and message frequency is naturally low, so the traffic cost this app avoided by keeping
-// the server-side wheel bind at 3 lines (see reduceScrollStep in server/src/tmux.ts)
-// doesn't apply here. Only reachable during momentum (after the finger has lifted), never
-// during an active drag.
-const FINE_SCROLL_VELOCITY_PX_PER_MS = 0.15;
-// tmux's copy-mode-vi key table binds C-y/C-e to a 1-line scroll-up/scroll-down; that
-// table (reduceScrollStep only rebinds the 3-line WheelPane entries, these are untouched)
-// is only active while mode-keys is "vi", which this app never sets itself, it's whatever
-// the host's tmux config has. If mode-keys were ever "emacs" here, C-e resolves to
-// end-of-line in that table instead of scroll. Sending these blind is also unsafe in
-// another way: if the app currently owning the pane requests its own mouse tracking (e.g.
-// Claude Code's own fullscreen TUI), tmux forwards wheel ticks straight to that app instead
-// of entering copy-mode, so a redraw landing proves nothing about copy-mode being active,
-// only that the app repainted. C-y in that case reaches the app as a literal keystroke,
-// which in a readline-style input is "yank" (paste), not scroll. To stay safe, this is only
-// sent once this gesture has been classified "copy-mode" by actually observing tmux's own
-// copy-mode position indicator right after a real tick landed (see gestureModeRef and
-// readCopyModeIndicator below), never merely because some render happened.
-const FINE_SCROLL_UP_BYTES = "\u0019"; // C-y
-const FINE_SCROLL_DOWN_BYTES = "\u0005"; // C-e
-
-// Desktop's real mouse wheel never goes through the touch-scroll machinery above; it's
-// forwarded by xterm itself as an SGR mouse report through onData. Button code 64 is
-// wheel-up, the signal that a scroll-to-bottom button should appear.
-const WHEEL_UP_SGR_PATTERN = /\x1b\[<64;/;
-
-// tmux draws this position indicator ("[<line>/<total>]") at the far right of row 0
-// while a pane is in copy-mode (the status bar is off, see server/src/tmux.ts). Reading
-// it back is how the scroll-to-bottom button knows when to hide again, independent of
-// the gesture that triggered the scroll (wheel, touch, or the pane's own keybindings).
-const COPY_MODE_INDICATOR_PATTERN = /\[(\d+)\/\d+\]\s*$/;
-const COPY_MODE_INDICATOR_SCAN_THROTTLE_MS = 100;
-
-// macOS trackpads keep emitting decaying native wheel events for roughly a second after
-// the fingers lift; those trailing ticks arrive after the click already exited copy-mode
-// and drag the pane back into it. This window (renewed on every trailing tick, not one
-// fixed timer) keeps re-issuing the exit instead of showing the button again, until a real
-// gap appears that tells trailing momentum apart from a deliberate new scroll-up.
-const TRAILING_MOMENTUM_SUPPRESS_MS = 400;
 
 // xterm-addon-webgl keeps ONE glyph texture atlas per render config (font/size/theme/dpr)
 // shared across every terminal that matches it, not one atlas per terminal (see
@@ -429,38 +343,15 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  // Whether the "scroll to bottom" button is shown; see the two signals that drive it
-  // (wheel-up/swipe-up detection to show, tmux's copy-mode position indicator to hide)
-  // in the terminal-creation effect below.
+  // Whether the "scroll to bottom" button is shown; driven by the .xterm-viewport "scroll"
+  // listener in the terminal-creation effect below (xterm's own buffer sync suppresses its
+  // onScroll event for this, see that listener's own comment).
   const [showScrollToBottom, setShowScrollToBottom] = useState<boolean>(false);
-  // performance.now() timestamp until which a wheel-up SGR report is treated as trailing
-  // native trackpad momentum (re-issue the exit-copy-mode call) instead of a fresh scroll-up
-  // (show the button). Armed by handleScrollToBottomClick, renewed by each trailing tick.
-  const suppressWheelUpUntilRef = useRef<number>(0);
-  // True once the tmux copy-mode position indicator (COPY_MODE_INDICATOR_PATTERN) has
-  // actually been observed, i.e. tmux really entered copy-mode rather than forwarding the
-  // wheel straight through to an app with its own mouse tracking (e.g. Claude Code's own
-  // fullscreen TUI). Persists across gestures so the button and its exit action stay in
-  // sync with tmux's real state even between swipes; see gestureModeRef below for the
-  // per-gesture classification used while a touch is in flight.
-  const copyModeActiveRef = useRef<boolean>(false);
-  // Classifies the touch gesture currently in flight. "unconfirmed" until the first real
-  // redraw lands, at which point the copy-mode indicator scan (unthrottled while a gesture
-  // is active, see the onRender subscription below) resolves it to "copy-mode" or
-  // "app-owned". The two need very different handling: copy-mode gets tmux's own 3-line
-  // WheelPane rebind, ack pacing and slide compensation; app-owned (nothing forwarded the
-  // wheel into copy-mode, so some other app is consuming it directly) gets 1-line-per-report
-  // sends with no ack and no slide, since there's no way to know how much that app actually
-  // scrolled per report.
-  const gestureModeRef = useRef<"unconfirmed" | "copy-mode" | "app-owned">("unconfirmed");
   // Set inside the terminal-creation effect to that render's stopDraining, so
   // handleScrollToBottomClick (defined outside the effect) can reach it without depending on
   // effect internals across re-runs.
   const stopActiveGestureRef = useRef<() => void>(() => {});
   const touchScrollRef = useRef<{ lastClientY: number; accumulatedPx: number; released: boolean } | null>(null);
-  // Set by the WS message handler's terminal.write() callback once a write has actually
-  // been parsed; read by the touch-scroll ack gate in the terminal-creation effect below.
-  const writeCommittedForAckRef = useRef<boolean>(false);
 
   useImperativeHandle(
     forwardedRef,
@@ -549,8 +440,10 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       // Some TUIs send truecolor values (e.g. pure black) that bypass the theme palette;
       // this rewrites them on the fly so they are always readable on the background
       minimumContrastRatio: 4.5,
-      // With tmux mouse mode active, normal click-drag is captured by tmux;
-      // holding Option forces xterm's native selection for copying
+      // tmux itself no longer claims the mouse (see disableTmuxMouseAndAltScreen in
+      // server/src/tmux.ts), but an app running inside the pane still can (Claude Code's own
+      // fullscreen TUI, vim, ...) and normal click-drag is then captured by that app; holding
+      // Option forces xterm's native selection for copying regardless.
       macOptionClickForcesSelection: true,
       // Option+click by default "moves the cursor" by sending arrow keys to the pty;
       // Claude Code interprets up-arrows as history and fills the input with
@@ -600,34 +493,26 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     };
     attachWebglAddon();
 
-    // Reads tmux's copy-mode position indicator ("[<line>/<total>]", drawn at the far right
-    // of row 0 while a pane is actually in copy-mode) straight off the buffer. This is the
-    // only client-side signal that tells apart a real tmux copy-mode from an app (e.g.
-    // Claude Code's own fullscreen TUI) consuming the wheel itself: tmux runs the whole
-    // attach inside the alternate screen buffer regardless of what's running inside it (see
-    // SYNTHETIC_WHEEL_TICK_LINES above), so xterm's own buffer.active.type can't tell them
-    // apart. Returns the current line position, or null if the indicator isn't present.
-    const readCopyModeIndicator = (): number | null => {
-      const topLine = terminal.buffer.active.getLine(0);
-      const topLineText: string = topLine?.translateToString(true) ?? "";
-      const indicatorMatch: RegExpMatchArray | null = topLineText.match(COPY_MODE_INDICATOR_PATTERN);
-      return indicatorMatch !== null ? Number(indicatorMatch[1]) : null;
+    // terminal.open() (above) creates .xterm-viewport internally: the actual scrollable
+    // element xterm's own touch/wheel handling and local scrollback (buffer.active) live on
+    // (see @xterm/xterm's Viewport.ts).
+    const viewportElement = container.querySelector<HTMLDivElement>(".xterm-viewport");
+
+    // xterm syncs its own scrollTop from buffer state with suppressScrollEvent: true (see
+    // Viewport.ts's _handleScroll), so terminal.onScroll never fires for a plain user scroll.
+    // This DOM listener on the underlying element fires for every scroll regardless of source
+    // (touch, wheel, or xterm auto-following new output), which is what the button needs.
+    const handleViewportScroll = (): void => {
+      const activeTerminal = terminalRef.current;
+      if (activeTerminal === null) {
+        return;
+      }
+      const buffer = activeTerminal.buffer.active;
+      setShowScrollToBottom(buffer.viewportY < buffer.baseY);
     };
+    viewportElement?.addEventListener("scroll", handleViewportScroll, { passive: true });
 
     terminal.onData((typedData: string) => {
-      if (WHEEL_UP_SGR_PATTERN.test(typedData)) {
-        const now: number = performance.now();
-        if (now < suppressWheelUpUntilRef.current) {
-          // Trailing native trackpad momentum: forwarding this to tmux would re-enter
-          // copy-mode through its own WheelPane binding, undoing the exit the click just
-          // triggered, so it's dropped entirely instead of merely hiding the button.
-          suppressWheelUpUntilRef.current = now + TRAILING_MOMENTUM_SUPPRESS_MS;
-          return;
-        }
-        // No optimistic show here: the indicator scan below is the only reliable evidence
-        // that this wheel-up actually landed tmux in copy-mode rather than being forwarded
-        // to whatever app owns the pane's mouse tracking.
-      }
       const socket = socketRef.current;
       if (socket !== null && socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ type: "input", data: typedData }));
@@ -659,107 +544,36 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       return true;
     });
 
-    // xterm's built-in touch-scroll only runs when no mouse tracking is active, so with
-    // tmux's mouse mode on (see SYNTHETIC_WHEEL_TICK_LINES above) it never fires; we
-    // synthesize the wheel events ourselves from the raw swipe instead.
-    //
-    // Ticks are paced by ack rather than fired synchronously inside touchmove: each tick
-    // makes tmux redraw the whole pane over the WebSocket, and a fast swipe can accumulate
-    // many lines' worth in a single touchmove callback. Firing them all at once queues up
-    // more redraws than the round trip can clear, so the screen visibly falls behind and
-    // then catches up in a stutter, which is what reads as not smooth, more than the
-    // line-jump size itself. Keeping exactly one redraw in flight, waiting for this tick's
-    // ack before sending the next, self-adjusts to the real round trip instead of guessing
-    // a fixed interval, and lets the tail continue to coast after the finger lifts
-    // (momentum), instead of stopping dead.
-    //
-    // "Ack" means the render that resulted from this tick's data actually landing. Two
-    // gates, both required: (1) writeCommittedForAckRef flips true only once
-    // terminal.write() has parsed the bytes from a socket message following this tick
-    // (armed fresh per tick), and (2) the onRender range below has to cover more than just
-    // the cursor's row, since cursorBlink also fires onRender and would otherwise ack
-    // instantly for the wrong reason. A safety timeout unblocks the gesture if a tick
-    // doesn't change anything (e.g. scrollback is already at an edge) and so never
-    // triggers a real redraw.
+    // Touch scroll only needs custom handling when the pane's mouse tracking is owned by an
+    // app running inside it (see APP_OWNED_TICK_LINES above): xterm's own built-in touch-scroll
+    // goes to sleep while that's active, so we drive the app's scroll via synthetic wheel
+    // reports instead. Otherwise (the common case: tmux itself never claims the mouse, see
+    // disableTmuxMouseAndAltScreen in server/src/tmux.ts) xterm's own touchstart/touchmove
+    // listeners on its own element already move .xterm-viewport's scrollTop directly against
+    // the local scrollback - there is nothing for this component to do.
     let dragVelocityPxPerMs = 0;
     let lastMoveTimestamp = 0;
     let lastMomentumTimestamp = 0;
-    let awaitingAck = false;
-    let ackTimeoutId: number | null = null;
     let momentumTimeoutId: number | null = null;
-    // Two ack timeouts in a row during coast mean the scrollback is pinned at an edge
-    // (tmux has nothing left to redraw), not that a tick was merely slow; without this the
-    // coast keeps retrying every ACK_TIMEOUT_MS until velocity decays to zero, which at the
-    // ~90ms-per-attempt pace near an edge takes several seconds of an invisible "stuck" loop.
-    let consecutiveAckTimeouts = 0;
-    // Signed px of the tick currently in flight (direction * tickPx), consumed once its
-    // ack lands to know which way and how far to slide the visual compensation from.
-    let pendingSlideOffsetPx = 0;
-    let pendingSlideWasFine = false;
-    let lastAckLandTimestamp = 0;
-    let slideIntervalEmaMs = SLIDE_MIN_DURATION_MS;
 
-    const clearTimers = (): void => {
-      if (ackTimeoutId !== null) {
-        window.clearTimeout(ackTimeoutId);
-        ackTimeoutId = null;
-      }
+    const stopDraining = (): void => {
       if (momentumTimeoutId !== null) {
         window.clearTimeout(momentumTimeoutId);
         momentumTimeoutId = null;
       }
-    };
-
-    const resetSlideTransform = (): void => {
-      container.style.transition = "none";
-      container.style.transform = "";
-      lastAckLandTimestamp = 0;
-      slideIntervalEmaMs = SLIDE_MIN_DURATION_MS;
-    };
-
-    const playSlideCompensation = (): void => {
-      const now: number = performance.now();
-      if (lastAckLandTimestamp !== 0) {
-        const observedIntervalMs: number = now - lastAckLandTimestamp;
-        slideIntervalEmaMs =
-          slideIntervalEmaMs * (1 - SLIDE_INTERVAL_EMA_ALPHA) + observedIntervalMs * SLIDE_INTERVAL_EMA_ALPHA;
-      }
-      lastAckLandTimestamp = now;
-
-      if (pendingSlideOffsetPx === 0) {
-        return;
-      }
-      const maxDurationMs: number = pendingSlideWasFine ? FINE_SLIDE_MAX_DURATION_MS : SLIDE_MAX_DURATION_MS;
-      const durationMs: number = Math.min(maxDurationMs, Math.max(SLIDE_MIN_DURATION_MS, slideIntervalEmaMs));
-      container.style.transition = "none";
-      container.style.transform = `translateY(${pendingSlideOffsetPx}px)`;
-      // Force a layout flush so the jump above is committed before the transition below
-      // is applied; otherwise the browser may coalesce both style writes into one frame
-      // and skip straight to the animated end state.
-      void container.offsetHeight;
-      container.style.transition = `transform ${durationMs}ms linear`;
-      container.style.transform = "translateY(0px)";
-      pendingSlideOffsetPx = 0;
-    };
-
-    const stopDraining = (): void => {
-      clearTimers();
-      awaitingAck = false;
       touchScrollRef.current = null;
-      resetSlideTransform();
     };
     // Exposes stopDraining to handleScrollToBottomClick (defined outside this effect), so a
-    // click can immediately kill any in-flight touch-momentum coast instead of letting it
-    // keep firing scroll-up ticks after the button already exited copy-mode.
+    // click can immediately kill any in-flight app-owned momentum coast.
     stopActiveGestureRef.current = stopDraining;
 
-    // Shared by both dispatch paths below: advances the coast's velocity/accumulated
-    // distance for one momentum step. Returns false when the coast has decayed below the
-    // stop threshold (caller should stopDraining()); a no-op (returns true) while the finger
-    // is still down, since an active drag is driven by handleTouchMove's own accumulation.
+    // Advances the coast's velocity/accumulated distance for one momentum step while the
+    // finger is up. Returns false once the coast has decayed below the stop threshold (caller
+    // should stopDraining()); a no-op (returns true) while the finger is still down, since an
+    // active drag is driven by handleTouchMove's own accumulation instead.
     const advanceMomentumIfReleased = (
       touchState: { accumulatedPx: number; released: boolean },
-      decayPerTick: number = MOMENTUM_DECAY_PER_TICK
+      decayPerTick: number
     ): boolean => {
       if (!touchState.released) {
         return true;
@@ -775,19 +589,10 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       return true;
     };
 
-    // Gesture classified "app-owned" (see gestureModeRef): the pane's mouse tracking is
-    // owned by whatever app is running, not tmux, so there's no ack to pace against and no
-    // known per-report scroll amount to slide-compensate for (see APP_OWNED_TICK_LINES
-    // above). Sends plain wheel reports at a flat rate instead, draining as much of the
-    // accumulated finger distance as it can each pass.
-    //
-    // Tried and reverted: animating the container by the assumed offset right after sending
-    // (mirroring playSlideCompensation). That assumed the redraw was local/instant; it isn't,
-    // the WheelEvent still round-trips over the socket to the server and back same as any
-    // other input, just without an ack to time against. The fake animation played and
-    // settled back to 0 well before the real redraw arrived, which read as the content
-    // sliding back and re-stabilizing, then jump-cutting separately once the real data
-    // landed, worse than the plain jump-cut this was meant to fix.
+    // The pane's mouse tracking is owned by whatever app is running (not tmux, see
+    // APP_OWNED_TICK_LINES above), so there's no ack to pace against and no known per-report
+    // scroll amount to visually compensate for. Sends plain wheel reports at a flat rate
+    // instead, draining as much of the accumulated finger distance as it can each pass.
     const dispatchAppOwnedTicks = (
       activeTerminal: Terminal,
       touchState: { lastClientY: number; accumulatedPx: number; released: boolean }
@@ -822,8 +627,8 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       const hasLeftoverDistance: boolean = Math.abs(touchState.accumulatedPx) >= tickPx;
       if (touchState.released || hasLeftoverDistance) {
         // While coasting, re-arm at MOMENTUM_TICK_INTERVAL_MS, not APP_OWNED_REPORT_INTERVAL_MS:
-        // MOMENTUM_DECAY_PER_TICK is calibrated per call, not per elapsed time (see its
-        // definition), assuming the ~50 calls/sec that constant produces. Re-arming faster
+        // APP_OWNED_MOMENTUM_DECAY_PER_TICK is calibrated per call, not per elapsed time (see
+        // its definition), assuming the ~50 calls/sec that constant produces. Re-arming faster
         // here would call advanceMomentumIfReleased more often per real second, decaying
         // velocity away quicker than intended and cutting the coast short. Only the leftover-
         // distance case (active drag outrunning the burst cap) needs the tighter interval, to
@@ -833,161 +638,11 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       }
     };
 
-    const attemptDispatch = (): void => {
-      const activeTerminal = terminalRef.current;
-      const touchState = touchScrollRef.current;
-      if (activeTerminal === null || touchState === null) {
-        stopDraining();
-        return;
-      }
-
-      if (gestureModeRef.current === "app-owned") {
-        dispatchAppOwnedTicks(activeTerminal, touchState);
-        return;
-      }
-
-      if (awaitingAck) {
-        return;
-      }
-
-      if (touchState.released && !advanceMomentumIfReleased(touchState)) {
-        stopDraining();
-        return;
-      }
-
-      const lineHeightPx: number = container.clientHeight / Math.max(1, activeTerminal.rows);
-      // Once this gesture has actually been classified "copy-mode" (see gestureModeRef) and
-      // the coast has slowed into its tail, switch to 1-line raw key sends instead of 3-line
-      // synthetic wheel ticks (see FINE_SCROLL_VELOCITY_PX_PER_MS above).
-      const useFineScroll: boolean =
-        touchState.released &&
-        gestureModeRef.current === "copy-mode" &&
-        copyModeActiveRef.current &&
-        Math.abs(dragVelocityPxPerMs) < FINE_SCROLL_VELOCITY_PX_PER_MS;
-      const tickLines: number = useFineScroll ? 1 : SYNTHETIC_WHEEL_TICK_LINES;
-      const tickPx: number = tickLines * lineHeightPx;
-      if (Math.abs(touchState.accumulatedPx) < tickPx) {
-        // Nothing to send yet. While coasting there is no touchmove to drive the next
-        // attempt, so re-arm ourselves; an active finger drag calls back in via
-        // handleTouchMove instead.
-        if (touchState.released) {
-          momentumTimeoutId = window.setTimeout(attemptDispatch, MOMENTUM_TICK_INTERVAL_MS);
-        }
-        return;
-      }
-
-      const direction: number = Math.sign(touchState.accumulatedPx);
-      touchState.accumulatedPx -= direction * tickPx;
-      pendingSlideOffsetPx = direction * tickPx;
-      pendingSlideWasFine = useFineScroll;
-      writeCommittedForAckRef.current = false;
-      if (useFineScroll) {
-        const socket = socketRef.current;
-        if (socket !== null && socket.readyState === WebSocket.OPEN) {
-          socket.send(
-            JSON.stringify({ type: "input", data: direction > 0 ? FINE_SCROLL_DOWN_BYTES : FINE_SCROLL_UP_BYTES })
-          );
-        }
-      } else {
-        activeTerminal.element?.dispatchEvent(
-          new WheelEvent("wheel", {
-            deltaY: direction * tickPx,
-            deltaMode: WheelEvent.DOM_DELTA_PIXEL,
-            bubbles: true,
-            cancelable: true,
-          })
-        );
-      }
-      awaitingAck = true;
-      ackTimeoutId = window.setTimeout(() => {
-        ackTimeoutId = null;
-        awaitingAck = false;
-        // No real redraw landed for this tick (e.g. scrollback was already at an edge),
-        // so there is nothing to visually compensate for; drop it rather than letting the
-        // next real ack apply a jump-and-slide offset for a step that never happened.
-        pendingSlideOffsetPx = 0;
-        const touchState = touchScrollRef.current;
-        if (touchState !== null && touchState.released) {
-          consecutiveAckTimeouts += 1;
-          // A single missed ack can just be a slow tick; two in a row while coasting
-          // means the scrollback is pinned at an edge and further ticks are pointless.
-          if (consecutiveAckTimeouts >= 2) {
-            stopDraining();
-            return;
-          }
-        }
-        attemptDispatch();
-      }, ACK_TIMEOUT_MS);
-    };
-
-    terminal.onRender(({ start, end }: { start: number; end: number }) => {
-      if (!awaitingAck || !writeCommittedForAckRef.current) {
-        return;
-      }
-      const cursorRow: number = terminal.buffer.active.cursorY;
-      const isCursorBlinkOnly: boolean = start === end && start === cursorRow;
-      if (isCursorBlinkOnly) {
-        return;
-      }
-      if (ackTimeoutId !== null) {
-        window.clearTimeout(ackTimeoutId);
-        ackTimeoutId = null;
-      }
-      awaitingAck = false;
-      consecutiveAckTimeouts = 0;
-      // Classify the gesture off the freshest possible read, right as the tick's own redraw
-      // lands, rather than waiting for the (possibly throttled) scan below: this is the one
-      // redraw we know for certain resulted from our own wheel report, so its indicator
-      // state is authoritative for what this gesture is. Sticky for the rest of the gesture
-      // (checked in attemptDispatch above), never re-evaluated once set.
-      if (gestureModeRef.current === "unconfirmed") {
-        gestureModeRef.current = readCopyModeIndicator() !== null ? "copy-mode" : "app-owned";
-      }
-      playSlideCompensation();
-      attemptDispatch();
-    });
-
-    // Separate subscription from the ack-gate onRender above (deliberately not merged
-    // into it: that one drives the delicate touch-scroll pacing state machine, this one
-    // only reads the screen). Throttled because onRender fires on every redraw, including
-    // ones unrelated to scrolling (e.g. Claude's output streaming in), except while a touch
-    // gesture is in flight: then the button and copyModeActiveRef must track tmux's real
-    // state without lag, since the gesture's own dispatch pacing depends on it being current.
-    let lastIndicatorScanTimestamp = 0;
-    let indicatorEverSeen = false;
-    terminal.onRender(() => {
-      const now: number = performance.now();
-      const gestureActive: boolean = touchScrollRef.current !== null;
-      if (!gestureActive && now - lastIndicatorScanTimestamp < COPY_MODE_INDICATOR_SCAN_THROTTLE_MS) {
-        return;
-      }
-      lastIndicatorScanTimestamp = now;
-      const indicatorValue: number | null = readCopyModeIndicator();
-      if (indicatorValue !== null) {
-        indicatorEverSeen = true;
-        copyModeActiveRef.current = true;
-        setShowScrollToBottom(indicatorValue > 0);
-      } else if (indicatorEverSeen) {
-        // No indicator this render means the pane just left copy-mode (exited, hit the
-        // bottom, or new output arrived); only trust this once the indicator has actually
-        // been observed at least once, otherwise a host tmux that doesn't draw it at all
-        // would hide the button on every render and it could never show.
-        copyModeActiveRef.current = false;
-        setShowScrollToBottom(false);
-      }
-    });
-
     const handleTouchStart = (event: TouchEvent): void => {
       if (event.touches.length !== 1) {
         stopDraining();
         return;
       }
-      clearTimers();
-      awaitingAck = false;
-      consecutiveAckTimeouts = 0;
-      pendingSlideOffsetPx = 0;
-      gestureModeRef.current = "unconfirmed";
-      resetSlideTransform();
       touchScrollRef.current = { lastClientY: event.touches[0].clientY, accumulatedPx: 0, released: false };
       dragVelocityPxPerMs = 0;
       lastMoveTimestamp = event.timeStamp;
@@ -997,43 +652,47 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     const handleTouchMove = (event: TouchEvent): void => {
       const activeTerminal = terminalRef.current;
       const touchState = touchScrollRef.current;
-      if (
-        activeTerminal === null ||
-        touchState === null ||
-        activeTerminal.modes.mouseTrackingMode === "none" ||
-        event.touches.length !== 1
-      ) {
+      if (activeTerminal === null || touchState === null || event.touches.length !== 1) {
         return;
       }
-      // Without this the browser treats the gesture as unhandled and falls back to
-      // native pull-to-refresh/rubber-banding once it reaches the top.
-      event.preventDefault();
       const currentClientY: number = event.touches[0].clientY;
       const movedPx: number = touchState.lastClientY - currentClientY;
       const elapsedMs: number = Math.max(1, event.timeStamp - lastMoveTimestamp);
       dragVelocityPxPerMs = movedPx / elapsedMs;
       lastMoveTimestamp = event.timeStamp;
       touchState.lastClientY = currentClientY;
+      if (activeTerminal.modes.mouseTrackingMode === "none") {
+        // No app inside the pane wants the mouse: let xterm's own native touch-scroll
+        // (already registered on its own element) handle the drag against its local
+        // scrollback directly. Nothing further to do here.
+        return;
+      }
+      // Without this the browser treats the gesture as unhandled and falls back to native
+      // pull-to-refresh/rubber-banding once it reaches an edge.
+      event.preventDefault();
       touchState.accumulatedPx += movedPx;
-
-      attemptDispatch();
+      dispatchAppOwnedTicks(activeTerminal, touchState);
     };
 
     const handleTouchRelease = (event: TouchEvent): void => {
       if (event.touches.length > 0) {
         return;
       }
+      const activeTerminal = terminalRef.current;
       const touchState = touchScrollRef.current;
-      if (touchState === null) {
+      if (activeTerminal === null || touchState === null) {
         return;
       }
       touchState.released = true;
-      if (Math.abs(dragVelocityPxPerMs) < MOMENTUM_MIN_VELOCITY_PX_PER_MS) {
+      if (
+        activeTerminal.modes.mouseTrackingMode === "none" ||
+        Math.abs(dragVelocityPxPerMs) < MOMENTUM_MIN_VELOCITY_PX_PER_MS
+      ) {
         stopDraining();
         return;
       }
       lastMomentumTimestamp = performance.now();
-      attemptDispatch();
+      dispatchAppOwnedTicks(activeTerminal, touchState);
     };
 
     container.addEventListener("touchstart", handleTouchStart, { passive: true });
@@ -1057,6 +716,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
 
     return () => {
       resizeObserver.disconnect();
+      viewportElement?.removeEventListener("scroll", handleViewportScroll);
       container.removeEventListener("touchstart", handleTouchStart);
       container.removeEventListener("touchmove", handleTouchMove);
       container.removeEventListener("touchend", handleTouchRelease);
@@ -1217,9 +877,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
         const text = event.data
           .replace(/\u23F5/g, "\u25B6")
           .replace(/\u23FA/g, "\u25CF");
-        terminalRef.current?.write(text, () => {
-          writeCommittedForAckRef.current = true;
-        });
+        terminalRef.current?.write(text);
       }
       // A binary frame is the server's heartbeat pong (see terminal.ts): it carries no
       // terminal output, updating lastActivityAtRef (and bridgeReadySignaled) above is its
@@ -1363,20 +1021,13 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   };
 
   const handleScrollToBottomClick = useCallback((): void => {
-    // Hide optimistically; the indicator scan above will resurface it on the next
-    // render if this didn't actually land us at the bottom.
-    setShowScrollToBottom(false);
-    // Kill any in-flight touch-momentum coast immediately, so a mobile swipe-then-tap can't
-    // keep dispatching scroll-up ticks after this call already exited copy-mode.
+    // Kill any in-flight app-owned momentum coast immediately, so a mobile swipe-then-tap
+    // can't keep dispatching wheel ticks into the pane after this click.
     stopActiveGestureRef.current();
-    // Arms the suppression window for trailing native trackpad momentum (see onData above):
-    // any wheel-up SGR report that arrives before this expires re-issues the exit instead of
-    // showing the button again.
-    suppressWheelUpUntilRef.current = performance.now() + TRAILING_MOMENTUM_SUPPRESS_MS;
-    api.scrollTerminalToBottom(instance.id).catch((error: Error) => {
-      console.error("Could not scroll the terminal to the bottom:", error.message);
-    });
-  }, [instance.id]);
+    // Scrolls xterm's own local buffer; the .xterm-viewport "scroll" listener above hides
+    // the button once viewportY catches up to baseY, no need to set state here.
+    terminalRef.current?.scrollToBottom();
+  }, []);
 
   return (
     <div className={`flex-1 min-h-0 flex-col ${visible ? "flex" : "hidden"}`}>
@@ -1387,7 +1038,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
         <div
           ref={containerRef}
           className="flex h-full w-full justify-center"
-          style={{ touchAction: "none", willChange: "transform" }}
+          style={{ touchAction: "none" }}
         />
         {disconnected && <DisconnectedOverlay onReconnect={reconnect} fatalReason={fatalDisconnectReason} />}
         {/* Both notices share one top-center stack (rather than each being independently

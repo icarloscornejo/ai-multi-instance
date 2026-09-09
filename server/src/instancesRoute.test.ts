@@ -33,7 +33,6 @@ vi.mock("./terminal", () => ({
   initializeInstanceSession: vi.fn(),
 }));
 vi.mock("./tmux", () => ({
-  exitCopyMode: vi.fn(),
   getPaneCurrentPath: vi.fn(),
   getSessionPresence: vi.fn(),
   killSession: vi.fn(),

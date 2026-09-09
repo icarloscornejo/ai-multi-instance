@@ -7,7 +7,7 @@ import { AUTH_COOKIE_NAME, checkPassword, isAuthEnabled, issueToken, readCookie,
 import { isAgentProvider, PROVIDERS, sessionKeyFor } from "./providers";
 import { pathExists } from "./paths";
 import { loadState, saveState, updateState } from "./store";
-import { exitCopyMode, getPaneCurrentPath, getSessionPresence, killSession } from "./tmux";
+import { getPaneCurrentPath, getSessionPresence, killSession } from "./tmux";
 import { isRemoteUnreachableError, NETWORK_GIT_TIMEOUT_MS, runGit } from "./git";
 import { LaunchProgress } from "./launchProgress";
 import { initializeInstanceSession } from "./terminal";
@@ -1005,21 +1005,6 @@ apiRouter.get(
     const branch: string | null = await currentBranch(cwd);
 
     response.json(branch === null ? { cwd } : { cwd, branch });
-  })
-);
-
-apiRouter.post(
-  "/instances/:id/scroll-to-bottom",
-  wrapAsync(async (request, response) => {
-    const state: DashboardState = await loadState();
-    const instance = state.instances.find((candidate) => candidate.id === request.params.id);
-    if (instance === undefined) {
-      response.status(404).json({ error: "Instance not found." });
-      return;
-    }
-
-    await exitCopyMode(instance.tmuxSession);
-    response.json({ ok: true });
   })
 );
 

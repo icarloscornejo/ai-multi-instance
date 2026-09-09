@@ -22,7 +22,7 @@ import { loadState } from "./store";
 import {
   TmuxError,
   createSession,
-  enableMouseMode,
+  disableTmuxMouseAndAltScreen,
   getSessionPresence,
   isDuplicateSessionError,
   isSessionInitIncomplete,
@@ -462,8 +462,8 @@ export async function ensureSessionReady(instance: InstanceRecord): Promise<void
       // session, unreadable marker) OR "confirmed-launching" (a provider launch that may
       // already be running an agent): preserve as-is. Only a "created" marker - set by this
       // version, before any launch - authorizes recreation. Migrate sessions that were alive
-      // before mouse mode existed; set-option is idempotent, no cost in repeating it.
-      await enableMouseMode(instance.tmuxSession);
+      // before native scroll existed; set-option is idempotent, no cost in repeating it.
+      await disableTmuxMouseAndAltScreen(instance.tmuxSession);
       return;
     }
 
