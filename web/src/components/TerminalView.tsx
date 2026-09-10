@@ -15,8 +15,9 @@ export interface TerminalViewHandle {
   sendInput: (data: string) => void;
 }
 
-const MIN_FONT_SIZE = 10;
-const MAX_FONT_SIZE = 18;
+// Mostly 1px steps; 14.9 is inserted between 14 and 15 because that jump felt too big.
+const FONT_SIZES = [10, 11, 12, 13, 14, 14.9, 15, 16, 17, 18] as const;
+const MIN_FONT_SIZE = FONT_SIZES[0];
 // Caps recreation attempts after a WebGL context loss so a genuinely dead GPU/driver falls
 // back to the DOM renderer instead of retrying forever.
 const MAX_WEBGL_CONTEXT_LOSS_RETRIES = 3;
@@ -401,13 +402,20 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   // FONT_SIZE_CHANGE_EVENT (see the listener below), so this must not apply anything
   // itself, just compute the next value and broadcast it. That keeps every mounted
   // instance, including this one, on the exact same single code path.
-  const applyZoom = useCallback((delta: number): void => {
+  // Steps through FONT_SIZES by index rather than adding a fixed delta, since the steps
+  // aren't uniform (see FONT_SIZES's declaration).
+  const applyZoom = useCallback((direction: 1 | -1): void => {
     const terminal = terminalRef.current;
     if (terminal === null) {
       return;
     }
     const previousSize: number = terminal.options.fontSize ?? MIN_FONT_SIZE;
-    const nextSize: number = Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, previousSize + delta));
+    const currentIndex: number = FONT_SIZES.indexOf(previousSize as (typeof FONT_SIZES)[number]);
+    const nextIndex: number = Math.min(
+      FONT_SIZES.length - 1,
+      Math.max(0, (currentIndex === -1 ? 0 : currentIndex) + direction)
+    );
+    const nextSize: number = FONT_SIZES[nextIndex];
     if (nextSize !== previousSize) {
       setHostFontSize(nextSize);
     }
