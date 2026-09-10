@@ -1,27 +1,24 @@
-// Per-host UI preferences (this browser only, never synced through the server): each
+// Per-host UI preference (this browser only, never synced through the server): each
 // device that opens the dashboard (desktop, phone via ai.local/LAN/tunnel) keeps its own
-// terminal zoom, independent from every other device. Theme already works this way via
-// theme.ts's own localStorage key; this mirrors that pattern for font size.
-const FONT_SIZE_STORAGE_KEY = "ccdash.fontSizeByInstance";
+// terminal zoom, shared by every instance/chat open on that device. Theme already works
+// this way via theme.ts's own localStorage key; this mirrors that pattern for font size.
+// FONT_SIZE_CHANGE_EVENT is what keeps every already-mounted TerminalView on the same
+// page in sync when one of them changes the zoom.
+const FONT_SIZE_STORAGE_KEY = "ccdash.fontSize";
+export const FONT_SIZE_CHANGE_EVENT = "ccdash:fontsize";
 
-function readFontSizeMap(): Record<string, number> {
-  try {
-    const parsed: unknown = JSON.parse(localStorage.getItem(FONT_SIZE_STORAGE_KEY) ?? "{}");
-    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, number>) : {};
-  } catch {
-    return {};
-  }
+export function getHostFontSize(fallback: number): number {
+  const stored: string | null = localStorage.getItem(FONT_SIZE_STORAGE_KEY);
+  const parsed: number = stored !== null ? Number(stored) : NaN;
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-export function getHostFontSize(instanceId: string, fallback: number): number {
-  const storedSize: number | undefined = readFontSizeMap()[instanceId];
-  return typeof storedSize === "number" ? storedSize : fallback;
-}
-
-export function setHostFontSize(instanceId: string, fontSize: number): void {
-  const map: Record<string, number> = readFontSizeMap();
-  map[instanceId] = fontSize;
-  localStorage.setItem(FONT_SIZE_STORAGE_KEY, JSON.stringify(map));
+export function setHostFontSize(fontSize: number): void {
+  // Dispatch before persisting: every TerminalView applies the zoom only in reaction to
+  // this event (see TerminalView.tsx), so a localStorage write failure (quota, private
+  // mode) must not also block the zoom from applying.
+  window.dispatchEvent(new CustomEvent<number>(FONT_SIZE_CHANGE_EVENT, { detail: fontSize }));
+  localStorage.setItem(FONT_SIZE_STORAGE_KEY, String(fontSize));
 }
 
 // Desktop rail width (InstanceRail), same per-host-only pattern as font size above: instance

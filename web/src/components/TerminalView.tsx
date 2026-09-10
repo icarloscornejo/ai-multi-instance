@@ -4,7 +4,7 @@ import { Terminal, type ITheme } from "@xterm/xterm";
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { useIsMobile } from "../hooks/useIsMobile";
 import { useWakeRetry } from "../hooks/useWakeRetry";
-import { getHostFontSize, setHostFontSize } from "../hostPrefs";
+import { FONT_SIZE_CHANGE_EVENT, getHostFontSize, setHostFontSize } from "../hostPrefs";
 import { INITIAL_RECONNECT_STATE, reduceConnection, type ReconnectState } from "../reconnectPolicy";
 import { btnGhost } from "../ui";
 import { RetryRing } from "./RetryRing";
@@ -252,7 +252,6 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   const fitAddonRef = useRef<FitAddon | null>(null);
   const webglAddonRef = useRef<WebglAddon | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
-  const persistTimerRef = useRef<number | null>(null);
   // Lives outside the connection effect (which reruns on every connectionEpoch bump) so the
   // backoff keeps counting across reconnect attempts instead of resetting each time. This is
   // the ONLY place normalAttempt/attachStreak/fatalReason/transientNotice are written; every
@@ -286,9 +285,10 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   const isMobile = useIsMobile();
   // Mobile screens are small enough that the server's default (tuned for desktop) reads
   // cramped-in-a-good-way but wastes space here; default to the smallest zoom on mobile
-  // until the user picks their own (still persisted separately per-device via hostPrefs).
+  // until the user picks their own (persisted per-device via hostPrefs, shared by every
+  // instance open on that device).
   const [fontSize, setFontSize] = useState<number>(() =>
-    getHostFontSize(instance.id, isMobile ? MIN_FONT_SIZE : instance.fontSize)
+    getHostFontSize(isMobile ? MIN_FONT_SIZE : instance.fontSize)
   );
   const [disconnected, setDisconnected] = useState<boolean>(false);
   // Non-null only for close codes the server sends when retrying can never succeed on its
@@ -396,25 +396,22 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     fitAddon.fit();
   }, []);
 
-  const applyZoom = useCallback(
-    (delta: number): void => {
-      setFontSize((previousSize) => {
-        const nextSize: number = Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, previousSize + delta));
-        if (nextSize !== previousSize && terminalRef.current !== null) {
-          terminalRef.current.options.fontSize = nextSize;
-          requestAnimationFrame(() => safeFit());
-          if (persistTimerRef.current !== null) {
-            window.clearTimeout(persistTimerRef.current);
-          }
-          persistTimerRef.current = window.setTimeout(() => {
-            setHostFontSize(instance.id, nextSize);
-          }, 600);
-        }
-        return nextSize;
-      });
-    },
-    [instance.id, safeFit]
-  );
+  // Reads the live value straight off the terminal instead of the previousSize captured by
+  // a setFontSize updater: applying the zoom now happens only in reaction to
+  // FONT_SIZE_CHANGE_EVENT (see the listener below), so this must not apply anything
+  // itself, just compute the next value and broadcast it. That keeps every mounted
+  // instance, including this one, on the exact same single code path.
+  const applyZoom = useCallback((delta: number): void => {
+    const terminal = terminalRef.current;
+    if (terminal === null) {
+      return;
+    }
+    const previousSize: number = terminal.options.fontSize ?? MIN_FONT_SIZE;
+    const nextSize: number = Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, previousSize + delta));
+    if (nextSize !== previousSize) {
+      setHostFontSize(nextSize);
+    }
+  }, []);
 
   // Create the xterm terminal, once per instance, deferred until fontReady (see its
   // declaration above): creating it earlier would measure cell size with the fallback font.
@@ -758,9 +755,6 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       container.removeEventListener("touchend", handleTouchRelease);
       container.removeEventListener("touchcancel", handleTouchRelease);
       stopDraining();
-      if (persistTimerRef.current !== null) {
-        window.clearTimeout(persistTimerRef.current);
-      }
       socketRef.current?.close();
       liveTerminals.delete(terminal);
       if (webglAddonRef.current !== null) {
@@ -791,11 +785,10 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   // This must run exactly once for the whole page, not once per instance: the atlas is a
   // single object shared by every terminal with the same render config (see liveWebglAddons
   // above), so clearing it from one instance's effect already invalidates every other live
-  // terminal's glyph model. Wiping every live atlas (there can be more than one if instances
-  // differ in font size, see hostPrefs) and then force-refreshing every live terminal keeps
-  // all of them in sync with the clear instead of just the one that triggered it. A terminal
-  // that mounts after this has already run has nothing to fix: fonts finished loading before
-  // its own atlas was ever populated.
+  // terminal's glyph model. Wiping every live atlas and then force-refreshing every live
+  // terminal keeps all of them in sync with the clear instead of just the one that
+  // triggered it. A terminal that mounts after this has already run has nothing to fix:
+  // fonts finished loading before its own atlas was ever populated.
   useEffect(() => {
     let cancelled = false;
     document.fonts.ready.then(() => {
@@ -1002,6 +995,24 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       terminalRef.current.options.theme = terminalThemesByMode[theme];
     }
   }, [theme]);
+
+  // Applying the zoom (see applyZoom above) only ever broadcasts FONT_SIZE_CHANGE_EVENT;
+  // every mounted instance, including the one that triggered it, picks up the new size
+  // here. safeFit already no-ops on a hidden container (clientWidth === 0), and the
+  // visibility effect below re-fits when an instance becomes visible again, so applying
+  // this while hidden is safe.
+  useEffect(() => {
+    const handleFontSizeChange = (event: Event): void => {
+      const nextSize = (event as CustomEvent<number>).detail;
+      setFontSize(nextSize);
+      if (terminalRef.current !== null) {
+        terminalRef.current.options.fontSize = nextSize;
+        requestAnimationFrame(() => safeFit());
+      }
+    };
+    window.addEventListener(FONT_SIZE_CHANGE_EVENT, handleFontSizeChange);
+    return () => window.removeEventListener(FONT_SIZE_CHANGE_EVENT, handleFontSizeChange);
+  }, [safeFit]);
 
   useEffect(() => {
     if (visible && !hasBeenVisible) {
