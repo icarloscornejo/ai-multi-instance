@@ -138,22 +138,25 @@ interface TerminalViewProps {
 // So this constant is "how many lines of finger travel it takes to fire one report", and 1 is the
 // only value that keeps finger travel and Claude Code's scroll in a true 1:1 ratio.
 const APP_OWNED_TICK_LINES = 1;
-// Floor between dispatch passes while draining an app-owned gesture; the app decides its own
-// scroll step per report and there is nothing to acknowledge back, so this is a plain rate
-// limit instead of pacing against a round trip.
-const APP_OWNED_REPORT_INTERVAL_MS = 16;
-// A single touchmove or momentum tick can accumulate several lines' worth of finger
-// movement; without a cap here a fast swipe would fall further and further behind since
-// each pass only advances the timer by one report. This still self-limits report rate
-// (multiplied by APP_OWNED_REPORT_INTERVAL_MS between passes) instead of firing unboundedly.
-const APP_OWNED_MAX_REPORTS_PER_DISPATCH = 4;
+// Floor between consecutive app-owned reports, measured directly against a live Claude Code
+// session: sending raw SGR wheel reports via tmux send-keys and diffing tmux capture-pane
+// before/after showed Claude Code's own render loop applies roughly 2x scroll acceleration
+// once consecutive reports arrive less than ~25-30ms apart (clean, unaccelerated 1:1 held at
+// every spacing tested from 30ms up; a zero-delay burst nearly doubled the scrolled distance).
+// This is enforced against the timestamp of the last report actually SENT (lastAppOwnedReportAt
+// below), not just as a delay between dispatch passes - a touchmove/touchend can call the
+// dispatcher directly at any time, so the throttle has to live at the send site itself.
+const APP_OWNED_REPORT_INTERVAL_MS = 34;
 // Every call while coasting is spaced at a flat MOMENTUM_TICK_INTERVAL_MS (see
 // dispatchAppOwnedTicks), so this is calibrated per call, not per elapsed time. Higher value =
 // slower decay = longer coast; tune by feel.
 const APP_OWNED_MOMENTUM_DECAY_PER_TICK = 0.98;
 
-// Floor for momentum's own re-check cadence while coasting after the finger lifts (there
-// is no touchmove to drive it, so it must re-arm itself).
+// Not used by the app-owned pipeline above (which re-arms at APP_OWNED_REPORT_INTERVAL_MS in
+// every case - Claude Code's own accel threshold applies whether the finger is down or
+// coasting). Reserved for the still-unimplemented native-mode (mouseTrackingMode === "none")
+// local inertia: that path has no round trip and no Claude-Code-side acceleration to respect,
+// so it can re-check at a much tighter, animation-frame-like cadence once it exists.
 const MOMENTUM_TICK_INTERVAL_MS = 20;
 const MOMENTUM_MIN_VELOCITY_PX_PER_MS = 0.02;
 
@@ -558,6 +561,11 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     let lastMoveTimestamp = 0;
     let lastMomentumTimestamp = 0;
     let momentumTimeoutId: number | null = null;
+    // Timestamp of the last app-owned wheel report actually SENT (0 = none sent yet). Enforces
+    // APP_OWNED_REPORT_INTERVAL_MS against real send times, not just against the next scheduled
+    // timer - see dispatchAppOwnedTicks, which can also be called directly and immediately from
+    // handleTouchMove/handleTouchRelease on every event, not only from its own re-arm timer.
+    let lastAppOwnedReportAt = 0;
 
     const stopDraining = (): void => {
       if (momentumTimeoutId !== null) {
@@ -570,32 +578,35 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     // click can immediately kill any in-flight app-owned momentum coast.
     stopActiveGestureRef.current = stopDraining;
 
-    // Advances the coast's velocity/accumulated distance for one momentum step while the
-    // finger is up. Returns false once the coast has decayed below the stop threshold (caller
-    // should stopDraining()); a no-op (returns true) while the finger is still down, since an
-    // active drag is driven by handleTouchMove's own accumulation instead.
+    // Advances the coast's velocity/accumulated distance for one momentum step while the finger
+    // is up; a no-op while it's still down, since an active drag is driven by handleTouchMove's
+    // own accumulation instead. Only ADDS distance from decaying velocity - it does not decide
+    // whether to stop draining. Those are different questions: velocity below the threshold just
+    // means the coast has nothing further to contribute, not that whatever whole lines are
+    // already sitting in accumulatedPx should be discarded. The caller (dispatchAppOwnedTicks)
+    // decides when to actually stop, based on whether anything is left to send.
     const advanceMomentumIfReleased = (
       touchState: { accumulatedPx: number; released: boolean },
       decayPerTick: number
-    ): boolean => {
-      if (!touchState.released) {
-        return true;
+    ): void => {
+      if (!touchState.released || Math.abs(dragVelocityPxPerMs) < MOMENTUM_MIN_VELOCITY_PX_PER_MS) {
+        return;
       }
       const now: number = performance.now();
       const elapsedMs: number = lastMomentumTimestamp === 0 ? 0 : now - lastMomentumTimestamp;
       lastMomentumTimestamp = now;
-      if (Math.abs(dragVelocityPxPerMs) < MOMENTUM_MIN_VELOCITY_PX_PER_MS) {
-        return false;
-      }
       touchState.accumulatedPx += dragVelocityPxPerMs * elapsedMs;
       dragVelocityPxPerMs *= decayPerTick;
-      return true;
     };
 
     // The pane's mouse tracking is owned by whatever app is running (not tmux, see
-    // APP_OWNED_TICK_LINES above), so there's no ack to pace against and no known per-report
-    // scroll amount to visually compensate for. Sends plain wheel reports at a flat rate
-    // instead, draining as much of the accumulated finger distance as it can each pass.
+    // APP_OWNED_TICK_LINES above), so there's no ack to pace against - but there IS a real rate
+    // limit to respect (APP_OWNED_REPORT_INTERVAL_MS, see its definition). This is a genuine
+    // rate limiter keyed off the timestamp of the last report actually sent, not just a delay
+    // between dispatch passes: handleTouchMove and handleTouchRelease both call this directly,
+    // as often as once per touch event (which can arrive faster than the interval), so the
+    // throttle has to be enforced at the send site itself or a fast swipe would still burst
+    // reports closer together than Claude Code can take without accelerating.
     const dispatchAppOwnedTicks = (
       activeTerminal: Terminal,
       touchState: { lastClientY: number; accumulatedPx: number; released: boolean }
@@ -604,14 +615,15 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
         window.clearTimeout(momentumTimeoutId);
         momentumTimeoutId = null;
       }
-      if (touchState.released && !advanceMomentumIfReleased(touchState, APP_OWNED_MOMENTUM_DECAY_PER_TICK)) {
-        stopDraining();
-        return;
+      if (touchState.released) {
+        advanceMomentumIfReleased(touchState, APP_OWNED_MOMENTUM_DECAY_PER_TICK);
       }
       const lineHeightPx: number = container.clientHeight / Math.max(1, activeTerminal.rows);
       const tickPx: number = APP_OWNED_TICK_LINES * lineHeightPx;
-      let reportsSent = 0;
-      while (Math.abs(touchState.accumulatedPx) >= tickPx && reportsSent < APP_OWNED_MAX_REPORTS_PER_DISPATCH) {
+      const hasFullLine = (): boolean => Math.abs(touchState.accumulatedPx) >= tickPx;
+      const elapsedSinceLastReport: number =
+        lastAppOwnedReportAt === 0 ? Infinity : performance.now() - lastAppOwnedReportAt;
+      if (hasFullLine() && elapsedSinceLastReport >= APP_OWNED_REPORT_INTERVAL_MS) {
         const direction: number = Math.sign(touchState.accumulatedPx);
         touchState.accumulatedPx -= direction * tickPx;
         // DOM_DELTA_LINE with deltaY of exactly +-1, not pixels: xterm's Viewport.getLinesScrolled
@@ -629,22 +641,27 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
             cancelable: true,
           })
         );
-        reportsSent += 1;
+        lastAppOwnedReportAt = performance.now();
       }
-      // Re-arm whenever there's more coasting to do (release) or this pass hit the burst
-      // cap with distance still left over (active drag outrunning the cap); an active drag
-      // still under the cap needs nothing further, the next handleTouchMove drives it.
-      const hasLeftoverDistance: boolean = Math.abs(touchState.accumulatedPx) >= tickPx;
-      if (touchState.released || hasLeftoverDistance) {
-        // While coasting, re-arm at MOMENTUM_TICK_INTERVAL_MS, not APP_OWNED_REPORT_INTERVAL_MS:
-        // APP_OWNED_MOMENTUM_DECAY_PER_TICK is calibrated per call, not per elapsed time (see
-        // its definition), assuming the ~50 calls/sec that constant produces. Re-arming faster
-        // here would call advanceMomentumIfReleased more often per real second, decaying
-        // velocity away quicker than intended and cutting the coast short. Only the leftover-
-        // distance case (active drag outrunning the burst cap) needs the tighter interval, to
-        // keep up with a fast finger instead of falling behind it.
-        const rearmDelayMs: number = touchState.released ? MOMENTUM_TICK_INTERVAL_MS : APP_OWNED_REPORT_INTERVAL_MS;
-        momentumTimeoutId = window.setTimeout(() => dispatchAppOwnedTicks(activeTerminal, touchState), rearmDelayMs);
+      const stillCoasting: boolean =
+        touchState.released && Math.abs(dragVelocityPxPerMs) >= MOMENTUM_MIN_VELOCITY_PX_PER_MS;
+      if (hasFullLine() || stillCoasting) {
+        // Either there's a whole line already waiting (possibly just throttled above, possibly
+        // more than one line's worth) or the coast can still add more - either way, something
+        // will need sending again. Wait out exactly the rest of the throttle window if that's
+        // why nothing went out this pass, otherwise wait a full interval before checking again.
+        const waitMs: number =
+          hasFullLine() && elapsedSinceLastReport < APP_OWNED_REPORT_INTERVAL_MS
+            ? APP_OWNED_REPORT_INTERVAL_MS - elapsedSinceLastReport
+            : APP_OWNED_REPORT_INTERVAL_MS;
+        momentumTimeoutId = window.setTimeout(() => dispatchAppOwnedTicks(activeTerminal, touchState), waitMs);
+      } else if (touchState.released) {
+        // Genuinely done: released, no whole line left to drain, and the coast has decayed
+        // below the threshold. Only stop tracking here when the finger is actually up - during
+        // an active drag, a sub-tickPx leftover is the normal case (most touchmoves don't cross
+        // a full line on their own), and stopping here would wipe touchScrollRef and silently
+        // ignore every touchmove for the rest of the gesture until the next touchstart.
+        stopDraining();
       }
     };
 
@@ -701,13 +718,15 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
         return;
       }
       touchState.released = true;
-      if (
-        activeTerminal.modes.mouseTrackingMode === "none" ||
-        Math.abs(dragVelocityPxPerMs) < MOMENTUM_MIN_VELOCITY_PX_PER_MS
-      ) {
+      if (activeTerminal.modes.mouseTrackingMode === "none") {
+        // Native mode: xterm's own touch-scroll already handled the drag directly against its
+        // local scrollback, there is no app-owned pipeline to hand off to.
         stopDraining();
         return;
       }
+      // Always hand off to the dispatcher, even if the finger was already slow/stopped when it
+      // lifted (no fling): it decides whether there's still a whole line of accumulated
+      // distance to flush before actually stopping, instead of discarding it here regardless.
       lastMomentumTimestamp = performance.now();
       dispatchAppOwnedTicks(activeTerminal, touchState);
     };
