@@ -129,12 +129,15 @@ interface TerminalViewProps {
 // terminal.modes.mouseTrackingMode reflects only whatever the app running INSIDE the pane
 // asked for (a TUI like Claude Code's own fullscreen mode) - tmux itself no longer claims it.
 // When an app does own the mouse, xterm's own built-in touch-scroll goes to sleep (it only
-// runs while no mouse tracking is active) and a WheelEvent's deltaY is discarded by xterm's
-// mouse encoder (it always emits exactly one mouse report per event, see @xterm/xterm's
-// Terminal.ts wheel handler), so we drive the app's scroll ourselves by dispatching synthetic
-// wheel events. Measured against Claude Code's own fullscreen TUI by feel: 1 line per report
-// was too slow, 3 too fast.
-const APP_OWNED_TICK_LINES = 2;
+// runs while no mouse tracking is active), so we drive the app's scroll ourselves by dispatching
+// synthetic wheel events. Measured directly against a live Claude Code session (raw SGR mouse
+// reports via tmux send-keys, diffing tmux capture-pane before/after each one): every wheel
+// report moves Claude Code's own view by exactly one line, regardless of the WheelEvent's deltaY
+// magnitude (xterm's mouse encoder always emits exactly one mouse report per event and ignores
+// deltaY beyond a non-zero check, see @xterm/xterm's Terminal.ts sendEvent/Viewport.getLinesScrolled).
+// So this constant is "how many lines of finger travel it takes to fire one report", and 1 is the
+// only value that keeps finger travel and Claude Code's scroll in a true 1:1 ratio.
+const APP_OWNED_TICK_LINES = 1;
 // Floor between dispatch passes while draining an app-owned gesture; the app decides its own
 // scroll step per report and there is nothing to acknowledge back, so this is a plain rate
 // limit instead of pacing against a round trip.
@@ -611,10 +614,17 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       while (Math.abs(touchState.accumulatedPx) >= tickPx && reportsSent < APP_OWNED_MAX_REPORTS_PER_DISPATCH) {
         const direction: number = Math.sign(touchState.accumulatedPx);
         touchState.accumulatedPx -= direction * tickPx;
+        // DOM_DELTA_LINE with deltaY of exactly +-1, not pixels: xterm's Viewport.getLinesScrolled
+        // divides a pixel deltaY by its own measured row height and floors the result into a
+        // fractional accumulator (_wheelPartialScroll), so a pixel-mode event can silently produce
+        // zero lines (and get dropped by sendEvent's `amount === 0` check) if tickPx ever undershoots
+        // that internal row height. Line mode multiplies by scrollSensitivity (1, unchanged by this
+        // app) with no division or accumulator, guaranteeing this event always becomes exactly one
+        // mouse report - matching APP_OWNED_TICK_LINES's 1:1 contract regardless of pixel rounding.
         activeTerminal.element?.dispatchEvent(
           new WheelEvent("wheel", {
-            deltaY: direction * tickPx,
-            deltaMode: WheelEvent.DOM_DELTA_PIXEL,
+            deltaY: direction,
+            deltaMode: WheelEvent.DOM_DELTA_LINE,
             bubbles: true,
             cancelable: true,
           })
@@ -639,8 +649,15 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     };
 
     const handleTouchStart = (event: TouchEvent): void => {
+      // Cancel any momentum still coasting from a previous gesture before touching state at all:
+      // without this, a re-touch mid-coast replaces touchScrollRef below, but the OLD momentum
+      // timeout (still scheduled from before this touch started) fires later against that stale
+      // closure's touchState, sees released:true with zero velocity (dragVelocityPxPerMs was just
+      // reset), and calls stopDraining() - which wipes out the NEW gesture's state this handler is
+      // about to create. The result: a drag that starts during another gesture's momentum silently
+      // loses every report until the next touchstart.
+      stopDraining();
       if (event.touches.length !== 1) {
-        stopDraining();
         return;
       }
       touchScrollRef.current = { lastClientY: event.touches[0].clientY, accumulatedPx: 0, released: false };
