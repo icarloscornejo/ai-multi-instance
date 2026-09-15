@@ -4,10 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import express, { type Request, type Response, type NextFunction, type Router } from "express";
 import { AUTH_COOKIE_NAME, checkPassword, isAuthEnabled, issueToken, readCookie, requireAuth, setStoredPassword, verifyToken } from "./auth";
+import { clearAgentReadiness, getReadyChannel } from "./agentReadiness";
 import { isAgentProvider, PROVIDERS, sessionKeyFor } from "./providers";
 import { pathExists } from "./paths";
 import { loadState, saveState, updateState } from "./store";
-import { getPaneCurrentPath, getSessionPresence, killSession } from "./tmux";
+import { getPaneCurrentPath, getSessionPresence, killSession, signalChannel } from "./tmux";
 import { isRemoteUnreachableError, NETWORK_GIT_TIMEOUT_MS, runGit } from "./git";
 import { LaunchProgress } from "./launchProgress";
 import { initializeInstanceSession } from "./terminal";
@@ -1070,6 +1071,20 @@ apiRouter.delete(
           return { result: undefined, nextState: draft };
         });
       }
+
+      // A pending "tmux wait-for" from watchForAgentReady (terminal.ts) would otherwise sit
+      // blocked for its full 20s timeout even though this session - and whatever it was
+      // waiting to hear from - is about to be killed. Best-effort: a DELETE must never fail
+      // because of this, it is purely a courtesy to let that wait return early.
+      const pendingReadyChannel: string | null = getReadyChannel(preInstance.id);
+      if (pendingReadyChannel !== null) {
+        try {
+          await signalChannel(pendingReadyChannel);
+        } catch {
+          // Nothing left to do about it; the watcher's own timeout still resolves eventually.
+        }
+      }
+      clearAgentReadiness(preInstance.id);
 
       // killSession (tmux.ts) only returns cleanly on a DEFINITIVE "no such session"; it
       // rethrows for anything unconfirmed (a timeout, a wedged tmux server). Retried a couple

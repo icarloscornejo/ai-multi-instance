@@ -1,5 +1,6 @@
 import os from "node:os";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { clearAgentReadiness, isAgentReady, markAgentBooting, markAgentReady } from "./agentReadiness";
 import type { InstanceRecord } from "./types";
 
 vi.mock("./tmux", () => ({
@@ -26,6 +27,8 @@ vi.mock("./tmux", () => ({
   isSessionInitIncomplete: vi.fn(),
   markSessionLaunching: vi.fn(),
   markSessionInitComplete: vi.fn(),
+  setSessionEnvironment: vi.fn(),
+  waitForChannelSignal: vi.fn(),
   // A plain predicate, not stateful: real impl in tmux.ts matches "duplicate session:" in the
   // error message. Tests that need it truthy set it per-case; the default (undefined ->
   // falsy) means "not a duplicate", the common path.
@@ -167,8 +170,14 @@ beforeEach(() => {
   vi.mocked(tmux.isSessionInitIncomplete).mockReset();
   vi.mocked(tmux.markSessionLaunching).mockReset();
   vi.mocked(tmux.markSessionInitComplete).mockReset();
+  vi.mocked(tmux.setSessionEnvironment).mockReset().mockResolvedValue(undefined);
+  // Resolves quickly by default so watchForAgentReady's fire-and-forget watcher settles
+  // within a microtask instead of tests needing to explicitly arrange for it every time -
+  // see the "readiness" describe block below for tests that override this.
+  vi.mocked(tmux.waitForChannelSignal).mockReset().mockResolvedValue(false);
   vi.mocked(tmux.isDuplicateSessionError).mockReset();
   vi.mocked(nodePty.spawn).mockReset();
+  clearAgentReadiness(makeInstance().id);
   vi.mocked(loadState).mockReset().mockResolvedValue({
     schemaVersion: 2,
     config: { locations: [], enabledProviders: [] },
@@ -323,12 +332,55 @@ describe("ensureSessionReady", () => {
     expect(tmux.markSessionInitComplete).toHaveBeenCalledWith("ccdash-abc123");
   });
 
+  // The whole point of routing the real command through the session environment: the pane
+  // must never be typed the flag-heavy command directly, only the short loader invocation.
+  it("sends the real launch command through the session environment, not through the pane", async () => {
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("absent");
+    vi.mocked(tmux.createSession).mockResolvedValue(undefined);
+    vi.mocked(tmux.sendCommandToSession).mockResolvedValue(undefined);
+
+    await ensureSessionReady(makeInstance({ shellOnly: false }));
+
+    const commandCall = vi
+      .mocked(tmux.setSessionEnvironment)
+      .mock.calls.find(([, name]) => name === "AI_LAUNCH_COMMAND");
+    expect(commandCall?.[2]).toContain("--settings");
+    expect(commandCall?.[2]).toContain("AI_MULTI_INSTANCE_ID=");
+
+    const channelCall = vi
+      .mocked(tmux.setSessionEnvironment)
+      .mock.calls.find(([, name]) => name === "AI_LAUNCH_READY_CHANNEL");
+    expect(channelCall?.[2]).toContain(makeInstance().id);
+
+    const [, pendingCommand] = vi.mocked(tmux.sendCommandToSession).mock.calls[0];
+    expect(pendingCommand).not.toContain("--settings");
+    expect(pendingCommand).not.toContain("AI_MULTI_INSTANCE_ID=");
+    expect(pendingCommand).toContain("source ");
+  });
+
   it("skips the provider launch for a shell-only instance but still marks init complete", async () => {
     vi.mocked(tmux.getSessionPresence).mockResolvedValue("absent");
     vi.mocked(tmux.createSession).mockResolvedValue(undefined);
     await ensureSessionReady(makeInstance({ shellOnly: true }));
-    expect(tmux.sendCommandToSession).not.toHaveBeenCalled();
     expect(tmux.markSessionInitComplete).toHaveBeenCalledWith("ccdash-abc123");
+  });
+
+  // shellOnly still gets the readiness mechanism (round-3 audit finding: excluding it left
+  // the boot overlay with nothing to hide it for a plain shell) - just a trivial ready-signal
+  // command instead of the loader invocation, since there's no launch command to hide.
+  it("sends only a trivial ready-signal command for a shell-only instance, never the launch-command env var", async () => {
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("absent");
+    vi.mocked(tmux.createSession).mockResolvedValue(undefined);
+    vi.mocked(tmux.sendCommandToSession).mockResolvedValue(undefined);
+
+    await ensureSessionReady(makeInstance({ shellOnly: true }));
+
+    expect(
+      vi.mocked(tmux.setSessionEnvironment).mock.calls.some(([, name]) => name === "AI_LAUNCH_COMMAND")
+    ).toBe(false);
+    const [, pendingCommand] = vi.mocked(tmux.sendCommandToSession).mock.calls[0];
+    expect(pendingCommand).toContain("tmux wait-for -S");
+    expect(pendingCommand).not.toContain("source ");
   });
 
   // Inverted from its previous form on purpose (round-2 audit finding): sendCommandToSession
@@ -349,21 +401,56 @@ describe("ensureSessionReady", () => {
     expect(tmux.markSessionInitComplete).not.toHaveBeenCalled();
   });
 
-  it("marks the session 'launching' BEFORE sending the launch command, never after", async () => {
+  // Round-3 audit finding: the watcher must be started BEFORE sendCommandToSession, not after,
+  // so a failed send (session still preserved, see the test above) does not leave the
+  // instance stuck "booting" forever with nothing but the client's own 25s fallback to save
+  // it - the watcher's own waitForChannelSignal call already happened and will resolve this
+  // independently.
+  it("still resolves the instance's readiness even when sendCommandToSession fails with the session preserved", async () => {
+    vi.mocked(tmux.getSessionPresence).mockResolvedValue("absent");
+    vi.mocked(tmux.createSession).mockResolvedValue(undefined);
+    vi.mocked(tmux.markSessionLaunching).mockResolvedValue(undefined);
+    vi.mocked(tmux.waitForChannelSignal).mockResolvedValue(false);
+    vi.mocked(tmux.sendCommandToSession).mockRejectedValueOnce(new Error("tmux command timed out"));
+
+    const instance = makeInstance({ shellOnly: false });
+    await expect(ensureSessionReady(instance)).rejects.toThrow("tmux command timed out");
+
+    // The watcher is fire-and-forget; give its microtask a turn to run.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(isAgentReady(instance.id)).toBe(true);
+  });
+
+  it("marks the session 'launching' BEFORE sending the launch command, never after - the readiness watcher starts right before the send too", async () => {
     const calls: string[] = [];
     vi.mocked(tmux.getSessionPresence).mockResolvedValue("absent");
     vi.mocked(tmux.createSession).mockImplementation(async () => {
       calls.push("createSession");
     });
+    vi.mocked(tmux.setSessionEnvironment).mockImplementation(async () => {
+      calls.push("setSessionEnvironment");
+    });
     vi.mocked(tmux.markSessionLaunching).mockImplementation(async () => {
       calls.push("markSessionLaunching");
+    });
+    vi.mocked(tmux.waitForChannelSignal).mockImplementation(async () => {
+      calls.push("watchForAgentReady");
+      return false;
     });
     vi.mocked(tmux.sendCommandToSession).mockImplementation(async () => {
       calls.push("sendCommandToSession");
     });
 
     await ensureSessionReady(makeInstance({ shellOnly: false }));
-    expect(calls).toEqual(["createSession", "markSessionLaunching", "sendCommandToSession"]);
+    expect(calls).toEqual([
+      "createSession",
+      "setSessionEnvironment",
+      "setSessionEnvironment",
+      "markSessionLaunching",
+      "watchForAgentReady",
+      "sendCommandToSession",
+    ]);
   });
 
   it("still cleans up when markSessionLaunching fails - nothing was launched yet - and never sends the command", async () => {
@@ -371,7 +458,9 @@ describe("ensureSessionReady", () => {
     vi.mocked(tmux.createSession).mockResolvedValue(undefined);
     vi.mocked(tmux.markSessionLaunching).mockRejectedValueOnce(new Error("tmux command timed out"));
 
-    await expect(ensureSessionReady(makeInstance({ shellOnly: false }))).rejects.toThrow("tmux command timed out");
+    const instance = makeInstance({ shellOnly: false });
+    await expect(ensureSessionReady(instance)).rejects.toThrow("tmux command timed out");
+    expect(isAgentReady(instance.id)).toBe(true); // clearAgentReadiness - nothing left to wait for
     expect(tmux.sendCommandToSession).not.toHaveBeenCalled();
     expect(tmux.killSession).toHaveBeenCalledWith("ccdash-abc123");
   });
@@ -484,6 +573,9 @@ describe("initializeInstanceSession (onSessionCreated hook)", () => {
     vi.mocked(tmux.createSession).mockImplementation(async () => {
       calls.push("createSession");
     });
+    vi.mocked(tmux.setSessionEnvironment).mockImplementation(async () => {
+      calls.push("setSessionEnvironment");
+    });
     vi.mocked(tmux.markSessionLaunching).mockImplementation(async () => {
       calls.push("markSessionLaunching");
     });
@@ -491,10 +583,23 @@ describe("initializeInstanceSession (onSessionCreated hook)", () => {
       calls.push("sendCommandToSession");
     });
 
+    vi.mocked(tmux.waitForChannelSignal).mockImplementation(async () => {
+      calls.push("watchForAgentReady");
+      return false;
+    });
+
     await initializeInstanceSession(makeInstance({ shellOnly: false }), async () => {
       calls.push("hook");
     });
-    expect(calls).toEqual(["createSession", "hook", "markSessionLaunching", "sendCommandToSession"]);
+    expect(calls).toEqual([
+      "createSession",
+      "hook",
+      "setSessionEnvironment",
+      "setSessionEnvironment",
+      "markSessionLaunching",
+      "watchForAgentReady",
+      "sendCommandToSession",
+    ]);
   });
 
   it("treats a hook failure as a pre-launch failure: kills the session and propagates", async () => {
@@ -513,6 +618,7 @@ describe("initializeInstanceSession (onSessionCreated hook)", () => {
   it("does NOT kill when the launch fails after the hook already ran (a live agent may be in the session)", async () => {
     vi.mocked(tmux.createSession).mockResolvedValue(undefined);
     vi.mocked(tmux.markSessionLaunching).mockResolvedValue(undefined);
+    vi.mocked(tmux.waitForChannelSignal).mockResolvedValue(false);
     vi.mocked(tmux.sendCommandToSession).mockRejectedValueOnce(new Error("tmux command timed out"));
     const hook = vi.fn(async () => {});
 
@@ -752,5 +858,53 @@ describe("bridgeTerminal", () => {
     expect(fakePty.write).toHaveBeenCalledWith("ls\n");
     expect(fakePty.resize).toHaveBeenCalledWith(100, 40);
     expect(socket.close).not.toHaveBeenCalled();
+  });
+
+  // Closes the race the whole readiness mechanism exists for: a browser connecting to an
+  // instance the server never tracked as "booting" (already running, created before this
+  // feature existed, or already resolved) must be told "ready" right away, not left waiting
+  // for a signal that will never come.
+  it("sends the agent-ready frame immediately on attach when the instance is not tracked as booting", async () => {
+    const fakePty = makeFakePty();
+    vi.mocked(nodePty.spawn).mockReturnValue(fakePty as never);
+    const socket = makeFakeSocket();
+    const instance = makeReadyInstance({ id: "ready-on-attach-test" });
+
+    await bridgeTerminal(socket as never, instance, null, makeNoopAttachBuffer(), () => {});
+
+    expect(socket.send).toHaveBeenCalledWith(new Uint8Array([1]));
+  });
+
+  it("withholds the agent-ready frame until markAgentReady fires for an instance still booting", async () => {
+    const fakePty = makeFakePty();
+    vi.mocked(nodePty.spawn).mockReturnValue(fakePty as never);
+    const socket = makeFakeSocket();
+    const instance = makeReadyInstance({ id: "still-booting-test" });
+    markAgentBooting(instance.id, "test-channel");
+
+    await bridgeTerminal(socket as never, instance, null, makeNoopAttachBuffer(), () => {});
+    expect(socket.send).not.toHaveBeenCalledWith(new Uint8Array([1]));
+
+    markAgentReady(instance.id, "test-channel");
+    expect(socket.send).toHaveBeenCalledWith(new Uint8Array([1]));
+  });
+
+  it("a broken socket.send for one waiting client does not stop another client for the same instance from being notified", async () => {
+    const fakePtyA = makeFakePty();
+    const fakePtyB = makeFakePty();
+    vi.mocked(nodePty.spawn).mockReturnValueOnce(fakePtyA as never).mockReturnValueOnce(fakePtyB as never);
+    const brokenSocket = makeFakeSocket();
+    brokenSocket.send.mockImplementation(() => {
+      throw new Error("write after end");
+    });
+    const healthySocket = makeFakeSocket();
+    const instance = makeReadyInstance({ id: "multi-waiter-test" });
+    markAgentBooting(instance.id, "test-channel");
+
+    await bridgeTerminal(brokenSocket as never, instance, null, makeNoopAttachBuffer(), () => {});
+    await bridgeTerminal(healthySocket as never, instance, null, makeNoopAttachBuffer(), () => {});
+
+    expect(() => markAgentReady(instance.id, "test-channel")).not.toThrow();
+    expect(healthySocket.send).toHaveBeenCalledWith(new Uint8Array([1]));
   });
 });

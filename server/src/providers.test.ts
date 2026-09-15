@@ -35,6 +35,11 @@ describe("provider launch commands", () => {
     expect(command).not.toContain("--effort");
   });
 
+  it("backgrounds the Codex session watcher inside a subshell, so its exit produces no job notification in the pane", () => {
+    const command = buildProviderLaunchCommand(instance("codex"));
+    expect(command).toMatch(/^\( AI_MULTI_INSTANCE_ID='instance-1' node .*codex-session-watcher\.mjs.*& \) 'codex'/);
+  });
+
   it("resumes Cursor with its chat ID", () => {
     const command = buildProviderLaunchCommand(instance("cursor"), "cursor-chat");
     expect(command).toContain("'agent' --resume 'cursor-chat' --model 'test-model'");

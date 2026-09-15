@@ -5,6 +5,7 @@ import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useSta
 import { useIsMobile } from "../hooks/useIsMobile";
 import { useWakeRetry } from "../hooks/useWakeRetry";
 import { FONT_SIZE_CHANGE_EVENT, getHostFontSize, setHostFontSize } from "../hostPrefs";
+import { PROVIDER_OPTIONS } from "../providerOptions";
 import { INITIAL_RECONNECT_STATE, reduceConnection, type ReconnectState } from "../reconnectPolicy";
 import { btnGhost } from "../ui";
 import { RetryRing } from "./RetryRing";
@@ -124,7 +125,18 @@ interface TerminalViewProps {
   // later, see below) steals focus back from the still-open rename field. The rail is
   // responsible for keeping this true until the rename commits or cancels.
   suppressAutoFocus?: boolean;
+  // True only for an instance this browser tab itself just created (see App.tsx's
+  // createInstance) - read once, at mount, to seed agentBooting below; the parent does not
+  // control this afterward. A page reload reconnecting to an already-running instance should
+  // never show the boot overlay, so this stays false/undefined for every instance this tab
+  // did not just create itself, even if the server's own readiness state is still "booting".
+  awaitingAgentReady?: boolean;
 }
+
+// How long to keep the terminal covered before giving up on ever hearing back from the
+// server (see terminal.ts's own AGENT_READY_WAIT_TIMEOUT_MS, a shorter 20s) - the last line
+// of defense so a missed/dropped ready frame never hides the terminal forever.
+const AGENT_BOOT_OVERLAY_MAX_MS = 25_000;
 
 // tmux runs with mouse mode off (see disableTmuxMouseAndAltScreen in server/src/tmux.ts), so
 // terminal.modes.mouseTrackingMode reflects only whatever the app running INSIDE the pane
@@ -221,6 +233,37 @@ function DisconnectedOverlay({
   );
 }
 
+// Opaque (bg-app, not the semi-transparent bg-app/80 DisconnectedOverlay uses) and above the
+// terminal's own controls (z-20 vs their z-10, see the scroll-to-bottom/zoom buttons further
+// below): nothing behind it - not xterm's canvas, not a half-drawn frame, not a disconnect
+// notice underneath - should be visible while an agent is still booting.
+function AgentBootingOverlay({ providerLabel }: { providerLabel: string }) {
+  return (
+    <div className="absolute inset-0 z-20 flex items-center justify-center bg-app">
+      <div className="flex w-[280px] flex-col items-center gap-[14px] rounded-lg border border-border bg-surface p-[26px] shadow-modal">
+        <RetryRing size={38} tone="accent">
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className="h-[15px] w-[15px]"
+          >
+            <polyline points="4 17 10 11 4 5" />
+            <line x1="12" y1="19" x2="20" y2="19" />
+          </svg>
+        </RetryRing>
+        <div className="flex flex-col items-center gap-[3px] text-center">
+          <span className="text-[13px] font-semibold text-txt-bright">Starting {providerLabel}</span>
+          <span className="break-words text-[11.5px] text-txt-dim">Setting up the session...</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // The fix for the plan's explicit requirement that the error message be visible "from the
 // first failure, alongside the retry spinner": DisconnectedOverlay alone cannot satisfy that.
 // It is delayed by DISCONNECTED_OVERLAY_DELAY_MS (1.5s) on purpose, to avoid flashing "Session
@@ -245,7 +288,7 @@ function ReconnectIndicator({ reason }: { reason: string }) {
 }
 
 export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(function TerminalView(
-  { instance, visible, theme, focusOnVisible = true, suppressAutoFocus = false },
+  { instance, visible, theme, focusOnVisible = true, suppressAutoFocus = false, awaitingAgentReady = false },
   forwardedRef
 ) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -291,6 +334,19 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   const [fontSize, setFontSize] = useState<number>(() =>
     getHostFontSize(isMobile ? MIN_FONT_SIZE : instance.fontSize)
   );
+  // Seeded once from the prop at mount, never re-derived from it afterward - see
+  // TerminalViewProps.awaitingAgentReady's own comment for why. Flipped to false either by the
+  // server's ready frame (socket.onmessage below) or by the fallback timeout right below.
+  const [agentBooting, setAgentBooting] = useState<boolean>(awaitingAgentReady);
+  useEffect(() => {
+    if (!agentBooting) return;
+    // ponytail: a hard ceiling, not a confirmation of anything - the server has its own,
+    // shorter timeout (see AGENT_READY_WAIT_TIMEOUT_MS in terminal.ts); this is only the
+    // last-resort net for a dropped ready frame or a socket that never got a chance to
+    // receive it in time.
+    const timeoutId = window.setTimeout(() => setAgentBooting(false), AGENT_BOOT_OVERLAY_MAX_MS);
+    return () => window.clearTimeout(timeoutId);
+  }, [agentBooting]);
   const [disconnected, setDisconnected] = useState<boolean>(false);
   // Non-null only for close codes the server sends when retrying can never succeed on its
   // own (4004 unknown instance, 4005 out-of-ptys/missing folder, see index.ts). The reason
@@ -915,10 +971,16 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
           .replace(/\u23F5/g, "\u25B6")
           .replace(/\u23FA/g, "\u25CF");
         terminalRef.current?.write(text);
+        return;
       }
-      // A binary frame is the server's heartbeat pong (see terminal.ts): it carries no
-      // terminal output, updating lastActivityAtRef (and bridgeReadySignaled) above is its
-      // entire purpose.
+      // A binary frame is either the server's heartbeat pong (empty, see PONG_FRAME in
+      // terminal.ts) or the agent-ready signal (a single byte, see AGENT_READY_FRAME) -
+      // Blob.size distinguishes them synchronously, no need to read either frame's content.
+      // setAgentBooting is a stable setState setter, so reading it here does not need to be
+      // in this effect's own dependency list.
+      if (event.data instanceof Blob && event.data.size > 0) {
+        setAgentBooting(false);
+      }
     };
     // A real disconnect (server restart from tsx watch, self-update, etc.) keeps retrying
     // on a growing backoff instead of stranding the user on the manual Reconnect button
@@ -1095,7 +1157,20 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
           className="flex h-full w-full justify-center"
           style={{ touchAction: "none" }}
         />
-        {disconnected && <DisconnectedOverlay onReconnect={reconnect} fatalReason={fatalDisconnectReason} />}
+        {/* agentBooting wins over disconnected on purpose: a disconnect that happens while
+            the agent is still booting must not reveal the half-set-up terminal underneath the
+            (semi-transparent) DisconnectedOverlay - see AgentBootingOverlay's own comment. */}
+        {agentBooting ? (
+          <AgentBootingOverlay
+            providerLabel={
+              instance.shellOnly === true
+                ? "Terminal"
+                : (PROVIDER_OPTIONS.find((option) => option.value === instance.provider)?.label ?? "Terminal")
+            }
+          />
+        ) : (
+          disconnected && <DisconnectedOverlay onReconnect={reconnect} fatalReason={fatalDisconnectReason} />
+        )}
         {/* Both notices share one top-center stack (rather than each being independently
             absolutely-positioned at the same spot) because they CAN legitimately both be
             non-null at once: transientNotice (4007) deliberately survives a subsequent 4006

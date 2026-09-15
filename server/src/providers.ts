@@ -80,15 +80,22 @@ function buildCodexCommand(instance: InstanceRecord, sessionId?: string): string
   if (sessionId) {
     return `AI_MULTI_INSTANCE_ID=${quoteForShell(instance.id)} ${cliParts.join(" ")}`;
   }
+  // Wrapped in a subshell "( ... & )" rather than a bare trailing "&": a background job
+  // launched directly in the interactive pane shell prints a "[1]  done <command>" job
+  // notification (zsh's default NOTIFY) whenever the watcher exits, exposing the exact
+  // command line the loader script exists to hide. A subshell's background job is invisible
+  // to the outer shell's job table, so it exits silently instead.
   const watcher: string = [
+    "(",
+    "AI_MULTI_INSTANCE_ID=" + quoteForShell(instance.id),
     "node",
     quoteForShell(codexWatcherPath),
     quoteForShell(instance.id),
     quoteForShell(instance.locationPath),
     quoteForShell(String(Date.now())),
-    "&",
+    "& )",
   ].join(" ");
-  return `AI_MULTI_INSTANCE_ID=${quoteForShell(instance.id)} ${watcher} ${cliParts.join(" ")}`;
+  return `${watcher} ${cliParts.join(" ")}`;
 }
 
 function buildCursorCommand(instance: InstanceRecord, sessionId?: string): string {

@@ -23,6 +23,8 @@ import {
   isDuplicateSessionError,
   isSessionInitIncomplete,
   killSession,
+  signalChannel,
+  waitForChannelSignal,
 } from "./tmux";
 
 const promisifyCustomSymbol = Symbol.for("nodejs.util.promisify.custom");
@@ -247,6 +249,27 @@ describe("killSession", () => {
   it("still throws for a genuine operational failure (e.g. a timeout), not just an absent session", async () => {
     runTmuxMock.mockRejectedValue(execError({ killed: true, message: "Command failed" }));
     await expect(killSession("ccdash-abc")).rejects.toBeInstanceOf(TmuxError);
+  });
+});
+
+describe("waitForChannelSignal", () => {
+  it("resolves true when tmux wait-for confirms the signal", async () => {
+    runTmuxMock.mockResolvedValue({ stdout: "", stderr: "" });
+    expect(await waitForChannelSignal("ccdash-ready-x", 1000)).toBe(true);
+    expect(runTmuxMock).toHaveBeenCalledWith("tmux", ["wait-for", "ccdash-ready-x"], { timeout: 1000 });
+  });
+
+  it("resolves false, never throws, on a timeout or any tmux error", async () => {
+    runTmuxMock.mockRejectedValue(execError({ killed: true, message: "Command failed" }));
+    await expect(waitForChannelSignal("ccdash-ready-x", 1000)).resolves.toBe(false);
+  });
+});
+
+describe("signalChannel", () => {
+  it("signals the channel with tmux wait-for -S", async () => {
+    runTmuxMock.mockResolvedValue({ stdout: "", stderr: "" });
+    await signalChannel("ccdash-ready-x");
+    expect(runTmuxMock).toHaveBeenCalledWith("tmux", ["wait-for", "-S", "ccdash-ready-x"], expect.anything());
   });
 });
 

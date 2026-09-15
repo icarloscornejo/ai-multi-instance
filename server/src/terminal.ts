@@ -14,7 +14,21 @@ import {
   truncateCloseReason,
   type SpawnAttemptDetail,
 } from "./attachErrors";
-import { buildLaunchCommand } from "./launch";
+import {
+  clearAgentReadiness,
+  isAgentReady,
+  markAgentBooting,
+  markAgentReady,
+  onAgentReady,
+} from "./agentReadiness";
+import {
+  LAUNCH_COMMAND_ENV_NAME,
+  READY_CHANNEL_ENV_NAME,
+  buildLaunchCommand,
+  buildLoaderInvocation,
+  buildReadyChannelName,
+  buildShellOnlyReadyCommand,
+} from "./launch";
 import { computeMaxLivePtys, getPtmxMax } from "./ptyCapacity";
 import { pathExists } from "./paths";
 import { withSessionLock } from "./sessionLock";
@@ -30,6 +44,8 @@ import {
   markSessionInitComplete,
   markSessionLaunching,
   sendCommandToSession,
+  setSessionEnvironment,
+  waitForChannelSignal,
 } from "./tmux";
 import type { InstanceRecord } from "./types";
 
@@ -49,6 +65,22 @@ interface ClientControlMessage {
 // string frames as terminal output (see terminal.ts's counterpart), so a binary pong is
 // silently invisible to the pty stream instead of needing its own message-type parsing there.
 const PONG_FRAME = new Uint8Array(0);
+
+// Tells the client the agent (or shell) is now up - see agentReadiness.ts and
+// watchForAgentReady below. A single non-empty byte, distinguished from PONG_FRAME by the
+// client checking Blob.size (0 vs 1) rather than reading either frame's actual content.
+const AGENT_READY_FRAME = new Uint8Array([1]);
+
+// How long to wait for instance-loader.sh's "tmux wait-for -S" before giving up and revealing
+// the terminal anyway (see markAgentReady's call site in watchForAgentReady) - a silent or
+// crashed launch must not hide the terminal forever.
+const AGENT_READY_WAIT_TIMEOUT_MS = 20_000;
+// ponytail: a fixed grace period after the wait-for signal, not a confirmation that this
+// specific browser has actually rendered anything yet - the real command has only just been
+// handed control of the pane at that point. Upgrade path if this ever reads as noticeably
+// early/late: have the client itself report back its first post-boot paint instead of relying
+// on server-side timing.
+const AGENT_READY_GRACE_MS = 400;
 
 interface InitialSize {
   cols: number;
@@ -306,13 +338,22 @@ const sessionInitInFlight = new Map<string, Promise<void>>();
 //    launch timed out). The catch below cleans that up, but ONLY when it is provably safe:
 //
 //    - never once the launch command may have been delivered (`launchMayHaveBeenApplied`).
-//      sendCommandToSession sends the command text and Enter as two separate tmux calls; a
-//      timeout on either kills the client, not the running agent. The flag is set
-//      synchronously right after markSessionLaunching's await and before sendCommandToSession,
-//      so any failure from the send onward preserves. markSessionLaunching itself failing
-//      still cleans up: nothing was launched yet.
+//      setSessionEnvironment calls (the real launch command, and the ready-channel name -
+//      see agentReadiness.ts) run first and are not gated by the flag: a failure there means
+//      nothing was launched, so it falls through to the same cleanup as markSessionLaunching
+//      failing below. The flag is set synchronously right before sendCommandToSession in
+//      EITHER branch (the loader invocation for a real agent, or the trivial "clear;
+//      wait-for" for shellOnly) - both send the pane's command and Enter as two separate tmux
+//      calls; a timeout on either kills the client, not whatever is now running in the pane.
+//      Any failure from the send onward preserves.
 //    - never when the error is `duplicate session` - positive proof this call did not create
 //      the session, so it is not ours to kill.
+//
+//    watchForAgentReady is started (fire-and-forget, never awaited here) right before each
+//    branch's sendCommandToSession, not after: if the send itself throws with the session
+//    preserved, the watcher is already running independently on tmux's own wait-for channel
+//    and will still resolve the instance's readiness via its own timeout, instead of leaving
+//    it stuck at "booting" with nothing but the client's own fallback timeout to save it.
 //
 //    The marker is the complementary guard for the case where THIS process dies before the
 //    catch runs: "created" -> a future attach recreates; "launching" -> a future attach
@@ -337,6 +378,23 @@ const sessionInitInFlight = new Map<string, Promise<void>>();
 // calls and reaches the exact same outcome.
 type SessionProgressStep = "create-session" | "launch-agent";
 
+// Fire-and-forget: waits on the tmux "wait-for" channel this launch minted (see
+// buildReadyChannelName), then marks the instance ready after a short fixed grace period (see
+// AGENT_READY_GRACE_MS). Never throws and never blocks its caller - started BEFORE
+// sendCommandToSession, not after, so a failure sending the launch command (the session may
+// still be preserved, see initializeInstanceSession's catch below) does not leave this
+// instance stuck at "booting" with nothing left to resolve it besides the client's own
+// fallback timeout.
+function watchForAgentReady(instance: InstanceRecord, channelName: string): void {
+  void (async () => {
+    const signaled = await waitForChannelSignal(channelName, AGENT_READY_WAIT_TIMEOUT_MS);
+    if (signaled) {
+      await sleep(AGENT_READY_GRACE_MS);
+    }
+    markAgentReady(instance.id, channelName);
+  })();
+}
+
 export async function initializeInstanceSession(
   instance: InstanceRecord,
   onSessionCreated?: () => Promise<void>,
@@ -357,19 +415,38 @@ export async function initializeInstanceSession(
     if (onSessionCreated !== undefined) {
       await onSessionCreated();
     }
+    const channelName: string = buildReadyChannelName(instance);
+    await setSessionEnvironment(instance.tmuxSession, READY_CHANNEL_ENV_NAME, channelName);
+    markAgentBooting(instance.id, channelName);
     if (instance.shellOnly !== true) {
       reportProgress("launch-agent", "start");
-      await markSessionLaunching(instance.tmuxSession);
-      launchMayHaveBeenApplied = true;
-      await sendCommandToSession(
+      // The real launch command (flags, --settings JSON, resume fallback) goes through the
+      // session's own environment rather than being typed into the pane, so the pane only ever
+      // shows the short loader invocation below - see buildLoaderInvocation's header comment.
+      await setSessionEnvironment(
         instance.tmuxSession,
+        LAUNCH_COMMAND_ENV_NAME,
         buildLaunchCommand(instance, { resumeSessionId: instance.sessionId ?? undefined })
       );
+      await markSessionLaunching(instance.tmuxSession);
+      launchMayHaveBeenApplied = true;
+      // Started before sendCommandToSession, not after - see watchForAgentReady's own comment.
+      watchForAgentReady(instance, channelName);
+      await sendCommandToSession(instance.tmuxSession, buildLoaderInvocation());
       reportProgress("launch-agent", "done");
+    } else {
+      launchMayHaveBeenApplied = true;
+      watchForAgentReady(instance, channelName);
+      await sendCommandToSession(instance.tmuxSession, buildShellOnlyReadyCommand(channelName));
     }
     await markSessionInitComplete(instance.tmuxSession);
   } catch (error) {
     if (!launchMayHaveBeenApplied && !isDuplicateSessionError(error)) {
+      // This instance's session never ends up existing, so there is nothing left for the
+      // watcher above to usefully wait 20s for - dropping it now lets a future WS attach for
+      // this instance id (if any) default to isAgentReady's "untracked -> ready" behavior
+      // immediately instead of appearing to still be booting.
+      clearAgentReadiness(instance.id);
       try {
         await killSession(instance.tmuxSession);
       } catch {
@@ -545,6 +622,36 @@ export async function bridgeTerminal(
   if (socket.readyState !== socket.OPEN) {
     releasePty(attachProcess);
     return;
+  }
+
+  // Tells the client's HTML boot overlay (see TerminalView.tsx) whether it can reveal the
+  // terminal right away or has to keep waiting - immediately if the instance is already
+  // ready (or was never tracked at all: an old instance, a server restart), otherwise once
+  // watchForAgentReady (above, in initializeInstanceSession) resolves it. socket.send can
+  // throw (a broken pipe, a race with close); caught per-listener so it never takes down the
+  // notification to any OTHER socket still waiting on the same instance, and the listener is
+  // always removed via `finally` either way.
+  if (isAgentReady(instance.id)) {
+    try {
+      socket.send(AGENT_READY_FRAME);
+    } catch {
+      // Same reasoning as the teardownAttach-guarded sends further down: a send failing
+      // here costs nothing beyond this one frame, the client's own fallback timeout covers it.
+    }
+  } else {
+    const unsubscribeFromAgentReady = onAgentReady(instance.id, () => {
+      try {
+        if (socket.readyState === socket.OPEN) {
+          socket.send(AGENT_READY_FRAME);
+        }
+      } catch {
+        // A broken socket must not stop this instance's OTHER waiting sockets from
+        // being notified - see teardownAttach's header comment for the same principle.
+      } finally {
+        unsubscribeFromAgentReady();
+      }
+    });
+    socket.on("close", unsubscribeFromAgentReady);
   }
 
   // node-pty rethrows any stream error that isn't EAGAIN/EIO UNLESS the consumer has

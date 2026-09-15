@@ -456,12 +456,20 @@ export function App() {
     [activeInstanceId]
   );
 
+  // Instance ids created by THIS browser tab, read once by TerminalView (see its
+  // awaitingAgentReady prop) to decide whether to show the boot overlay. Never removed: a
+  // page reload resets this to empty anyway (the whole point - see App.tsx's own comment at
+  // the state declaration), and TerminalView only reads it at mount, so a stale entry here is
+  // harmless.
+  const [awaitingAgentReadyIds, setAwaitingAgentReadyIds] = useState<Set<string>>(new Set());
+
   const createInstance = async (
     payload: CreateInstancePayload,
     onProgress?: (event: LaunchEvent) => void
   ): Promise<void> => {
     const createdInstance: Instance = await api.createInstance(payload, onProgress);
     setInstances((previousInstances) => [...previousInstances, createdInstance]);
+    setAwaitingAgentReadyIds((previousIds) => new Set(previousIds).add(createdInstance.id));
     setIsNewInstanceModalOpen(false);
     if (isMobile) {
       enterMobileTerminal(createdInstance.id);
@@ -641,6 +649,7 @@ export function App() {
                     theme={theme}
                     focusOnVisible={!isMobile}
                     suppressAutoFocus={!isMobile && railEditingActive}
+                    awaitingAgentReady={awaitingAgentReadyIds.has(instance.id)}
                   />
                 ))
               )}

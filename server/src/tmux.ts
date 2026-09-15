@@ -297,6 +297,38 @@ export async function sendCommandToSession(sessionName: string, command: string)
   await runTmux(["send-keys", "-t", sessionName, "Enter"]);
 }
 
+// Hands a value to the session through tmux's own environment instead of typing it into the
+// pane - used to smuggle the real (long, flag-heavy) launch command past the interactive shell
+// so the pane only ever displays a short "source <loader>" line. Goes through execFile with no
+// shell involved (see runTmux), so there is no quoting to worry about here.
+export async function setSessionEnvironment(sessionName: string, name: string, value: string): Promise<void> {
+  await runTmux(["set-environment", "-t", sessionName, name, value]);
+}
+
+// tmux "wait-for" channels are a named, server-side semaphore: "-S" signals a channel (never
+// blocks), a bare "wait-for <channel>" blocks until signaled - or returns immediately if the
+// channel was already signaled first, so callers on either side of this pair never race each
+// other regardless of which one runs first. Used to let the pane's own shell (instance-
+// loader.sh) tell the server "the real command now has control of the terminal" without
+// printing anything visible or exposing raw bytes to a second attached client - see
+// agentReadiness.ts for how the server turns this into the dashboard's HTML loading overlay.
+//
+// Resolves to false on timeout or any tmux error rather than throwing: an unconfirmed signal
+// is not a failure the caller needs to react to specially, just a "give up waiting" result -
+// see AGENT_READY_WAIT_TIMEOUT_MS in terminal.ts.
+export async function waitForChannelSignal(channelName: string, timeoutMs: number): Promise<boolean> {
+  try {
+    await runTmux(["wait-for", channelName], timeoutMs);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function signalChannel(channelName: string): Promise<void> {
+  await runTmux(["wait-for", "-S", channelName]);
+}
+
 // tmux's "new-session -s NAME" for a NAME that already exists fails with exactly
 // "duplicate session: NAME". A caller's create attempt hitting this is positive proof the
 // session was NOT created by that attempt - so its rollback path must NOT kill it (it belongs
