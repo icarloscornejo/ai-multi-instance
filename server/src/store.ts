@@ -16,6 +16,10 @@ export const stateFilePath: string = path.join(dataDirectory, "instances.json");
 // bit rot, a truncated write from outside this process, a manual edit gone wrong.
 export const backupFilePath: string = `${stateFilePath}.backup`;
 export const quarantineDirectory: string = path.join(dataDirectory, "quarantine");
+// What TMUX_TMPDIR (see scripts/with-writable-tmpdir.mjs's resolveTmuxTmpdir) the previous
+// server start used, so reconcileLegacyTmuxSockets (tmux.ts) can sweep it even if it isn't one
+// of the hardcoded historical paths - e.g. an explicit TMUX_TMPDIR the user changed by hand.
+export const tmuxTmpdirRecordPath: string = path.join(dataDirectory, "tmux-tmpdir.txt");
 // Bounds how much of the user's registry history (custom commands, locations, provider
 // session ids - see InstanceRecord) accumulates on disk across repeated corruption events.
 // Rotation only ever deletes the OLDEST quarantined file once this cap is exceeded, never the

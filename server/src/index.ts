@@ -22,7 +22,8 @@ import { apiRouter } from "./routes";
 import { getTunnelMode } from "./namedTunnel";
 import { isLocalRequestHost } from "./requestHost";
 import { formatCrashLine, startServerLog } from "./serverLog";
-import { loadState } from "./store";
+import { loadState, tmuxTmpdirRecordPath } from "./store";
+import { reconcileLegacyTmuxSockets } from "./tmux";
 import { reconcileFrontendPublishOnStartup } from "./updater";
 import { bridgeTerminal, closeSocketSafely, getLivePtyCount, validateTerminalSize } from "./terminal";
 import type { DashboardState } from "./types";
@@ -292,6 +293,23 @@ httpServer.on("upgrade", (request, socket, head) => {
     });
   }
 });
+
+// Awaited BEFORE listen(), not fire-and-forget: bridgeTerminal (this file's WS "connection"
+// handler) recreates an absent session and launches a fresh agent the instant a client attaches
+// (see terminal.ts's ensureSessionReady) - if that could race this sweep, a client attaching
+// during startup could relaunch an agent while its orphaned predecessor on a legacy tmux socket
+// is still alive, reproducing the exact name collision this sweep exists to prevent. A failure
+// here must never block startup itself, only skip this run's cleanup.
+try {
+  const killedOrphanedSessions = await reconcileLegacyTmuxSockets(tmuxTmpdirRecordPath);
+  if (killedOrphanedSessions.length > 0) {
+    console.warn(
+      `[server] killed ${killedOrphanedSessions.length} orphaned dashboard session(s) on legacy tmux sockets: ${killedOrphanedSessions.join(", ")}`
+    );
+  }
+} catch (error: unknown) {
+  console.warn(`[server] legacy tmux socket sweep failed: ${describeError(error)}`);
+}
 
 httpServer.listen(serverPort, serverHost, () => {
   console.log(`[server] listening on http://${serverHost}:${serverPort}`);

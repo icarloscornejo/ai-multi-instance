@@ -73,8 +73,10 @@ function darwinUserTempDir() {
 // ~/Library/Caches, which any cache-sweeping tool is entitled to clear on its own schedule).
 //
 // One-time cost, same as the previous move off /tmp: the first server start after this lands
-// looks at the new path, finds no server, and recreates the sessions once. From then on they
-// are stable.
+// looks at the new path, finds no server, and recreates the sessions once. The sessions still
+// alive on the OLD path are then orphaned there; server/src/tmux.ts's reconcileLegacyTmuxSockets
+// sweeps and kills them on the next start (see index.ts), so they don't linger and trip the
+// CLI's own live-name-collision check.
 export function resolveTmuxTmpdir(env = process.env) {
   // Honor an explicit TMUX_TMPDIR the user set deliberately, as long as it works.
   if (env.TMUX_TMPDIR && isWritable(env.TMUX_TMPDIR)) {

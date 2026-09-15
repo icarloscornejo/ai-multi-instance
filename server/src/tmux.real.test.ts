@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,9 +9,11 @@ import {
   createSession,
   getSessionPresence,
   isSessionInitIncomplete,
+  killOrphanedDashboardSessions,
   killSession,
   markSessionInitComplete,
   markSessionLaunching,
+  reconcileLegacyTmuxSockets,
 } from "./tmux";
 
 const execFileAsync = promisify(execFile);
@@ -163,5 +165,95 @@ describe("getSessionPresence with no server (real tmux, ENOENT)", () => {
 
   it("classifies a missing socket as 'absent', not 'unknown' (the deadlock this fix exists for)", async () => {
     expect(await getSessionPresence("ccdash-does-not-exist")).toBe("absent");
+  });
+});
+
+// Own isolated pair of TMUX_TMPDIRs: the "current" one (never gets a server started in it, so
+// killOrphanedDashboardSessions has nothing of its own to accidentally sweep) and a separate
+// "legacy" one with a real tmux server holding both a ccdash-* session and a non-dashboard
+// session, so the prefix filter and the never-kill-server guarantee are both exercised for real.
+describe("killOrphanedDashboardSessions / reconcileLegacyTmuxSockets (real tmux)", () => {
+  let currentSocketDir: string;
+  let legacySocketDir: string;
+  let legacySocketPath: string;
+  let previousTmuxTmpdir: string | undefined;
+  let previousTmux: string | undefined;
+  let previousTmuxPane: string | undefined;
+
+  beforeAll(async () => {
+    currentSocketDir = await mkdtemp(join(tmpdir(), "ccdash-tmux-current-"));
+    legacySocketDir = await mkdtemp(join(tmpdir(), "ccdash-tmux-legacy-"));
+    legacySocketPath = join(legacySocketDir, `tmux-${process.getuid?.() ?? 501}`, "default");
+    previousTmuxTmpdir = process.env.TMUX_TMPDIR;
+    previousTmux = process.env.TMUX;
+    previousTmuxPane = process.env.TMUX_PANE;
+    process.env.TMUX_TMPDIR = currentSocketDir;
+    delete process.env.TMUX;
+    delete process.env.TMUX_PANE;
+  });
+
+  afterAll(async () => {
+    if (previousTmuxTmpdir === undefined) {
+      delete process.env.TMUX_TMPDIR;
+    } else {
+      process.env.TMUX_TMPDIR = previousTmuxTmpdir;
+    }
+    if (previousTmux !== undefined) process.env.TMUX = previousTmux;
+    if (previousTmuxPane !== undefined) process.env.TMUX_PANE = previousTmuxPane;
+    if (existsSync(legacySocketPath)) {
+      await execFileAsync("tmux", ["-S", legacySocketPath, "kill-server"]).catch(() => undefined);
+    }
+    await rm(currentSocketDir, { recursive: true, force: true });
+    await rm(legacySocketDir, { recursive: true, force: true });
+  });
+
+  // Started via TMUX_TMPDIR (matching how the real dashboard's own createSession launches a
+  // server, and how killOrphanedDashboardSessions expects to find one - see tmux.ts), not "-S"
+  // with a hand-built path: "-S" treats its argument as the literal socket FILE and never
+  // creates a missing parent directory, so a bare "-S <dir>/tmux-<uid>/default" against a
+  // fresh mkdtemp silently fails to bind while still reporting success.
+  async function startLegacySessions(): Promise<void> {
+    const legacyEnv: NodeJS.ProcessEnv = { ...process.env, TMUX_TMPDIR: legacySocketDir };
+    delete legacyEnv.TMUX;
+    delete legacyEnv.TMUX_PANE;
+    await execFileAsync("tmux", ["new-session", "-d", "-s", "ccdash-orphan", "-c", tmpdir()], { env: legacyEnv });
+    await execFileAsync("tmux", ["new-session", "-d", "-s", "keep-me", "-c", tmpdir()], { env: legacyEnv });
+  }
+
+  it("kills only the ccdash-* session on a legacy socket, leaving a non-dashboard session alive", async () => {
+    await startLegacySessions();
+    try {
+      const killed = await killOrphanedDashboardSessions([legacySocketDir]);
+      expect(killed).toEqual([`${legacySocketPath}:ccdash-orphan`]);
+
+      await expect(execFileAsync("tmux", ["-S", legacySocketPath, "has-session", "-t", "ccdash-orphan"])).rejects.toThrow();
+      await expect(execFileAsync("tmux", ["-S", legacySocketPath, "has-session", "-t", "keep-me"])).resolves.toBeTruthy();
+    } finally {
+      await execFileAsync("tmux", ["-S", legacySocketPath, "kill-session", "-t", "keep-me"]).catch(() => undefined);
+    }
+  });
+
+  it("never touches the current TMUX_TMPDIR even if it's also passed as a legacy dir", async () => {
+    const killed = await killOrphanedDashboardSessions([currentSocketDir]);
+    expect(killed).toEqual([]);
+  });
+
+  it("skips a legacy dir that has no socket at all", async () => {
+    const nonexistentDirectory = join(legacySocketDir, "never-created");
+    const killed = await killOrphanedDashboardSessions([nonexistentDirectory]);
+    expect(killed).toEqual([]);
+  });
+
+  it("reconcileLegacyTmuxSockets sweeps the recorded prior TMUX_TMPDIR and records the current one", async () => {
+    await startLegacySessions();
+    const recordPath = join(currentSocketDir, "tmux-tmpdir.txt");
+    await writeFile(recordPath, legacySocketDir, "utf8");
+    try {
+      const killed = await reconcileLegacyTmuxSockets(recordPath);
+      expect(killed).toEqual([`${legacySocketPath}:ccdash-orphan`]);
+      expect((await readFile(recordPath, "utf8")).trim()).toBe(currentSocketDir);
+    } finally {
+      await execFileAsync("tmux", ["-S", legacySocketPath, "kill-session", "-t", "keep-me"]).catch(() => undefined);
+    }
   });
 });

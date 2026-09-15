@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -359,4 +360,96 @@ export async function killSession(sessionName: string): Promise<void> {
 // the terminal; this reads the pane's live directory instead of the one it started in.
 export async function getPaneCurrentPath(sessionName: string): Promise<string> {
   return runTmux(["display-message", "-p", "-t", sessionName, "#{pane_current_path}"]);
+}
+
+// TMUX_TMPDIRs the dashboard pinned before the current one (see resolveTmuxTmpdir in
+// scripts/with-writable-tmpdir.mjs). Anything ccdash-* still alive there is unreachable from
+// this server yet keeps its agent running, and the CLI's own name-collision check (which
+// validates the PID is genuinely alive) counts it as a live duplicate.
+const HISTORICAL_TMUX_TMPDIRS: readonly string[] = ["/tmp", join(homedir(), ".cache", "ai-multi-instance", "tmux")];
+
+const DASHBOARD_SESSION_NAME_PATTERN = /^ccdash-/;
+
+// Best-effort resolution: a legacy dir that doesn't exist yet must not make a real legacy dir
+// further down the list get skipped, so a raw string (not the resolved path) is the fallback
+// rather than throwing or dropping the entry.
+function resolveDirectoryPath(directoryPath: string): string {
+  try {
+    return realpathSync(directoryPath);
+  } catch {
+    return directoryPath;
+  }
+}
+
+// Kills every ccdash-* session found on each given legacy TMUX_TMPDIR, skipping whichever one
+// resolves to the CURRENT TMUX_TMPDIR (that socket is live, not legacy) and de-duplicating by
+// resolved path. Never touches a session outside the ccdash- prefix and never runs kill-server:
+// /tmp is the user's own default tmux socket and can hold sessions of theirs unrelated to this
+// dashboard. Returns "<socketPath>:<sessionName>" for everything it killed.
+export async function killOrphanedDashboardSessions(legacyTmuxTmpdirs: readonly string[]): Promise<string[]> {
+  const currentTmuxTmpdir = resolveDirectoryPath(process.env.TMUX_TMPDIR ?? "/tmp");
+  const seenDirectories = new Set<string>();
+  const killed: string[] = [];
+
+  for (const rawLegacyDirectory of legacyTmuxTmpdirs) {
+    const resolvedLegacyDirectory = resolveDirectoryPath(rawLegacyDirectory);
+    if (resolvedLegacyDirectory === currentTmuxTmpdir || seenDirectories.has(resolvedLegacyDirectory)) {
+      continue;
+    }
+    seenDirectories.add(resolvedLegacyDirectory);
+
+    const socketPath = join(rawLegacyDirectory, `tmux-${process.getuid?.() ?? "0"}`, "default");
+    if (!existsSync(socketPath)) {
+      continue;
+    }
+
+    let sessionNames: string[];
+    try {
+      const output = await runTmux(["-S", socketPath, "list-sessions", "-F", "#{session_name}"]);
+      sessionNames = output.split("\n").filter((line) => line.length > 0);
+    } catch {
+      // No server on this socket, or it's wedged - nothing this sweep can safely do about it.
+      continue;
+    }
+
+    for (const sessionName of sessionNames.filter((name) => DASHBOARD_SESSION_NAME_PATTERN.test(name))) {
+      try {
+        await runTmux(["-S", socketPath, "kill-session", "-t", sessionName]);
+        killed.push(`${socketPath}:${sessionName}`);
+      } catch (error) {
+        console.warn(
+          `[server] failed to kill orphaned dashboard session ${sessionName} on ${socketPath}:`,
+          (error as Error).message
+        );
+      }
+    }
+  }
+
+  return killed;
+}
+
+// Sweeps every TMUX_TMPDIR this dashboard is known to have used before the current one - the
+// hardcoded historical paths plus whatever the previous start recorded - so an explicit
+// TMUX_TMPDIR change (not just an upgrade to a new hardcoded default) also gets reconciled.
+// Records the current TMUX_TMPDIR for the next start to read back.
+export async function reconcileLegacyTmuxSockets(recordPath: string): Promise<string[]> {
+  let previouslyRecordedTmuxTmpdir = "";
+  try {
+    previouslyRecordedTmuxTmpdir = readFileSync(recordPath, "utf8").trim();
+  } catch {
+    // No record yet - first start, or the file was never written. Fine either way.
+  }
+
+  const legacyTmuxTmpdirs = [...HISTORICAL_TMUX_TMPDIRS, previouslyRecordedTmuxTmpdir].filter(
+    (value) => value.length > 0
+  );
+  const killed = await killOrphanedDashboardSessions(legacyTmuxTmpdirs);
+
+  try {
+    writeFileSync(recordPath, process.env.TMUX_TMPDIR ?? "/tmp", "utf8");
+  } catch (error) {
+    console.warn(`[server] failed to record TMUX_TMPDIR at ${recordPath}:`, (error as Error).message);
+  }
+
+  return killed;
 }
