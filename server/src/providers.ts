@@ -95,7 +95,9 @@ function buildCodexCommand(instance: InstanceRecord, sessionId?: string): string
     quoteForShell(String(Date.now())),
     "& )",
   ].join(" ");
-  return `${watcher} ${cliParts.join(" ")}`;
+  // A compound command like "(... &)" needs a statement separator before the next
+  // command on the same line - without it, zsh/bash both fail with a parse error.
+  return `${watcher}; ${cliParts.join(" ")}`;
 }
 
 function buildCursorCommand(instance: InstanceRecord, sessionId?: string): string {

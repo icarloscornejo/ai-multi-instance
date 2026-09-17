@@ -1,3 +1,4 @@
+import { execSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { buildProviderLaunchCommand, PROVIDERS, quoteForShell, sessionKeyFor } from "./providers";
 import type { AgentProvider, InstanceRecord } from "./types";
@@ -37,7 +38,14 @@ describe("provider launch commands", () => {
 
   it("backgrounds the Codex session watcher inside a subshell, so its exit produces no job notification in the pane", () => {
     const command = buildProviderLaunchCommand(instance("codex"));
-    expect(command).toMatch(/^\( AI_MULTI_INSTANCE_ID='instance-1' node .*codex-session-watcher\.mjs.*& \) 'codex'/);
+    expect(command).toMatch(/^\( AI_MULTI_INSTANCE_ID='instance-1' node .*codex-session-watcher\.mjs.*& \); 'codex'/);
+  });
+
+  it("separates the backgrounded watcher subshell from the Codex command with a statement terminator", () => {
+    // "(... &) codex" without a separator is a shell syntax error in both bash and zsh -
+    // a compound command can't be followed directly by another command on the same line.
+    const command = buildProviderLaunchCommand(instance("codex"));
+    execSync(`zsh -n -c ${quoteForShell(command)}`);
   });
 
   it("resumes Cursor with its chat ID", () => {
