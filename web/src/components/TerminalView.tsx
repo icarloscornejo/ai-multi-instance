@@ -7,6 +7,7 @@ import { useWakeRetry } from "../hooks/useWakeRetry";
 import { FONT_SIZE_CHANGE_EVENT, getHostFontSize, setHostFontSize } from "../hostPrefs";
 import { PROVIDER_OPTIONS } from "../providerOptions";
 import { INITIAL_RECONNECT_STATE, reduceConnection, type ReconnectState } from "../reconnectPolicy";
+import { hasVisibleText } from "../terminalPaint";
 import { btnGhost } from "../ui";
 import { RetryRing } from "./RetryRing";
 import type { Instance } from "../types";
@@ -338,6 +339,31 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   // TerminalViewProps.awaitingAgentReady's own comment for why. Flipped to false either by the
   // server's ready frame (socket.onmessage below) or by the fallback timeout right below.
   const [agentBooting, setAgentBooting] = useState<boolean>(awaitingAgentReady);
+  // Mirrors agentBooting for revealIfPainted below, which runs from xterm's onWriteParsed
+  // and from the socket's onmessage - both live in effects that must not re-run on every
+  // agentBooting flip, so they read this ref instead of closing over the state value.
+  const agentBootingRef = useRef(agentBooting);
+  agentBootingRef.current = agentBooting;
+  // True once the server's ready frame has arrived for this launch - see socket.onmessage
+  // below. Persists across reconnects (a ref, not state reset by any effect) since a launch
+  // is only ever "seen ready" once.
+  const readyFrameSeenRef = useRef(false);
+  // Reveals the terminal only once BOTH the server says the agent is ready AND the agent has
+  // actually painted something into the current viewport - see terminalPaint.ts's own
+  // comment for why only the viewport (not scrollback) counts. Stable across renders (no
+  // deps) so it can be registered once on the Terminal instance (onWriteParsed, below) and
+  // also called from the socket effect without either effect needing to depend on it.
+  const revealIfPainted = useCallback((): void => {
+    const terminal = terminalRef.current;
+    if (
+      agentBootingRef.current &&
+      readyFrameSeenRef.current &&
+      terminal !== null &&
+      hasVisibleText(terminal.buffer.active, terminal.rows)
+    ) {
+      setAgentBooting(false);
+    }
+  }, []);
   useEffect(() => {
     if (!agentBooting) return;
     // ponytail: a hard ceiling, not a confirmation of anything - the server has its own,
@@ -585,6 +611,12 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
         socket.send(JSON.stringify({ type: "input", data: typedData }));
       }
     });
+
+    // Fires after every write is parsed into the buffer - the cheapest hook available to
+    // notice "the agent just painted something" without polling. revealIfPainted no-ops
+    // instantly once agentBootingRef is false, so this costs nothing for the rest of the
+    // session.
+    terminal.onWriteParsed(revealIfPainted);
 
     terminal.onResize(({ cols, rows }: { cols: number; rows: number }) => {
       const socket = socketRef.current;
@@ -976,10 +1008,15 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       // A binary frame is either the server's heartbeat pong (empty, see PONG_FRAME in
       // terminal.ts) or the agent-ready signal (a single byte, see AGENT_READY_FRAME) -
       // Blob.size distinguishes them synchronously, no need to read either frame's content.
-      // setAgentBooting is a stable setState setter, so reading it here does not need to be
-      // in this effect's own dependency list.
       if (event.data instanceof Blob && event.data.size > 0) {
-        setAgentBooting(false);
+        readyFrameSeenRef.current = true;
+        // Not a synchronous check: xterm queues write() calls and parses them on a later
+        // tick (see @xterm/xterm's WriteBuffer), so text already sent before this frame
+        // (e.g. instance-loader.sh's `clear`) may not be applied to the buffer yet. An empty
+        // write with a callback is a FIFO barrier - it only runs once everything queued
+        // ahead of it has been parsed, so revealIfPainted here sees the buffer's true state
+        // instead of racing it.
+        terminalRef.current?.write("", revealIfPainted);
       }
     };
     // A real disconnect (server restart from tsx watch, self-update, etc.) keeps retrying

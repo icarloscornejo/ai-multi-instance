@@ -75,11 +75,12 @@ const AGENT_READY_FRAME = new Uint8Array([1]);
 // the terminal anyway (see markAgentReady's call site in watchForAgentReady) - a silent or
 // crashed launch must not hide the terminal forever.
 const AGENT_READY_WAIT_TIMEOUT_MS = 20_000;
-// ponytail: a fixed grace period after the wait-for signal, not a confirmation that this
-// specific browser has actually rendered anything yet - the real command has only just been
-// handed control of the pane at that point. Upgrade path if this ever reads as noticeably
-// early/late: have the client itself report back its first post-boot paint instead of relying
-// on server-side timing.
+// Not an estimate of when the agent paints (the client decides that itself, see
+// hasVisibleText/onWriteParsed in TerminalView.tsx) - purely an ordering cushion. The pane's
+// pre-launch bytes (instance-loader.sh's own `clear`) travel through the attach's own pty
+// stream, while this ready frame travels through tmux's wait-for channel plus this sleep;
+// without some cushion here, a client fast enough could see the ready frame before the
+// `clear` reaches it and read the agent's OLD prompt as "already painted".
 const AGENT_READY_GRACE_MS = 400;
 
 interface InitialSize {
@@ -386,20 +387,12 @@ type SessionProgressStep = "create-session" | "launch-agent";
 // instance stuck at "booting" with nothing left to resolve it besides the client's own
 // fallback timeout.
 function watchForAgentReady(instance: InstanceRecord, channelName: string): void {
-  // TEMP debug instrumentation for the Mac Sephora blank-prompt-flash edge case - remove once
-  // that edge case is understood. Correlates with instance-loader.sh's own [channelName]-keyed
-  // lines in /tmp/ccdash-boot-debug.log on the machine actually running the agent.
-  const startedAt = Date.now();
   void (async () => {
     const signaled = await waitForChannelSignal(channelName, AGENT_READY_WAIT_TIMEOUT_MS);
-    console.log(
-      `[agent-boot] wait-for ${signaled ? "signaled" : "timeout"} instance=${instance.id} channel=${channelName} +${Date.now() - startedAt}ms`
-    );
     if (signaled) {
       await sleep(AGENT_READY_GRACE_MS);
     }
     markAgentReady(instance.id, channelName);
-    console.log(`[agent-boot] marked ready instance=${instance.id} +${Date.now() - startedAt}ms`);
   })();
 }
 
@@ -577,11 +570,6 @@ export async function bridgeTerminal(
   attachBuffer: AttachBuffer,
   stopBuffering: () => void
 ): Promise<void> {
-  // TEMP debug instrumentation for the Mac Sephora blank-prompt-flash edge case - remove once
-  // that edge case is understood. Tracks the gap between the ready frame reaching this socket
-  // (overlay hides) and the pty's own next bytes (what the client actually has to show instead).
-  let readyFrameSentAt: number | null = null;
-  let bootChunksLogged = 0;
   // Locations are validated at instance-creation time (see routes.ts) but never again;
   // a folder deleted, unmounted, or renamed afterward otherwise surfaces as a raw
   // tmux/pty spawn failure instead of a message that explains what actually happened.
@@ -656,8 +644,6 @@ export async function bridgeTerminal(
       try {
         if (socket.readyState === socket.OPEN) {
           socket.send(AGENT_READY_FRAME);
-          readyFrameSentAt = Date.now();
-          console.log(`[agent-boot] ready frame sent instance=${instance.id}`);
         }
       } catch {
         // A broken socket must not stop this instance's OTHER waiting sockets from
@@ -689,16 +675,6 @@ export async function bridgeTerminal(
 
   attachProcess.onData((outputChunk: string) => {
     try {
-      if (
-        readyFrameSentAt !== null &&
-        bootChunksLogged < 20 &&
-        Date.now() - readyFrameSentAt < 5000
-      ) {
-        bootChunksLogged += 1;
-        console.log(
-          `[agent-boot] pty chunk +${Date.now() - readyFrameSentAt}ms ${outputChunk.length}B ${JSON.stringify(outputChunk.slice(0, 40))}`
-        );
-      }
       if (socket.readyState === socket.OPEN) {
         socket.send(outputChunk);
       }
