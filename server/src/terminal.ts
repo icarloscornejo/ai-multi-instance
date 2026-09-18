@@ -386,12 +386,20 @@ type SessionProgressStep = "create-session" | "launch-agent";
 // instance stuck at "booting" with nothing left to resolve it besides the client's own
 // fallback timeout.
 function watchForAgentReady(instance: InstanceRecord, channelName: string): void {
+  // TEMP debug instrumentation for the Mac Sephora blank-prompt-flash edge case - remove once
+  // that edge case is understood. Correlates with instance-loader.sh's own [channelName]-keyed
+  // lines in /tmp/ccdash-boot-debug.log on the machine actually running the agent.
+  const startedAt = Date.now();
   void (async () => {
     const signaled = await waitForChannelSignal(channelName, AGENT_READY_WAIT_TIMEOUT_MS);
+    console.log(
+      `[agent-boot] wait-for ${signaled ? "signaled" : "timeout"} instance=${instance.id} channel=${channelName} +${Date.now() - startedAt}ms`
+    );
     if (signaled) {
       await sleep(AGENT_READY_GRACE_MS);
     }
     markAgentReady(instance.id, channelName);
+    console.log(`[agent-boot] marked ready instance=${instance.id} +${Date.now() - startedAt}ms`);
   })();
 }
 
@@ -569,6 +577,11 @@ export async function bridgeTerminal(
   attachBuffer: AttachBuffer,
   stopBuffering: () => void
 ): Promise<void> {
+  // TEMP debug instrumentation for the Mac Sephora blank-prompt-flash edge case - remove once
+  // that edge case is understood. Tracks the gap between the ready frame reaching this socket
+  // (overlay hides) and the pty's own next bytes (what the client actually has to show instead).
+  let readyFrameSentAt: number | null = null;
+  let bootChunksLogged = 0;
   // Locations are validated at instance-creation time (see routes.ts) but never again;
   // a folder deleted, unmounted, or renamed afterward otherwise surfaces as a raw
   // tmux/pty spawn failure instead of a message that explains what actually happened.
@@ -643,6 +656,8 @@ export async function bridgeTerminal(
       try {
         if (socket.readyState === socket.OPEN) {
           socket.send(AGENT_READY_FRAME);
+          readyFrameSentAt = Date.now();
+          console.log(`[agent-boot] ready frame sent instance=${instance.id}`);
         }
       } catch {
         // A broken socket must not stop this instance's OTHER waiting sockets from
@@ -674,6 +689,16 @@ export async function bridgeTerminal(
 
   attachProcess.onData((outputChunk: string) => {
     try {
+      if (
+        readyFrameSentAt !== null &&
+        bootChunksLogged < 20 &&
+        Date.now() - readyFrameSentAt < 5000
+      ) {
+        bootChunksLogged += 1;
+        console.log(
+          `[agent-boot] pty chunk +${Date.now() - readyFrameSentAt}ms ${outputChunk.length}B ${JSON.stringify(outputChunk.slice(0, 40))}`
+        );
+      }
       if (socket.readyState === socket.OPEN) {
         socket.send(outputChunk);
       }

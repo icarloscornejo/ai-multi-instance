@@ -43,8 +43,20 @@ case "$_ail_channel_raw" in
     ;;
 esac
 
+# TEMP debug instrumentation for the Mac Sephora blank-prompt-flash edge case - writes to a
+# FILE, never to the pane, so it does not violate the "nothing printed" contract above. Keyed
+# by the ready channel name (unique per launch, see buildReadyChannelName) so it lines up with
+# the matching [agent-boot] lines in the server's own log. Remove once that edge case is understood.
+zmodload zsh/datetime 2>/dev/null
+_ail_debug() {
+  printf '%s %s %s\n' "${EPOCHREALTIME:-$(date +%s)}" "${_ail_ready_channel:-no-channel}" "$1" \
+    >> /tmp/ccdash-boot-debug.log 2>/dev/null
+}
+_ail_debug loader-start
+
 if [ -z "$_ail_launch_command" ]; then
   printf '\033[31mNo se encontro el comando de lanzamiento (AI_LAUNCH_COMMAND vacio o no seteado).\033[0m\n'
+  unset -f _ail_debug
   unset _ail_raw _ail_channel_raw _ail_launch_command _ail_ready_channel
   return 1
 fi
@@ -53,8 +65,14 @@ clear
 
 # Defensive: an old/relaunched instance with no channel set must still boot normally instead
 # of failing here - the dashboard's overlay just falls back to its own timeout in that case.
-[ -n "$_ail_ready_channel" ] && tmux wait-for -S "$_ail_ready_channel" 2>/dev/null
+if [ -n "$_ail_ready_channel" ]; then
+  tmux wait-for -S "$_ail_ready_channel" 2>/dev/null
+  _ail_debug signal-sent
+fi
 
+_ail_debug eval-start
 eval "$_ail_launch_command"
+_ail_debug eval-exit
 
+unset -f _ail_debug
 unset _ail_raw _ail_channel_raw _ail_launch_command _ail_ready_channel
