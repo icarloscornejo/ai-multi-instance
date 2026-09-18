@@ -1,9 +1,14 @@
 import { useEffect, useState } from "react";
 import { api, ApiError } from "../api";
+import { retryDelayMs } from "../retry";
 import type { UpdateStatus } from "../types";
 import { btnGhost, btnPrimary, iconBtnClassName } from "../ui";
 import { Modal } from "./Modal";
 import { ResetConfirmModal } from "./ResetConfirmModal";
+
+// ~250+500+1000+2000ms = up to 3.75s of silent retrying before falling back to the manual
+// "No connection. Retry" state - see runApply's own comment for what this covers.
+const APPLY_RESTART_RETRY_ATTEMPTS = 4;
 
 interface UpdateScreenProps {
   initialStatus: UpdateStatus | null;
@@ -146,20 +151,44 @@ export function UpdateScreen({ initialStatus, autoApply = false, onStatusChange,
       });
   };
 
-  const runApply = (): void => {
+  const runApply = async (): Promise<void> => {
     setPhase("applying");
     setErrorMessage(null);
-    api
-      .applyUpdate()
-      .then((result) => {
+    try {
+      const result = await api.applyUpdate();
+      setStatus(result);
+      onStatusChange(result);
+      setPhase("idle");
+      return;
+    } catch (error) {
+      if (error instanceof ApiError) {
+        setErrorMessage(error.message);
+        setPhase("idle");
+        return;
+      }
+      // Not an ApiError: a raw network failure, most likely `tsx watch` restarting the dev
+      // server mid-request because the update it just applied touched server/src (see
+      // updateTransaction.ts's own comment on this exact race). The update itself already
+      // succeeded in the detached child; recheck instead of reporting a false failure.
+    }
+    for (let attempt = 0; attempt < APPLY_RESTART_RETRY_ATTEMPTS; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs(attempt)));
+      try {
+        const result = await api.checkForUpdate();
         setStatus(result);
         onStatusChange(result);
         setPhase("idle");
-      })
-      .catch((error) => {
-        setErrorMessage(error instanceof ApiError ? error.message : "Could not apply the update.");
-        setPhase("idle");
-      });
+        return;
+      } catch (error) {
+        if (error instanceof ApiError) {
+          setErrorMessage(error.message);
+          setPhase("idle");
+          return;
+        }
+      }
+    }
+    setErrorMessage("Could not apply the update.");
+    setPhase("idle");
   };
 
   useEffect(() => {
