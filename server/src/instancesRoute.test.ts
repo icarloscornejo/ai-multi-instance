@@ -1,3 +1,6 @@
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { AddressInfo } from "node:net";
 import express from "express";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -13,15 +16,32 @@ import type { DashboardState, InstanceRecord } from "./types";
 vi.mock("./store", () => {
   const loadStateMock = vi.fn();
   const saveStateMock = vi.fn();
+  // Serialized through a promise chain exactly like store.ts's updateQueueTail: without it
+  // this mock would let two overlapping updateState calls both read the same snapshot, which
+  // the real store never does, and a lost-update regression test could not fail.
+  let updateQueueTail: Promise<unknown> = Promise.resolve();
+  const runOneUpdate = async (
+    mutator: (draft: DashboardState) => Promise<{ result: unknown; nextState?: DashboardState }>
+  ): Promise<unknown> => {
+    const current = (await loadStateMock()) as DashboardState;
+    const draft = structuredClone(current);
+    const outcome = await mutator(draft);
+    if (outcome.nextState !== undefined) {
+      await saveStateMock(outcome.nextState);
+    }
+    return outcome.result;
+  };
   const updateStateMock = vi.fn(
     async (mutator: (draft: DashboardState) => Promise<{ result: unknown; nextState?: DashboardState }>) => {
-      const current = (await loadStateMock()) as DashboardState;
-      const draft = structuredClone(current);
-      const outcome = await mutator(draft);
-      if (outcome.nextState !== undefined) {
-        await saveStateMock(outcome.nextState);
-      }
-      return outcome.result;
+      const myTurn: Promise<unknown> = updateQueueTail.then(
+        () => runOneUpdate(mutator),
+        () => runOneUpdate(mutator)
+      );
+      updateQueueTail = myTurn.then(
+        () => undefined,
+        () => undefined
+      );
+      return myTurn;
     }
   );
   return { loadState: loadStateMock, saveState: saveStateMock, updateState: updateStateMock };
@@ -362,4 +382,134 @@ describe("DELETE /instances/:id", () => {
     // its own updateState commit, separate from the delete-or-not decision below it).
     expect(vi.mocked(saveState)).not.toHaveBeenCalled();
   }, 10_000);
+});
+
+// Every route that changes state must go through updateState's queue. These run against a
+// stateful in-memory store whose saveState is slow, so a route that still did its own
+// loadState + saveState would read a snapshot that a concurrent commit is about to replace,
+// and its later save would silently undo that commit (a lost update).
+describe("concurrent writers never lose each other's commits", () => {
+  let committedState: DashboardState;
+  let temporaryHomeDirectory: string;
+
+  const patchInstanceRequest = (id: string, body: Record<string, unknown>): Promise<Response> =>
+    fetch(`${baseUrl}/instances/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+  const reorderRequest = (order: string[]): Promise<Response> =>
+    fetch(`${baseUrl}/instances/order`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ order }),
+    });
+
+  beforeEach(async () => {
+    committedState = {
+      ...baseState(),
+      instances: [
+        makeRunningInstance({ id: "aaa111", label: "first", tmuxSession: "ccdash-aaa111" }),
+        makeRunningInstance({ id: "bbb222", label: "second", tmuxSession: "ccdash-bbb222" }),
+        makeRunningInstance({ id: "ccc333", label: "third", tmuxSession: "ccdash-ccc333" }),
+      ],
+    } as DashboardState;
+    vi.mocked(loadState).mockImplementation(async () => committedState);
+    vi.mocked(saveState).mockImplementation(async (nextState: DashboardState) => {
+      // Slow write, then publish: the window in which a bare loadState still sees old data.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      committedState = structuredClone(nextState);
+    });
+    temporaryHomeDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "ccdash-home-"));
+    vi.spyOn(os, "homedir").mockReturnValue(temporaryHomeDirectory);
+  });
+
+  afterEach(async () => {
+    await fs.rm(temporaryHomeDirectory, { recursive: true, force: true });
+  });
+
+  // A commit from "another device": goes through the real-shaped updateState queue and, because
+  // saveState is slow, is still in flight when the route under test starts. Not awaited here.
+  const commitFromOtherDevice = (): Promise<unknown> =>
+    updateState(async (draft) => {
+      draft.instances = draft.instances.filter((instance) => instance.id !== "ccc333");
+      return { result: undefined, nextState: draft };
+    });
+  const remainingAfterOtherDevice = ["aaa111", "bbb222"];
+
+  it("PATCH started while another commit is saving keeps both changes", async () => {
+    const otherDevice = commitFromOtherDevice();
+    const patchResponse = await patchInstanceRequest("aaa111", { label: "renamed" });
+    await otherDevice;
+    expect(patchResponse.status).toBe(200);
+    expect(committedState.instances.map((instance) => [instance.id, instance.label])).toEqual([
+      ["aaa111", "renamed"],
+      ["bbb222", "second"],
+    ]);
+  });
+
+  it("reorder started while another commit is saving does not resurrect what it removed", async () => {
+    const otherDevice = commitFromOtherDevice();
+    // Built from the pre-commit list: stale by the time it runs, so it must be rejected
+    // (a bare loadState/saveState would accept it and bring ccc333 back).
+    const reorderResponse = await reorderRequest(["ccc333", "bbb222", "aaa111"]);
+    await otherDevice;
+    expect(reorderResponse.status).toBe(400);
+    expect(committedState.instances.map((instance) => instance.id)).toEqual(remainingAfterOtherDevice);
+  });
+
+  it("a reorder matching the latest list still applies after another commit", async () => {
+    const otherDevice = commitFromOtherDevice();
+    const reorderResponse = await reorderRequest(["bbb222", "aaa111"]);
+    await otherDevice;
+    expect(reorderResponse.status).toBe(200);
+    expect(committedState.instances.map((instance) => instance.id)).toEqual(["bbb222", "aaa111"]);
+  });
+
+  it("PUT /config started while another commit is saving keeps both changes", async () => {
+    const otherDevice = commitFromOtherDevice();
+    const configResponse = await fetch(`${baseUrl}/config`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ locations: ["/work/repo"], enabledProviders: ["claude"] }),
+    });
+    await otherDevice;
+    expect(configResponse.status).toBe(200);
+    expect(committedState.config.enabledProviders).toEqual(["claude"]);
+    expect(committedState.instances.map((instance) => instance.id)).toEqual(remainingAfterOtherDevice);
+  });
+
+  it("live-status saving a session id keeps a commit that was still saving", async () => {
+    const snapshotDirectory: string = path.join(temporaryHomeDirectory, "Library", "Application Support", "ai-multi-instance");
+    await fs.mkdir(snapshotDirectory, { recursive: true });
+    await fs.writeFile(path.join(snapshotDirectory, "aaa111.json"), JSON.stringify({ sessionId: "other-session" }));
+
+    const otherDevice = commitFromOtherDevice();
+    const liveStatusResponse = await fetch(`${baseUrl}/instances/aaa111/live-status`);
+    await otherDevice;
+    expect(liveStatusResponse.status).toBe(200);
+    expect(committedState.instances.map((instance) => instance.id)).toEqual(remainingAfterOtherDevice);
+    expect(committedState.instances.find((instance) => instance.id === "aaa111")?.sessionId).toBe("other-session");
+  });
+
+  it("live-status does not resurrect an instance deleted between its read and its save", async () => {
+    const snapshotDirectory: string = path.join(temporaryHomeDirectory, "Library", "Application Support", "ai-multi-instance");
+    await fs.mkdir(snapshotDirectory, { recursive: true });
+    await fs.writeFile(path.join(snapshotDirectory, "ccc333.json"), JSON.stringify({ sessionId: "late-session" }));
+
+    // ccc333 is deleted by the commit still saving; live-status then wants to record its session.
+    const otherDevice = commitFromOtherDevice();
+    await fetch(`${baseUrl}/instances/ccc333/live-status`);
+    await otherDevice;
+    expect(committedState.instances.map((instance) => instance.id)).toEqual(remainingAfterOtherDevice);
+    expect(committedState.sessionsByKey).toEqual({});
+  });
+
+  it("PATCH on an instance that was already deleted is a 404", async () => {
+    await commitFromOtherDevice();
+    const patchResponse = await patchInstanceRequest("ccc333", { label: "too late" });
+    expect(patchResponse.status).toBe(404);
+    expect(committedState.instances.map((instance) => instance.id)).toEqual(remainingAfterOtherDevice);
+  });
 });

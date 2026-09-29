@@ -7,7 +7,7 @@ import { AUTH_COOKIE_NAME, checkPassword, isAuthEnabled, issueToken, readCookie,
 import { clearAgentReadiness, getReadyChannel } from "./agentReadiness";
 import { isAgentProvider, PROVIDERS, sessionKeyFor } from "./providers";
 import { pathExists } from "./paths";
-import { loadState, saveState, updateState } from "./store";
+import { loadState, updateState } from "./store";
 import { getPaneCurrentPath, getSessionPresence, killSession, signalChannel } from "./tmux";
 import { isRemoteUnreachableError, NETWORK_GIT_TIMEOUT_MS, runGit } from "./git";
 import { LaunchProgress } from "./launchProgress";
@@ -395,18 +395,23 @@ apiRouter.put(
       }
     }
 
-    const state: DashboardState = await loadState();
-    let resolvedEnabledProviders = state.config.enabledProviders;
-    if (enabledProviders !== undefined) {
-      if (!Array.isArray(enabledProviders) || enabledProviders.length === 0 || !enabledProviders.every(isAgentProvider)) {
-        response.status(400).json({ error: "Provide at least one valid agent." });
-        return;
-      }
-      resolvedEnabledProviders = enabledProviders;
+    if (
+      enabledProviders !== undefined &&
+      (!Array.isArray(enabledProviders) || enabledProviders.length === 0 || !enabledProviders.every(isAgentProvider))
+    ) {
+      response.status(400).json({ error: "Provide at least one valid agent." });
+      return;
     }
-    state.config = { locations: resolvedLocations, enabledProviders: resolvedEnabledProviders };
-    await saveState(state);
-    response.json({ ...state.config, configured: true });
+    // Through updateState like every other writer: a bare loadState/saveState here could
+    // overwrite a create/delete/rename another device committed in between.
+    const savedConfig = await updateState(async (draft) => {
+      draft.config = {
+        locations: resolvedLocations,
+        enabledProviders: enabledProviders === undefined ? draft.config.enabledProviders : enabledProviders,
+      };
+      return { result: draft.config, nextState: draft };
+    });
+    response.json({ ...savedConfig, configured: true });
   })
 );
 
@@ -934,59 +939,78 @@ apiRouter.put(
       response.status(400).json({ error: "Provide the new id order." });
       return;
     }
-    const state: DashboardState = await loadState();
-    const currentIds: Set<string> = new Set(state.instances.map((instance) => instance.id));
-    const isExactPermutation: boolean =
-      order.length === currentIds.size && new Set(order).size === order.length && order.every((id) => currentIds.has(id));
-    if (!isExactPermutation) {
+    // The permutation check runs inside the mutator, against the latest committed instances:
+    // a create/delete from another device that landed first makes a stale order a 400 here
+    // instead of silently dropping or resurrecting an instance.
+    const outcome = await updateState(async (draft) => {
+      const currentIds: Set<string> = new Set(draft.instances.map((instance) => instance.id));
+      const isExactPermutation: boolean =
+        order.length === currentIds.size &&
+        new Set(order).size === order.length &&
+        order.every((id) => currentIds.has(id));
+      if (!isExactPermutation) {
+        return { result: null };
+      }
+      const instanceById: Map<string, InstanceRecord> = new Map(
+        draft.instances.map((instance) => [instance.id, instance])
+      );
+      draft.instances = (order as string[]).map((id) => instanceById.get(id) as InstanceRecord);
+      return { result: draft.instances, nextState: draft };
+    });
+    if (outcome === null) {
       response.status(400).json({ error: "The order must include exactly the current instance ids." });
       return;
     }
-    const instanceById: Map<string, InstanceRecord> = new Map(
-      state.instances.map((instance) => [instance.id, instance])
-    );
-    state.instances = (order as string[]).map((id) => instanceById.get(id) as InstanceRecord);
-    await saveState(state);
-    response.json(state.instances);
+    response.json(outcome);
   })
 );
 
 apiRouter.patch(
   "/instances/:id",
   wrapAsync(async (request, response) => {
-    const state: DashboardState = await loadState();
-    const instance = state.instances.find((candidate) => candidate.id === request.params.id);
-    if (instance === undefined) {
-      response.status(404).json({ error: "Instance not found." });
+    const payload = request.body as UpdateInstancePayload;
+    // Lookup, name-collision check and mutation all run inside updateState so they see the
+    // latest committed instances (a concurrent delete/rename from another device included).
+    const outcome = await updateState<
+      { instance: InstanceRecord } | { errorStatus: 404 | 409; error: string }
+    >(async (draft) => {
+      const instance = draft.instances.find((candidate) => candidate.id === request.params.id);
+      if (instance === undefined) {
+        return { result: { errorStatus: 404, error: "Instance not found." } };
+      }
+      if (typeof payload.label === "string" && payload.label.trim() !== "") {
+        const nextLabel: string = payload.label.trim();
+        const nameTaken: boolean = draft.instances.some(
+          (candidate) =>
+            candidate.id !== instance.id &&
+            candidate.locationPath === instance.locationPath &&
+            candidate.label === nextLabel
+        );
+        if (nameTaken) {
+          return {
+            result: { errorStatus: 409, error: `An instance named '${nextLabel}' is already running here` },
+          };
+        }
+        instance.label = nextLabel;
+      }
+      if (typeof payload.command === "string" && payload.command.trim() !== "") {
+        instance.command = payload.command.trim();
+      }
+      if (payload.model !== undefined) {
+        instance.model =
+          typeof payload.model === "string" && payload.model.trim() !== "" ? payload.model.trim() : null;
+      }
+      if (payload.effort !== undefined) {
+        instance.effort =
+          typeof payload.effort === "string" && payload.effort.trim() !== "" ? payload.effort.trim() : null;
+      }
+      return { result: { instance }, nextState: draft };
+    });
+    if ("errorStatus" in outcome) {
+      response.status(outcome.errorStatus).json({ error: outcome.error });
       return;
     }
-    const payload = request.body as UpdateInstancePayload;
-    if (typeof payload.label === "string" && payload.label.trim() !== "") {
-      const nextLabel: string = payload.label.trim();
-      const nameTaken: boolean = state.instances.some(
-        (candidate) =>
-          candidate.id !== instance.id &&
-          candidate.locationPath === instance.locationPath &&
-          candidate.label === nextLabel
-      );
-      if (nameTaken) {
-        response.status(409).json({ error: `An instance named '${nextLabel}' is already running here` });
-        return;
-      }
-      instance.label = nextLabel;
-    }
-    if (typeof payload.command === "string" && payload.command.trim() !== "") {
-      instance.command = payload.command.trim();
-    }
-    if (payload.model !== undefined) {
-      instance.model = typeof payload.model === "string" && payload.model.trim() !== "" ? payload.model.trim() : null;
-    }
-    if (payload.effort !== undefined) {
-      instance.effort =
-        typeof payload.effort === "string" && payload.effort.trim() !== "" ? payload.effort.trim() : null;
-    }
-    await saveState(state);
-    response.json(instance);
+    response.json(outcome.instance);
   })
 );
 
@@ -1028,9 +1052,18 @@ apiRouter.get(
       }
       const sessionId: unknown = snapshot.sessionId;
       if (typeof sessionId === "string" && sessionId !== "" && instance.sessionId !== sessionId) {
-        instance.sessionId = sessionId;
-        state.sessionsByKey[sessionKeyFor(instance.provider, instance.locationPath, instance.label)] = sessionId;
-        await saveState(state);
+        // Re-find the instance inside the transaction: the reads above are async, so a
+        // DELETE (or rename) from another device may have committed meanwhile. Saving the
+        // pre-read `state` here would resurrect a deleted instance or undo that change.
+        await updateState(async (draft) => {
+          const current = draft.instances.find((candidate) => candidate.id === instance.id);
+          if (current === undefined || current.sessionId === sessionId) {
+            return { result: undefined };
+          }
+          current.sessionId = sessionId;
+          draft.sessionsByKey[sessionKeyFor(current.provider, current.locationPath, current.label)] = sessionId;
+          return { result: undefined, nextState: draft };
+        });
       }
       response.json({ available: true, ...snapshot });
     } catch {

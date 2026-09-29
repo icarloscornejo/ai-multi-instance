@@ -35,6 +35,7 @@ import {
   resolveRestoredScreen,
   type MobileScreen,
 } from "./mobileSession";
+import { reconcileFetchedInstances, shouldApplyRefresh } from "./instanceSync";
 import { retryDelayMs } from "./retry";
 import type {
   CreateInstancePayload,
@@ -49,6 +50,13 @@ import type {
 // ServerErrorScreen is held back instead of shown immediately: flashing it for a blip that
 // clears in a few hundred ms is just noise. A real outage still surfaces it soon enough.
 const LOAD_FAILURE_DISPLAY_DELAY_MS = 1_500;
+
+// How often a visible tab re-reads the instance list so a change made from another device
+// (create, delete, rename, reorder) shows up without a manual reload.
+const INSTANCES_REFRESH_INTERVAL_MS = 5_000;
+// A GET that hangs (slow tunnel, dead connection) must not hold the single in-flight slot
+// forever, or every later poll would be skipped and the tab would never resync.
+const INSTANCES_REFRESH_TIMEOUT_MS = 10_000;
 
 export function App() {
   const [config, setConfig] = useState<DashboardConfig | null>(null);
@@ -107,6 +115,26 @@ export function App() {
   // effect (just below it) - both need to know the real instance list before they can safely act,
   // or they'd wrongly treat "still loading" the same as "there is no such instance".
   const [instancesLoaded, setInstancesLoaded] = useState<boolean>(false);
+  // Live mirrors for refreshInstances below, which is reached from a registered-once interval
+  // and wake handler and would otherwise close over the values from the render it was created in
+  // (an activeInstanceId of null from mount would make the first refresh deselect everything).
+  const instancesRef = useRef<Instance[]>([]);
+  instancesRef.current = instances;
+  const activeInstanceIdRef = useRef<string | null>(null);
+  activeInstanceIdRef.current = activeInstanceId;
+  const instancesLoadedRef = useRef<boolean>(false);
+  instancesLoadedRef.current = instancesLoaded;
+  const isMobileRef = useRef<boolean>(isMobile);
+  isMobileRef.current = isMobile;
+  const mobileScreenRef = useRef<MobileScreen>(mobileScreen);
+  mobileScreenRef.current = mobileScreen;
+  // Guard state for refreshInstances (see shouldApplyRefresh): `syncGeneration` moves whenever a
+  // refresh or a local mutation starts or ends, `pendingMutations` counts local mutations still
+  // in flight, and `refreshInFlight` keeps a single GET going at a time so a slow connection's
+  // response is never invalidated by the next tick before it can land.
+  const syncGenerationRef = useRef<number>(0);
+  const pendingMutationsRef = useRef<number>(0);
+  const refreshInFlightRef = useRef<boolean>(false);
   // True while the desktop rail has an inline rename open; suppresses the active terminal's
   // own visibility-focus so a rename on a just-selected row doesn't lose focus to xterm two
   // rAF later (see TerminalView's suppressAutoFocus prop).
@@ -244,11 +272,85 @@ export function App() {
     };
   }, []);
 
+  // Re-reads the instance list so this tab converges with what other devices did. Background
+  // and best-effort: a failure is ignored (the initial load owns the retry/error screens, and
+  // a 401 already opens the gate through the unauthorized handler), the next tick tries again.
+  const refreshInstances = useCallback((): void => {
+    if (
+      !instancesLoadedRef.current ||
+      document.hidden ||
+      refreshInFlightRef.current ||
+      pendingMutationsRef.current > 0
+    ) {
+      return;
+    }
+    refreshInFlightRef.current = true;
+    syncGenerationRef.current += 1;
+    const capturedGeneration: number = syncGenerationRef.current;
+    api
+      .listInstances(AbortSignal.timeout(INSTANCES_REFRESH_TIMEOUT_MS))
+      .then((fetchedInstances) => {
+        if (!shouldApplyRefresh(capturedGeneration, syncGenerationRef.current, pendingMutationsRef.current)) {
+          return;
+        }
+        const reconciled = reconcileFetchedInstances(
+          instancesRef.current,
+          fetchedInstances,
+          activeInstanceIdRef.current
+        );
+        if (reconciled.instances !== instancesRef.current) {
+          setInstances(reconciled.instances);
+        }
+        if (reconciled.activeInstanceId !== activeInstanceIdRef.current) {
+          setActiveInstanceId(reconciled.activeInstanceId);
+        }
+        // The terminal it was showing is gone: send mobile home explicitly, otherwise the
+        // next thing typed on the key bar would land in whatever terminal is left.
+        if (reconciled.activeRemoved && isMobileRef.current && mobileScreenRef.current === "terminal") {
+          setMobileScreen("home");
+        }
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        refreshInFlightRef.current = false;
+      });
+  }, []);
+
+  useEffect(() => {
+    if (!instancesLoaded) {
+      return;
+    }
+    const intervalId: number = window.setInterval(refreshInstances, INSTANCES_REFRESH_INTERVAL_MS);
+    return () => {
+      window.clearInterval(intervalId);
+      // Invalidate a response still in flight so it cannot land after this effect is gone.
+      syncGenerationRef.current += 1;
+    };
+  }, [instancesLoaded, refreshInstances]);
+
+  // Wraps every local create/update/reorder/delete request. While one is pending no refresh
+  // starts, and a refresh that began earlier is invalidated both when the mutation starts and
+  // when it ends, so a GET the server answered before committing the change can never roll the
+  // change back (or bring a just-deleted instance back).
+  const trackMutation = useCallback(async <T,>(run: () => Promise<T>): Promise<T> => {
+    pendingMutationsRef.current += 1;
+    syncGenerationRef.current += 1;
+    try {
+      return await run();
+    } finally {
+      pendingMutationsRef.current -= 1;
+      syncGenerationRef.current += 1;
+    }
+  }, []);
+
   // While a load failure is being retried on a backoff timer, coming back to the
   // foreground (or the network coming back) should not have to wait out the rest of
   // that delay: retry immediately and reset the backoff, same as a fresh failure would.
+  // With no failure pending, coming back to the foreground is exactly when this tab is most
+  // likely to be behind what other devices did, so it refreshes the instance list instead.
   useWakeRetry(() => {
     if (loadFailureRef.current === null) {
+      refreshInstances();
       return;
     }
     window.clearTimeout(loadRetryTimeoutIdRef.current);
@@ -467,8 +569,14 @@ export function App() {
     payload: CreateInstancePayload,
     onProgress?: (event: LaunchEvent) => void
   ): Promise<void> => {
-    const createdInstance: Instance = await api.createInstance(payload, onProgress);
-    setInstances((previousInstances) => [...previousInstances, createdInstance]);
+    const createdInstance: Instance = await trackMutation(() => api.createInstance(payload, onProgress));
+    // Replace-by-id rather than a blind append: the server saves the instance before the launch
+    // stream ends, so a refresh from another path could already have added this same id.
+    setInstances((previousInstances) =>
+      previousInstances.some((candidate) => candidate.id === createdInstance.id)
+        ? previousInstances.map((candidate) => (candidate.id === createdInstance.id ? createdInstance : candidate))
+        : [...previousInstances, createdInstance]
+    );
     setAwaitingAgentReadyIds((previousIds) => new Set(previousIds).add(createdInstance.id));
     setIsNewInstanceModalOpen(false);
     if (isMobile) {
@@ -484,17 +592,17 @@ export function App() {
         candidate.id === instanceId ? { ...candidate, ...normalizePayload(candidate, payload) } : candidate
       )
     );
-    api.updateInstance(instanceId, payload).catch((error: Error) => {
+    trackMutation(() => api.updateInstance(instanceId, payload)).catch((error: Error) => {
       console.error("Could not save the change:", error.message);
     });
-  }, []);
+  }, [trackMutation]);
 
   const confirmDelete = async (): Promise<void> => {
     if (deleteRequest === null) {
       return;
     }
     const targetInstance: Instance = deleteRequest;
-    await api.deleteInstance(targetInstance.id);
+    await trackMutation(() => api.deleteInstance(targetInstance.id));
     setInstances((previousInstances) => {
       const remainingInstances: Instance[] = previousInstances.filter(
         (candidate) => candidate.id !== targetInstance.id
@@ -514,7 +622,7 @@ export function App() {
       );
       return orderedIds.map((id) => instanceById.get(id) as Instance);
     });
-    api.reorderInstances(orderedIds).catch((error: Error) => {
+    trackMutation(() => api.reorderInstances(orderedIds)).catch((error: Error) => {
       console.error("Could not save the new order:", error.message);
     });
   };

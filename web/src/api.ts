@@ -64,7 +64,7 @@ export const api = {
   saveConfig: (payload: { locations: string[]; enabledProviders: AgentProvider[] }): Promise<DashboardConfig> =>
     requestJson("/api/config", { method: "PUT", body: JSON.stringify(payload) }),
 
-  listInstances: (): Promise<Instance[]> => requestJson("/api/instances"),
+  listInstances: (signal?: AbortSignal): Promise<Instance[]> => requestJson("/api/instances", { signal }),
 
   getInstanceGit: (instanceId: string): Promise<{ cwd: string; branch?: string }> =>
     requestJson(`/api/instances/${instanceId}/git`),
