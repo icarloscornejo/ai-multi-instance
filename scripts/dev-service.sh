@@ -143,7 +143,7 @@ run_service() {
   trap on_signal TERM INT HUP
   cd "${REPO_ROOT}" || exit 1
   # Login + interactive so nvm and the env vars from ~/.zshrc are the same as in a terminal.
-  /bin/zsh -lic 'exec npm run dev:all' </dev/null &
+  /bin/zsh -lic 'npm run dev:all' </dev/null &
   RUN_CHILD_PID=$!
   log_line "started dev:all pid=${RUN_CHILD_PID}"
 
