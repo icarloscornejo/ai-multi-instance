@@ -20,56 +20,58 @@ The script does not touch Claude Code authentication: the dashboard inherits the
 
 ## Usage
 
+On macOS, `setup.sh` installs the dashboard as a launchd service (see [below](#the-dev-service-midev)): it starts at login, restarts itself, and runs the server plus the frontend build with hot reload. Nothing to start by hand; open <http://ai.local> (`http://localhost` also works). Existing installations may continue using <http://claude.local>.
+
+If you skipped the service (or want to run the dashboard in a terminal), stop it first because both use ports 3001/5173:
+
 ```bash
+midev stop                    # only if the service is installed
 cd ~/claude-multi-instance
 npm run dev
 ```
-
-Open <http://ai.local> (`http://localhost` also works). Existing installations may continue using <http://claude.local>.
 
 1. **Initial setup** (once, or from the `Settings` button): add the folder paths where terminals will open. You can open multiple instances in the same folder at once; there is no per-folder limit.
 2. **New instance** (the `+` button): pick a location, name the instance, and choose Claude Code, Codex CLI, Cursor Agent, a custom command, or shell only. Provider-specific model and effort fields are shown only when supported.
 3. **Closing the browser does not kill anything**: sessions live in tmux. When you reopen the dashboard, each tab reconnects to its session with all output intact.
 4. **Delete an instance** (from the instance sidebar): closes the tmux session. The folder and its contents are untouched on disk.
 5. **Terminal zoom**: `A-` / `A+` buttons or `Cmd +` / `Cmd -` with focus inside the terminal. The size persists per instance.
-6. **Update** (button in the tab bar): fetches the latest version from GitHub and applies it (fast-forward + npm install) if there are no local changes in the folder. Server/web code changes hot-reload automatically (`tsx watch` and Vite); other changes (dependencies, config) need `npm run dev` restarted manually. Sessions live in tmux so relaunching does not interrupt anything.
+6. **Update** (button in the tab bar): fetches the latest version from GitHub and applies it (fast-forward + npm install) if there are no local changes in the folder. Server/web code changes hot-reload automatically (`tsx watch` and Vite); other changes (dependencies, config) need a restart (`midev`, or `npm run dev` again if you run it by hand). Sessions live in tmux so relaunching does not interrupt anything.
 
 If the server crashes, `data/server.log` (or `data/server-dev.log` under `npm run dev`) has a stack trace - it didn't before, and figuring out *why* the dashboard went down used to mean nothing to go on.
 
-### Optional: keep it running without a terminal open
+### The dev service (`midev`)
 
-By default the dashboard only runs while you have `npm run dev` open, same as always - nothing below is enabled unless you ask for it. If you'd rather it start at login and restart itself after a crash instead of needing a terminal:
+`scripts/dev-service.sh` runs `npm run dev:all` (server with `tsx watch` plus `vite build --watch`) as a launchd LaunchAgent that starts at login and restarts the whole thing when any part dies or hangs. `setup.sh` installs it and adds a `midev` function to your zsh config, so a new terminal has:
+
+```bash
+midev            # restart everything (also loads the job if it was stopped)
+midev stop       # stop it (it comes back at the next login, or with midev)
+midev log        # tail data/dev-service.log
+midev status     # job state and whether :3001 / :5173 answer
+midev uninstall  # remove it for good
+midev setup      # (re)install it; safe to rerun, this is the retry command the warnings print
+```
+
+Things worth knowing:
+
+- Opt out with `AI_MULTI_INSTANCE_SKIP_SERVICE=1 bash setup.sh` (pass it on every run, or `setup.sh` installs it again).
+- On a machine with no dashboard password the service still installs, and the setup checklist warns that the dashboard runs without one (Caddy exposes it on your LAN). If a password is configured, the service refuses to stay installed unless it can confirm that the login still requires it.
+- It also refuses to install if it would change the tmux socket dir (which kills live sessions) or run without a UTF-8 locale. If agent sessions work in `~/Desktop`, `~/Documents` or similar, macOS may block them under launchd until `/bin/bash` has Full Disk Access; `setup.sh` runs a probe and says so.
+- On a clean machine `setup.sh` adds `brew shellenv` to your `~/.zprofile` if needed, because launchd's login shell would otherwise not find `npm`.
+
+### The alternative supervised service
+
+`npm run service:install` is the older optional mode: a launchd service running plain `npm start` (no hot reload, no frontend watcher). It cannot coexist with the dev service (same ports, both start at login): `midev uninstall` first, and `npm run service:uninstall` before going back.
 
 ```bash
 npm run service:install    # sets it up as a per-user launchd service and starts it
-npm run service:uninstall  # removes it, back to npm run dev only
+npm run service:uninstall  # removes it
+npm run service:status     # is it running, and what's its PID
+npm run service:stop       # stop it (e.g. before npm run dev)
+npm run service:restart    # restart it (e.g. after a server/src/ update, which the service doesn't hot-reload)
+npm run service:start      # start it again
+npm run service:log        # tail data/server.log
 ```
-
-Once installed, the service owns port 3001, so a plain `npm run dev` will fail fast with `EADDRINUSE` until you stop the service first:
-
-```bash
-npm run service:status    # is it running, and what's its PID
-npm run service:stop      # stop it (e.g. before npm run dev)
-npm run service:restart   # restart it (e.g. after a server/src/ update, which the service doesn't hot-reload)
-npm run service:start     # start it again
-npm run service:log       # tail data/server.log
-```
-
-### Optional: dev + dist as a service (`midev`)
-
-`scripts/dev-service.sh` runs `npm run dev:all` (server with `tsx watch` plus `vite build --watch`) as a launchd LaunchAgent that starts at login and restarts the whole thing when any part dies or hangs. It is an alternative to the service above (both want ports 3001/5173), and unlike it keeps hot reload. Add this alias to `~/.zshrc`:
-
-```bash
-alias midev="bash ~/claude-multi-instance/scripts/dev-service.sh"
-```
-
-```bash
-midev install [--no-live-check]   # first time: stop your manual npm run dev first, or pass --no-live-check
-midev                              # restart everything (also loads the job if it was stopped)
-midev stop | log | status
-```
-
-`install` refuses to proceed if the service would lose the dashboard password, change the tmux socket dir (which kills live sessions) or run without a UTF-8 locale. If agent sessions work in `~/Desktop`, `~/Documents` or similar, macOS may block them under launchd until the executable that launches the job (`/bin/bash`) has Full Disk Access; `scripts/dev-service.sh probejob tccprobe` tells you beforehand.
 
 ## Mobile
 

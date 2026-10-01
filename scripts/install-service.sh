@@ -127,6 +127,15 @@ health_check_service() {
   return 1
 }
 
+# The dev+dist service (scripts/dev-service.sh, installed by setup.sh) uses the same ports and is
+# also RunAtLoad: keeping both plists on disk would make them fight at the next login.
+DEV_SERVICE_LABEL="com.ai-multi-instance.dev"
+if [[ -f "${HOME}/Library/LaunchAgents/${DEV_SERVICE_LABEL}.plist" ]] || launchctl print "gui/$(id -u)/${DEV_SERVICE_LABEL}" >/dev/null 2>&1; then
+  warn "The dev service (${DEV_SERVICE_LABEL}) is installed and uses the same ports."
+  echo   "      Remove it first: bash ${INSTALL_DIR}/scripts/dev-service.sh uninstall"
+  exit 1
+fi
+
 if lsof -iTCP:3001 -sTCP:LISTEN >/dev/null 2>&1 && ! launchctl print "${SERVICE_DOMAIN_TARGET}" >/dev/null 2>&1; then
   warn "Something is already listening on port 3001 that isn't this service (probably npm run dev)."
   echo   "      Stop it first, then rerun this script."

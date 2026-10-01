@@ -133,7 +133,7 @@ const webSocketServer = new WebSocketServer({ noServer: true, maxPayload: MAX_WS
 httpServer.on("error", (error: NodeJS.ErrnoException) => {
   if (error.code === "EADDRINUSE") {
     console.error(
-      `[server] port ${serverPort} is already in use - another "npm run dev"/"npm start" is probably already running. If you installed the optional launchd service (npm run service:install), stop it first: npm run service:stop`
+      `[server] port ${serverPort} is already in use - another "npm run dev"/"npm start" is probably already running. If a launchd service is running it, stop it first: midev stop (dev service) or npm run service:stop (supervised service)`
     );
   } else {
     console.error("[server] fatal http server error:", error.message);

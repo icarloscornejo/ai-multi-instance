@@ -31,6 +31,8 @@ VITE_PORT=5173
 LOG_MAX_BYTES=$((10 * 1024 * 1024))
 USER_DOMAIN="gui/$(id -u)"
 UPDATE_TRANSACTION_MARKER="updateTransaction.ts --run"
+SCRIPT_PATH="${REPO_ROOT}/scripts/dev-service.sh"
+OTHER_SERVICE_PLIST_PATH="${HOME}/Library/LaunchAgents/${OTHER_SERVICE_LABEL}.plist"
 
 log_line() { printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*"; }
 die() { printf '\033[1;31m%s\033[0m\n' "$*" >&2; exit 1; }
@@ -43,6 +45,12 @@ probe_port() { curl -s -o /dev/null --max-time 2 -w '%{http_code}' "http://127.0
 listeners_on() { lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null || true; }
 is_loaded() { launchctl print "${USER_DOMAIN}/$1" >/dev/null 2>&1; }
 runner_pid() { launchctl print "${USER_DOMAIN}/${LABEL}" 2>/dev/null | awk '$1=="pid" && $2=="=" {print $3; exit}'; }
+
+# Recovery commands carry absolute, shell-escaped paths: the remote installer runs from $HOME or from
+# another checkout, and AI_MULTI_INSTANCE_DIR may contain spaces, quotes or a literal $.
+retry_command() { printf 'bash %q setup' "${SCRIPT_PATH}"; }
+accept_no_password_command() { printf 'rm %q && %s' "${AUTHGATE_PATH}" "$(retry_command)"; }
+uninstall_other_command() { printf 'bash %q' "${REPO_ROOT}/scripts/uninstall-service.sh"; }
 
 wait_healthy() {
   local deadline=$((SECONDS + $1))
@@ -226,6 +234,32 @@ random_login_code() {
 }
 
 AUTH_EXPECTED=""
+AUTH_REASON=""
+
+# Without a live dashboard to compare against, the expectation comes from configuration. Durable
+# signals (a stored "on", data/auth-password.json, DASHBOARD_PASSWORD in the env the service will
+# really get) are persisted; a password that only exists in the invoking terminal counts for this
+# run only, so it cannot leave a sticky "on" behind. Presence only: values are never printed.
+derive_auth_expected() {
+  local stored="" zsh_has_password=""
+  stored="$(cat "${AUTHGATE_PATH}" 2>/dev/null || true)"
+  zsh_has_password="$(service_eval 'echo "__DS__${DASHBOARD_PASSWORD:+set}"')"
+  mkdir -p "${DATA_DIR}"
+  if [[ -n "${zsh_has_password}" || -f "${DATA_DIR}/auth-password.json" ]]; then
+    AUTH_EXPECTED="on"; AUTH_REASON="durable"
+    echo "on" > "${AUTHGATE_PATH}"
+  elif [[ "${stored}" == "on" ]]; then
+    AUTH_EXPECTED="on"; AUTH_REASON="stored_on_only"
+  elif [[ -n "${DASHBOARD_PASSWORD:-}" ]]; then
+    AUTH_EXPECTED="on"; AUTH_REASON="caller_only"
+  else
+    AUTH_EXPECTED="off"; AUTH_REASON="none"
+    echo "off" > "${AUTHGATE_PATH}"
+    note "no dashboard password is configured: it will run from login without one and Caddy exposes it on the LAN."
+    echo "      Set one from the dashboard UI, or export DASHBOARD_PASSWORD in ~/.zprofile and run: midev"
+  fi
+  note "auth expectation without a live dashboard: ${AUTH_EXPECTED} (${AUTH_REASON})"
+}
 
 envcheck() {
   local skip_live_auth="$1"
@@ -259,14 +293,12 @@ envcheck() {
     *) live_auth="" ;;
   esac
   if [[ "${skip_live_auth}" == "yes" ]]; then
-    AUTH_EXPECTED="$(cat "${AUTHGATE_PATH}" 2>/dev/null || true)"
-    [[ "${AUTH_EXPECTED}" == "on" || "${AUTH_EXPECTED}" == "off" ]] \
-      || die "--no-live-check needs ${AUTHGATE_PATH} (on|off) from a previous install run with the dashboard alive."
-    note "live auth comparison skipped (auth was '${AUTH_EXPECTED}' in the last live check)"
+    derive_auth_expected
     return 0
   fi
-  [[ -n "${live_auth}" ]] || die "No dashboard answering on ${SERVER_PORT} (login probe gave '${live_code}'). Start it, or use --no-live-check."
+  [[ -n "${live_auth}" ]] || die "No dashboard answering on ${SERVER_PORT} (login probe gave '${live_code}'). Start it, or use: $(retry_command)"
   AUTH_EXPECTED="${live_auth}"
+  AUTH_REASON="live"
   mkdir -p "${DATA_DIR}"
   echo "${live_auth}" > "${AUTHGATE_PATH}"
 
@@ -329,11 +361,52 @@ SERVICE_KEYS
 PLIST
 }
 
-post_start_auth_gate() {
-  if [[ "${AUTH_EXPECTED}" == "on" ]]; then
-    [[ "$(random_login_code)" == "401" ]] || return 1
-  fi
-  return 0
+wait_new_runner() {
+  local previous_pid="$1" deadline=$((SECONDS + 60)) current_pid
+  while (( SECONDS < deadline )); do
+    current_pid="$(runner_pid)"
+    [[ -n "${current_pid}" && "${current_pid}" != "${previous_pid}" ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# Fail closed: with an expected password, anything but a 401 on the login route (a confirmed 200,
+# or no confirmation within the window) means the service must not stay installed, because it
+# could start answering without a password later or at the next login. 90s covers a cold start
+# (login shell, nvm, tmux cleanup before the server listens).
+confirm_auth_protected() {
+  [[ "${AUTH_EXPECTED}" == "on" ]] || return 0
+  local deadline=$((SECONDS + 90)) code
+  while (( SECONDS < deadline )); do
+    code="$(random_login_code)"
+    [[ "${code}" == "401" ]] && return 0
+    [[ "${code}" == "200" ]] && return 1
+    sleep 3
+  done
+  return 1
+}
+
+remove_unprotected_service() {
+  launchctl bootout "${USER_DOMAIN}/${LABEL}" >/dev/null 2>&1 || true
+  wait_gone "${LABEL}" || true
+  rm -f "${PLIST_PATH}"
+  echo "The service was removed (plist deleted) because it could not be confirmed to require a password." >&2
+  case "${AUTH_REASON}" in
+    caller_only)
+      echo "Your DASHBOARD_PASSWORD only exists in this terminal and the service cannot see it." >&2
+      echo "Export it in ~/.zprofile or ~/.zshenv, or rerun without that variable to install without a password." >&2
+      ;;
+    stored_on_only)
+      echo "A password was configured before and no longer is (no data/auth-password.json, no DASHBOARD_PASSWORD for the service)." >&2
+      echo "To accept running without a password: $(accept_no_password_command)" >&2
+      ;;
+    *)
+      echo "Check that DASHBOARD_PASSWORD is exported in ~/.zprofile or ~/.zshenv (not only in an open terminal) and that data/auth-password.json is valid." >&2
+      ;;
+  esac
+  echo "Then retry: $(retry_command)" >&2
+  exit 1
 }
 
 install_service() {
@@ -345,7 +418,7 @@ install_service() {
   chmod 0700 "${DATA_DIR}"
   envcheck "${skip_live_auth}"
 
-  local candidate_plist
+  local candidate_plist previous_pid
   candidate_plist="$(mktemp)"
   render_plist "${LABEL}" "run" "${SERVICE_LOG}" "service" > "${candidate_plist}"
   plutil -lint "${candidate_plist}" >/dev/null || { rm -f "${candidate_plist}"; die "Generated an invalid plist, not installing."; }
@@ -353,9 +426,11 @@ install_service() {
   if is_loaded "${LABEL}"; then
     if cmp -s "${candidate_plist}" "${PLIST_PATH}"; then
       rm -f "${candidate_plist}"
+      previous_pid="$(runner_pid)"
       launchctl kickstart -k "${USER_DOMAIN}/${LABEL}" || die "kickstart failed"
-      sleep 3
-      wait_healthy 60 && post_start_auth_gate || die "Service did not come back healthy. Check: midev log"
+      wait_new_runner "${previous_pid}" || true
+      confirm_auth_protected || remove_unprotected_service
+      wait_healthy 60 || die "Service did not come back healthy. Check: midev log"
       ok "Service restarted"
       return 0
     fi
@@ -365,8 +440,13 @@ install_service() {
     launchctl bootout "${USER_DOMAIN}/${LABEL}" >/dev/null 2>&1 || true
     wait_gone "${LABEL}" || note "old job still tearing down after 40s"
     cp "${candidate_plist}" "${PLIST_PATH}"
-    if launchctl bootstrap "${USER_DOMAIN}" "${PLIST_PATH}" && wait_healthy 60 && post_start_auth_gate; then
-      rm -f "${candidate_plist}" "${plist_backup}"
+    rm -f "${candidate_plist}"
+    launchctl bootstrap "${USER_DOMAIN}" "${PLIST_PATH}" || true
+    wait_new_runner "" || true
+    # Not restoring the previous plist on an auth failure: it has the same environment.
+    confirm_auth_protected || { rm -f "${plist_backup}"; remove_unprotected_service; }
+    if wait_healthy 60; then
+      rm -f "${plist_backup}"
       ok "Service updated and running"
       return 0
     fi
@@ -375,14 +455,20 @@ install_service() {
     wait_gone "${LABEL}" || true
     cp "${plist_backup}" "${PLIST_PATH}"
     launchctl bootstrap "${USER_DOMAIN}" "${PLIST_PATH}" || true
-    rm -f "${candidate_plist}" "${plist_backup}"
+    rm -f "${plist_backup}"
     die "Install failed; the previous configuration was restored. Check: midev log"
   fi
 
   preflight
   cp "${candidate_plist}" "${PLIST_PATH}"
   rm -f "${candidate_plist}"
-  if launchctl bootstrap "${USER_DOMAIN}" "${PLIST_PATH}" && wait_healthy 60 && post_start_auth_gate; then
+  if ! launchctl bootstrap "${USER_DOMAIN}" "${PLIST_PATH}"; then
+    rm -f "${PLIST_PATH}"
+    die "launchctl bootstrap failed; nothing was installed."
+  fi
+  wait_new_runner "" || true
+  confirm_auth_protected || remove_unprotected_service
+  if wait_healthy 60; then
     ok "Service installed and running (starts at login, restarts as a whole on failure)"
     return 0
   fi
@@ -391,7 +477,14 @@ install_service() {
   rm -f "${PLIST_PATH}"
   echo "--- tail of ${SERVICE_LOG} ---" >&2
   tail -n 30 "${SERVICE_LOG}" >&2 || true
-  die "Fresh install did not become healthy; job removed, ports are free. Restart your manual command."
+  die "Fresh install did not become healthy; job removed, ports are free. Retry: $(retry_command)"
+}
+
+uninstall_service() {
+  launchctl bootout "${USER_DOMAIN}/${LABEL}" >/dev/null 2>&1 || true
+  wait_gone "${LABEL}" || note "something still holds ${SERVER_PORT}/${VITE_PORT}"
+  rm -f "${PLIST_PATH}"
+  ok "Service removed (nothing starts at login any more). Reinstall with: $(retry_command)"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -449,6 +542,116 @@ probejob() {
 }
 
 # ---------------------------------------------------------------------------------------------
+# setup: what setup.sh calls. Never fails; every problem becomes a warning with a retry command.
+# ---------------------------------------------------------------------------------------------
+
+# The directory the service's own login shell reads its dotfiles from: ~/.zshenv is read under
+# env -i, a ZDOTDIR exported only in the invoking terminal is not. Both dotfile writers use it.
+zsh_config_dir() {
+  local config_dir
+  config_dir="$(env -i HOME="${HOME}" USER="${USER}" /bin/zsh -c 'echo "${ZDOTDIR:-$HOME}"' 2>/dev/null)"
+  echo "${config_dir:-${HOME}}"
+}
+
+# Starts on a fresh line so a file without a trailing newline does not get its last line fused.
+append_block() {
+  local file_path="$1" block="$2"
+  mkdir -p "$(dirname "${file_path}")"
+  touch "${file_path}"
+  if [[ -s "${file_path}" && -n "$(tail -c 1 "${file_path}")" ]]; then
+    printf '\n' >> "${file_path}"
+  fi
+  printf '%s\n' "${block}" >> "${file_path}"
+}
+
+# A function and not an alias, so the path is never re-parsed; the "function" form also avoids
+# "defining function based on alias" when an alias named midev comes from another file.
+add_alias() {
+  local rc_path block
+  rc_path="$(zsh_config_dir)/.zshrc"
+  if grep -qE '^[[:space:]]*(alias midev=|function[[:space:]]+midev|midev[[:space:]]*\(\))' "${rc_path}" 2>/dev/null; then
+    ok "midev is already defined in ${rc_path}"
+    return 0
+  fi
+  block="$(printf '# dev + dist launchd service (scripts/dev-service.sh)\nfunction midev { bash %q "$@"; }' "${SCRIPT_PATH}")"
+  append_block "${rc_path}" "${block}"
+  ok "midev added to ${rc_path} (open a new terminal or: source ${rc_path})"
+}
+
+npm_resolves_for_service() {
+  [[ -n "$(service_eval 'echo "__DS__$(command -v npm)"')" ]]
+}
+
+# On a clean machine Homebrew is only on PATH for the setup run; launchd's login shell needs
+# brew shellenv in a dotfile it reads.
+ensure_brew_in_login_shell() {
+  npm_resolves_for_service && return 0
+  local brew_bin="" candidate
+  for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    [[ -x "${candidate}" ]] && { brew_bin="${candidate}"; break; }
+  done
+  [[ -n "${brew_bin}" ]] || return 1
+  local profile_path
+  profile_path="$(zsh_config_dir)/.zprofile"
+  if ! grep -q 'brew shellenv' "${profile_path}" 2>/dev/null; then
+    append_block "${profile_path}" "eval \"\$(${brew_bin} shellenv)\""
+    ok "Homebrew added to ${profile_path} so the service can find npm"
+  fi
+  npm_resolves_for_service
+}
+
+setup_service() {
+  if [[ "${AI_MULTI_INSTANCE_SKIP_SERVICE:-}" == "1" ]]; then
+    note "AI_MULTI_INSTANCE_SKIP_SERVICE=1: not installing the dev service (pass it on every setup.sh run to keep it off)."
+    return 0
+  fi
+  SERVICE_LANG="$(detect_service_lang)"
+  add_alias || note "could not add the midev function to your zsh config"
+
+  if [[ -f "${OTHER_SERVICE_PLIST_PATH}" ]]; then
+    note "${OTHER_SERVICE_LABEL} is installed and uses the same ports, so the dev service was not installed."
+    echo "      Remove it with: $(uninstall_other_command)"
+    echo "      Then run: $(retry_command)"
+    return 0
+  fi
+  if ! is_loaded "${LABEL}"; then
+    local port
+    for port in "${SERVER_PORT}" "${VITE_PORT}"; do
+      if [[ -n "$(listeners_on "${port}")" ]]; then
+        note "Something else is listening on port ${port} (a manual npm run dev?), so the dev service was not installed."
+        echo "      Close it and run: $(retry_command)"
+        return 0
+      fi
+    done
+  fi
+  if ! ensure_brew_in_login_shell; then
+    note "npm does not resolve in a login shell without a terminal (what launchd runs), so the dev service was not installed."
+    echo "      Make sure node/npm is on the PATH set by ~/.zprofile or ~/.zshenv, then run: $(retry_command)"
+    return 0
+  fi
+
+  local probe_output probe_result
+  probe_output="$(bash "${SCRIPT_PATH}" probejob tccprobe 2>&1 || true)"
+  probe_result="$(echo "${probe_output}" | grep -E '^tccprobe: ' | tail -n 1 | sed 's/^tccprobe: //')"
+  case "${probe_result}" in
+    ok) ok "launchd jobs can read ~/Desktop" ;;
+    EPERM)
+      note "launchd jobs cannot read ~/Desktop (macOS privacy). Agent sessions in Desktop/Documents will fail until /bin/bash has Full Disk Access"
+      echo "      (System Settings > Privacy & Security > Full Disk Access). This is a broad permission: your call."
+      ;;
+    timeout) note "the permission probe timed out (an unanswered macOS permission dialog, or a slow ~/.zshrc). Continuing." ;;
+    *) note "could not run the permission probe: $(echo "${probe_output}" | tail -n 1). Continuing." ;;
+  esac
+
+  if ! bash "${SCRIPT_PATH}" install --no-live-check; then
+    note "the dev service did not come up. Check: bash $(printf '%q' "${SCRIPT_PATH}") log"
+    echo "      Retry: $(retry_command)"
+    echo "      Or run the dashboard by hand: npm run dev"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------------------------
 # user-facing commands
 # ---------------------------------------------------------------------------------------------
 
@@ -464,7 +667,7 @@ restart_service() {
       sleep 1
     done
   else
-    [[ -f "${PLIST_PATH}" ]] || die "Not installed. Run: midev install"
+    [[ -f "${PLIST_PATH}" ]] || die "Not installed. Run: $(retry_command)"
     preflight
     launchctl bootstrap "${USER_DOMAIN}" "${PLIST_PATH}" || die "bootstrap failed"
   fi
@@ -481,6 +684,9 @@ case "${1:-restart}" in
   probejob) probejob "${2:-}" ;;
   tccprobe) tccprobe ;;
   tmuxprobe) tmuxprobe ;;
+  setup) setup_service ;;
+  uninstall) uninstall_service ;;
+  healthy) is_loaded "${LABEL}" && [[ "$(probe_port "${SERVER_PORT}")" != "000" && "$(probe_port "${VITE_PORT}")" != "000" ]] ;;
   stop)
     launchctl bootout "${USER_DOMAIN}/${LABEL}" >/dev/null 2>&1 || true
     wait_gone "${LABEL}" && ok "Stopped (comes back at next login, or run: midev)" || note "Stopped, but something still holds ${SERVER_PORT}/${VITE_PORT}"
@@ -491,5 +697,5 @@ case "${1:-restart}" in
     echo "server :${SERVER_PORT} -> $(probe_port "${SERVER_PORT}")   vite :${VITE_PORT} -> $(probe_port "${VITE_PORT}")"
     ;;
   restart) restart_service ;;
-  *) die "usage: midev [install [--no-live-check] | stop | log | status]" ;;
+  *) die "usage: midev [setup | install [--no-live-check] | uninstall | stop | log | status]" ;;
 esac

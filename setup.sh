@@ -231,7 +231,14 @@ else
   warn "Cursor Agent is not installed; live Cursor metrics will be configured when setup is rerun after installation."
 fi
 
-# 6. ai.local: hostname + reverse proxy, so the dashboard is reachable at
+# 6. Dev service: `npm run dev:all` as a launchd LaunchAgent (starts at login, restarts as a whole
+#    when anything dies or hangs) plus the `midev` shell function to restart it. Placed before
+#    ai.local so it stays installed even if Caddy setup aborts later. It never fails the setup:
+#    every problem is a warning with a command to retry. Opt out with AI_MULTI_INSTANCE_SKIP_SERVICE=1.
+step "Dev service (starts at login, restarts on failure)"
+bash "${INSTALL_DIR}/scripts/dev-service.sh" setup || true
+
+# 7. ai.local: hostname + reverse proxy, so the dashboard is reachable at
 #    http://ai.local with no port suffix, while the dashboard's own server keeps listening on
 #    its normal unprivileged port 3001 (macOS refuses to bind :80 without root).
 #    Caddy is installed as a brew service (a LaunchDaemon running as root, brew's
@@ -339,7 +346,7 @@ else
   ok "Caddy running as a system service (survives reboots)"
 fi
 
-# 7. Final checklist: what must be done manually by design
+# 8. Final checklist: what must be done manually by design
 printf '\n\033[1;35m=== Done. Manual steps ===\033[0m\n'
 if [[ -z "${CLAUDE_CODE_USE_VERTEX:-}" ]]; then
   warn "CLAUDE_CODE_USE_VERTEX is not set in this shell."
@@ -348,17 +355,31 @@ if [[ -z "${CLAUDE_CODE_USE_VERTEX:-}" ]]; then
 else
   ok "CLAUDE_CODE_USE_VERTEX detected: Vertex routing is inherited automatically"
 fi
+dev_service_script="${INSTALL_DIR}/scripts/dev-service.sh"
+dev_service_label="com.ai-multi-instance.dev"
+if bash "${dev_service_script}" healthy; then
+  printf '\n  1. The dashboard is already running as a service: open http://ai.local\n'
+  printf '     Restart it any time with: midev (open a new terminal or: source ~/.zshrc)\n'
+  if [[ "$(cat "${INSTALL_DIR}/data/dev-service-authgate" 2>/dev/null)" == "off" ]]; then
+    warn "The dashboard runs from login WITHOUT a password and Caddy exposes it on your LAN."
+    echo   "      Set one from the dashboard UI, or export DASHBOARD_PASSWORD in ~/.zprofile and run: midev"
+  fi
+elif launchctl print "gui/$(id -u)/${dev_service_label}" >/dev/null 2>&1; then
+  printf '\n  1. The dev service is loaded but the dashboard is not answering yet.\n'
+  printf '     Check: midev log   (restart: midev)\n'
+else
+  printf '\n  1. Start the dashboard:\n'
+  printf '       cd %s && npm run dev\n' "${INSTALL_DIR}"
+  printf '     then open http://ai.local\n'
+fi
 cat <<EOF
-
-  1. Start the dashboard:
-       cd ${INSTALL_DIR} && npm run dev
-     then open http://ai.local
 
   2. On the initial screen, add the folder paths where terminals will open.
      You can open multiple instances in the same folder at once.
 
-  Optional: if you'd rather the dashboard stay up on its own (survives crashes, starts at
-  login) instead of running "npm run dev" by hand, run: npm run service:install
-  It's off by default and never enabled by this script - see README.md's Usage section.
+  The dev service (dashboard + frontend build, starts at login, restarts itself) is installed by
+  this script. Skip it with AI_MULTI_INSTANCE_SKIP_SERVICE=1 (needed on every run), remove it
+  with "midev uninstall". "npm run service:install" is the alternative supervised mode and
+  cannot coexist with it: remove one before using the other. See README.md's Usage section.
 
 EOF
