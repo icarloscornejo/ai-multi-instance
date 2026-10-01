@@ -401,15 +401,18 @@ install_service() {
 tccprobe() {
   local output_file shell_pid deadline
   output_file="$(mktemp)"
-  /bin/zsh -lic 'node -e "require(\"fs\").readdirSync(process.env.HOME + \"/Desktop\")"' </dev/null >"${output_file}" 2>&1 &
+  /bin/zsh -lic 'node -e "require(\"fs\").readdirSync(process.env.HOME + \"/Desktop\")"; echo "__DS_RC__$?"' </dev/null >"${output_file}" 2>&1 &
   shell_pid=$!
+  # Detached from job control so killing it on timeout does not print a "Killed: 9" notice into
+  # the probe output.
+  disown "${shell_pid}"
   deadline=$((SECONDS + 20))
   while kill -0 "${shell_pid}" 2>/dev/null && (( SECONDS < deadline )); do sleep 1; done
   if kill -0 "${shell_pid}" 2>/dev/null; then
     pkill -9 -P "${shell_pid}" 2>/dev/null || true
     kill -9 "${shell_pid}" 2>/dev/null || true
     echo "timeout"
-  elif wait "${shell_pid}"; then
+  elif grep -qx '__DS_RC__0' "${output_file}"; then
     echo "ok"
   elif grep -qiE 'EPERM|not permitted' "${output_file}"; then
     echo "EPERM"
@@ -435,8 +438,8 @@ probejob() {
   render_plist "${PROBE_LABEL}" "${subcommand}" "${PROBE_OUT_PATH}" "probe" > "${PROBE_PLIST_PATH}"
   launchctl bootstrap "${USER_DOMAIN}" "${PROBE_PLIST_PATH}" || { rm -f "${PROBE_PLIST_PATH}"; die "probe bootstrap failed"; }
   local deadline=$((SECONDS + 30))
-  while [[ ! -s "${PROBE_OUT_PATH}" ]] && (( SECONDS < deadline )); do sleep 1; done
-  result="$(tail -n 1 "${PROBE_OUT_PATH}" 2>/dev/null)"
+  while ! grep -qxE 'ok|EPERM|timeout|error' "${PROBE_OUT_PATH}" 2>/dev/null && (( SECONDS < deadline )); do sleep 1; done
+  result="$(grep -xE 'ok|EPERM|timeout|error' "${PROBE_OUT_PATH}" 2>/dev/null | tail -n 1)"
   [[ -n "${result}" ]] || result="timeout"
   launchctl bootout "${USER_DOMAIN}/${PROBE_LABEL}" >/dev/null 2>&1 || true
   wait_gone "${PROBE_LABEL}" no || true
