@@ -9,6 +9,7 @@
   ],
   "scripts": {
     "dev": "node scripts/with-writable-tmpdir.mjs concurrently --kill-others-on-fail -n server,web -c blue,magenta \"npm run dev -w server\" \"npm run dev -w web\"",
+    "dev:all": "concurrently --kill-others -n dev,dist \"npm run dev\" \"cd web && npx vite build --watch\"",
     "build": "npm run build -w web",
     "start": "node scripts/with-writable-tmpdir.mjs npm run start -w server",
     "test": "npm run test -w server && npm run test -w web",

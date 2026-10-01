@@ -55,6 +55,22 @@ npm run service:start     # start it again
 npm run service:log       # tail data/server.log
 ```
 
+### Optional: dev + dist as a service (`midev`)
+
+`scripts/dev-service.sh` runs `npm run dev:all` (server with `tsx watch` plus `vite build --watch`) as a launchd LaunchAgent that starts at login and restarts the whole thing when any part dies or hangs. It is an alternative to the service above (both want ports 3001/5173), and unlike it keeps hot reload. Add this alias to `~/.zshrc`:
+
+```bash
+alias midev="bash ~/claude-multi-instance/scripts/dev-service.sh"
+```
+
+```bash
+midev install [--no-live-check]   # first time: stop your manual npm run dev first, or pass --no-live-check
+midev                              # restart everything (also loads the job if it was stopped)
+midev stop | log | status
+```
+
+`install` refuses to proceed if the service would lose the dashboard password, change the tmux socket dir (which kills live sessions) or run without a UTF-8 locale. If agent sessions work in `~/Desktop`, `~/Documents` or similar, macOS may block them under launchd until the executable that launches the job (`/bin/bash`) has Full Disk Access; `scripts/dev-service.sh probejob tccprobe` tells you beforehand.
+
 ## Mobile
 
 On a phone or narrow viewport the dashboard switches to a dedicated mobile shell instead of the desktop split view:
