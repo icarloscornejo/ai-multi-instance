@@ -43,7 +43,7 @@ export const PROVIDERS: Record<AgentProvider, AgentProviderDefinition> = {
 };
 
 const statuslineScriptPath: string = path.resolve(import.meta.dirname, "../scripts/dashboard-statusline.sh");
-const codexWatcherPath: string = path.resolve(import.meta.dirname, "../scripts/codex-session-watcher.mjs");
+const codexShimPath: string = path.resolve(import.meta.dirname, "../scripts/shims/codex");
 const cursorLauncherPath: string = path.resolve(import.meta.dirname, "../scripts/cursor-session-launcher.mjs");
 
 export function quoteForShell(value: string): string {
@@ -70,34 +70,23 @@ function buildClaudeCommand(instance: InstanceRecord, sessionId?: string): strin
   return parts.join(" ");
 }
 
+// Goes through the codex shim by absolute path (not through PATH lookup of `codex`) so a
+// user-edited absolute `command` still gets the session watcher: the shim is the one place that
+// starts it, for this launch and for codex sessions started by hand in the pane alike. The shim
+// backgrounds the watcher inside a subshell, so its exit produces no "[1] done" job notice in
+// the pane that would expose the command line the loader script exists to hide.
 function buildCodexCommand(instance: InstanceRecord, sessionId?: string): string {
-  const cliParts: string[] = [quoteForShell(executable(instance))];
+  const cliParts: string[] = [
+    `AI_MULTI_INSTANCE_ID=${quoteForShell(instance.id)}`,
+    `AI_MULTI_REAL_CODEX=${quoteForShell(executable(instance))}`,
+    quoteForShell(codexShimPath),
+  ];
   if (sessionId) cliParts.push("resume", quoteForShell(sessionId));
   if (instance.model) cliParts.push("--model", quoteForShell(instance.model));
   if (!sessionId) {
     cliParts.push("--cd", quoteForShell(instance.locationPath));
   }
-  if (sessionId) {
-    return `AI_MULTI_INSTANCE_ID=${quoteForShell(instance.id)} ${cliParts.join(" ")}`;
-  }
-  // Wrapped in a subshell "( ... & )" rather than a bare trailing "&": a background job
-  // launched directly in the interactive pane shell prints a "[1]  done <command>" job
-  // notification (zsh's default NOTIFY) whenever the watcher exits, exposing the exact
-  // command line the loader script exists to hide. A subshell's background job is invisible
-  // to the outer shell's job table, so it exits silently instead.
-  const watcher: string = [
-    "(",
-    "AI_MULTI_INSTANCE_ID=" + quoteForShell(instance.id),
-    "node",
-    quoteForShell(codexWatcherPath),
-    quoteForShell(instance.id),
-    quoteForShell(instance.locationPath),
-    quoteForShell(String(Date.now())),
-    "& )",
-  ].join(" ");
-  // A compound command like "(... &)" needs a statement separator before the next
-  // command on the same line - without it, zsh/bash both fail with a parse error.
-  return `${watcher}; ${cliParts.join(" ")}`;
+  return cliParts.join(" ");
 }
 
 function buildCursorCommand(instance: InstanceRecord, sessionId?: string): string {

@@ -1,0 +1,45 @@
+#!/bin/bash
+# Put first on PATH inside every dashboard pane (see instance-loader.sh and
+# buildShellOnlyReadyCommand in server/src/launch.ts), so a Claude session started by hand in
+# the pane (claude, claude-me, claude-in, claude-sephora, ...) reports to the sidebar exactly
+# like one the dashboard launched itself: it gets the same statusLine wrapper injected.
+
+shim_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+real_claude=""
+IFS=: read -ra path_entries <<< "$PATH"
+for path_entry in "${path_entries[@]}"; do
+  [ "$path_entry" = "$shim_dir" ] && continue
+  if [ -x "$path_entry/claude" ] && [ ! -d "$path_entry/claude" ]; then
+    real_claude="$path_entry/claude"
+    break
+  fi
+done
+if [ -z "$real_claude" ]; then
+  echo "claude: command not found (the dashboard shim could not find the real binary)" >&2
+  exit 127
+fi
+
+# Already shimmed (a wrapper script calling claude again, or an agent launched from inside
+# another one): pass straight through, never inject a second time.
+if [ "${AI_MULTI_SHIM_ACTIVE:-}" = 1 ]; then
+  exec "$real_claude" "$@"
+fi
+
+inject=1
+case "${1:-}" in
+  mcp|config|update|doctor|install|plugin|auth|setup-token|migrate-installer) inject=0 ;;
+esac
+for argument in "$@"; do
+  case "$argument" in
+    --settings|--settings=*|-p|--print) inject=0 ;;
+  esac
+done
+
+export AI_MULTI_SHIM_ACTIVE=1
+if [ "$inject" = 1 ]; then
+  statusline_script="$(cd "$shim_dir/.." && pwd)/dashboard-statusline.sh"
+  # ponytail: the path is spliced into JSON unescaped, fine for an install dir without quotes or backslashes
+  exec "$real_claude" --settings "{\"statusLine\":{\"type\":\"command\",\"command\":\"$statusline_script\"}}" "$@"
+fi
+exec "$real_claude" "$@"

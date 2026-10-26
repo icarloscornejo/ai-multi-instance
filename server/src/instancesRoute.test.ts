@@ -53,6 +53,7 @@ vi.mock("./terminal", () => ({
   initializeInstanceSession: vi.fn(),
 }));
 vi.mock("./tmux", () => ({
+  getOriginalPanePid: vi.fn(),
   getPaneCurrentPath: vi.fn(),
   getSessionPresence: vi.fn(),
   killSession: vi.fn(),
@@ -483,7 +484,12 @@ describe("concurrent writers never lose each other's commits", () => {
   it("live-status saving a session id keeps a commit that was still saving", async () => {
     const snapshotDirectory: string = path.join(temporaryHomeDirectory, "Library", "Application Support", "ai-multi-instance");
     await fs.mkdir(snapshotDirectory, { recursive: true });
-    await fs.writeFile(path.join(snapshotDirectory, "aaa111.json"), JSON.stringify({ sessionId: "other-session" }));
+    // A snapshot the dashboard's own launch wrote (idSource env, from the pane job): the only kind
+    // that may become the resume target.
+    await fs.writeFile(
+      path.join(snapshotDirectory, "aaa111.json"),
+      JSON.stringify({ provider: "claude", sessionId: "other-session", paneJobPid: 4242, idSource: "env", configDir: "/profile" })
+    );
 
     const otherDevice = commitFromOtherDevice();
     const liveStatusResponse = await fetch(`${baseUrl}/instances/aaa111/live-status`);

@@ -50,6 +50,15 @@ function hardenedGitEnv(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.Proces
   };
 }
 
+export async function currentBranch(cwd: string): Promise<string | null> {
+  try {
+    return await runGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  } catch {
+    // Not a git repo, git not installed, or the folder does not exist anymore
+    return null;
+  }
+}
+
 // Always passes `-C <cwd>` so callers never have to. `timeoutMs` picks between the two
 // constants above based on whether the command touches the network.
 export async function runGit(

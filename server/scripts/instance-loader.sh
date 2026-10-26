@@ -20,6 +20,17 @@
 # .zprofile/.zshrc, same shell the user lands back on when the agent exits). That also means
 # `return` (not `exit`) on error paths below - `exit` would kill the pane's shell entirely.
 
+# First thing, before any early return below: put the claude/codex shims ahead of the real
+# binaries for the rest of this pane's life, so an agent the user starts by hand later (claude-me,
+# codex, ...) reports to the sidebar just like the one launched here. $BASH_SOURCE is bash,
+# $0 is what zsh sets to the sourced file.
+_ail_shims_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/shims"
+case ":$PATH:" in
+  *":$_ail_shims_dir:"*) ;;
+  *) export PATH="$_ail_shims_dir:$PATH" ;;
+esac
+unset _ail_shims_dir
+
 _ail_raw="$(tmux show-environment AI_LAUNCH_COMMAND 2>/dev/null)"
 _ail_channel_raw="$(tmux show-environment AI_LAUNCH_READY_CHANNEL 2>/dev/null)"
 tmux set-environment -u AI_LAUNCH_COMMAND 2>/dev/null

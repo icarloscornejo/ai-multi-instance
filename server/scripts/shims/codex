@@ -1,0 +1,60 @@
+#!/bin/bash
+# Put first on PATH inside every dashboard pane, and called by absolute path with
+# AI_MULTI_REAL_CODEX by the dashboard's own codex launch (buildCodexCommand in
+# server/src/providers.ts). Codex has no statusline hook, so the dashboard learns about a
+# session from a watcher that claims the new rollout file; this shim is the single place that
+# starts it, for dashboard launches and for sessions started by hand alike.
+
+shim_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+resolve_real_binary() {
+  local candidate="$1" path_entries path_entry
+  case "$candidate" in
+    */*) printf '%s' "$candidate"; return 0 ;;
+  esac
+  IFS=: read -ra path_entries <<< "$PATH"
+  for path_entry in "${path_entries[@]}"; do
+    [ "$path_entry" = "$shim_dir" ] && continue
+    if [ -x "$path_entry/$candidate" ] && [ ! -d "$path_entry/$candidate" ]; then
+      printf '%s' "$path_entry/$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+real_codex="$(resolve_real_binary "${AI_MULTI_REAL_CODEX:-codex}")"
+unset AI_MULTI_REAL_CODEX
+if [ -z "$real_codex" ]; then
+  echo "codex: command not found (the dashboard shim could not find the real binary)" >&2
+  exit 127
+fi
+
+# Already shimmed, or a subcommand that is not an interactive session (exec, login, mcp, ...):
+# pass straight through, no watcher.
+case "${1:-}" in
+  exec|e|login|logout|mcp|apply|a|proto|completion|debug|cloud) exec "$real_codex" "$@" ;;
+esac
+if [ "${AI_MULTI_SHIM_ACTIVE:-}" = 1 ]; then
+  exec "$real_codex" "$@"
+fi
+export AI_MULTI_SHIM_ACTIVE=1
+
+source "$shim_dir/../lib/pane-identity.sh"
+if ai_resolve_pane_identity && [ -n "$AI_PANE_JOB_PID" ]; then
+  watcher_cwd="$PWD"
+  resume_id=""
+  previous_argument=""
+  for argument in "$@"; do
+    case "$previous_argument" in
+      --cd|-C) watcher_cwd="$argument" ;;
+      resume) case "$argument" in -*) ;; *) resume_id="$argument" ;; esac ;;
+    esac
+    previous_argument="$argument"
+  done
+  # Milliseconds, as the watcher expects: macOS date has no %N, so append the zeros by hand.
+  started_at_ms="$(date +%s)000"
+  # Subshell around the background job so the pane's shell prints no "[1] done" notice.
+  ( node "$shim_dir/../codex-session-watcher.mjs" "$AI_INSTANCE_ID" "$watcher_cwd" "$started_at_ms" "$AI_PANE_JOB_PID" "$resume_id" >/dev/null 2>&1 & )
+fi
+exec "$real_codex" "$@"

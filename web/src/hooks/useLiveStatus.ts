@@ -57,8 +57,10 @@ export function useLiveStatus(instanceId: string, enabled: boolean): LiveStatusR
           }
         })
         .catch(() => {
+          // Keep the last answer, marked as such: blanking the view on one failed poll flips the
+          // sidebar to "Loading..." and back, which reads as the data being wrong.
           if (!cancelled) {
-            setLiveStatus(null);
+            setLiveStatus((previous) => (previous === null ? null : { ...previous, unreachable: true }));
           }
         });
     };

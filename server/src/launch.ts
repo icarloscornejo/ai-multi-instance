@@ -30,6 +30,7 @@ export function buildLaunchCommand(
 export const LAUNCH_COMMAND_ENV_NAME = "AI_LAUNCH_COMMAND";
 
 const loaderScriptPath: string = path.resolve(import.meta.dirname, "../scripts/instance-loader.sh");
+const shimsDirPath: string = path.resolve(import.meta.dirname, "../scripts/shims");
 
 // The short line actually typed into the pane in place of the real launch command (see
 // buildLaunchCommand above): sources the loader script, which reads the real command back
@@ -59,6 +60,10 @@ export function buildReadyChannelName(instance: InstanceRecord): string {
 
 // For a shellOnly instance: there is no real command to hide (no loader to source), but the
 // dashboard's HTML boot overlay still needs a signal to know the shell's prompt is up.
+//
+// It also puts the agent shims on PATH (the same thing instance-loader.sh does for the other
+// kind of instance), since a shell-only instance is exactly where the user always starts the
+// agent by hand and still expects the sidebar to follow it. `clear` right after wipes the line.
 export function buildShellOnlyReadyCommand(channelName: string): string {
-  return `clear; tmux wait-for -S ${quoteForShell(channelName)}`;
+  return `export PATH=${quoteForShell(shimsDirPath)}:"$PATH"; clear; tmux wait-for -S ${quoteForShell(channelName)}`;
 }

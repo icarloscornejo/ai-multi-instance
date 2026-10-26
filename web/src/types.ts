@@ -123,6 +123,16 @@ export interface UpdateInstancePayload {
 
 export interface LiveStatus {
   available: boolean;
+  // Set when available is false and the server knows why: no agent is running in the pane, or
+  // one is but there is nothing to read from it yet.
+  reason?: "no-agent" | "no-data";
+  // False when the data was recovered from the agent's own files because it never reported to
+  // the dashboard (no statusline): less data, no cost or limits of its own.
+  live?: boolean;
+  // Set by the client when the last poll failed and this is the previous answer.
+  unreachable?: boolean;
+  // When the 5h/7d windows were last reported, which can be another instance of the same account.
+  rateLimitsUpdatedAt?: string;
   provider?: AgentProvider;
   model?: string;
   cwd?: string;

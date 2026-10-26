@@ -7,11 +7,14 @@ import { describe, expect, it } from "vitest";
 
 const scriptPath = fileURLToPath(new URL("../scripts/dashboard-cursor-statusline.mjs", import.meta.url));
 
-function runStatusline(home: string, payload: object, instanceId = "cursor-instance"): string {
+// TMUX_PANE is stripped so the run does not pick up the pane the tests themselves run in: the
+// identity rules under test are driven only by what each test passes in.
+function runStatusline(home: string, payload: object, instanceId: string | null = "cursor-instance"): string {
+  const { TMUX_PANE: _tmuxPane, AI_MULTI_INSTANCE_ID: _instanceId, ...inheritedEnv } = process.env;
   const result = spawnSync(process.execPath, [scriptPath], {
     input: JSON.stringify(payload),
     encoding: "utf8",
-    env: { ...process.env, HOME: home, AI_MULTI_INSTANCE_ID: instanceId },
+    env: { ...inheritedEnv, HOME: home, ...(instanceId === null ? {} : { AI_MULTI_INSTANCE_ID: instanceId }) },
   });
   expect(result.status).toBe(0);
   return result.stdout;
@@ -82,5 +85,28 @@ describe("Cursor dashboard status line", () => {
       contextUsed: 40_000,
       contextSize: 200_000,
     });
+  });
+
+  it("writes nothing when it is not running inside a dashboard instance", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "cursor-statusline-"));
+    runStatusline(home, { session_id: "chat-9", model: { display_name: "GPT" } }, null);
+    await expect(
+      readFile(path.join(home, "Library", "Application Support", "ai-multi-instance", "cursor-instance.json"), "utf8"),
+    ).rejects.toThrow();
+  });
+
+  it("does not carry another agent's cost and rate limits into a Cursor snapshot", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "cursor-statusline-"));
+    const cacheDir = path.join(home, "Library", "Application Support", "ai-multi-instance");
+    await mkdir(cacheDir, { recursive: true });
+    await writeFile(
+      path.join(cacheDir, "cursor-instance.json"),
+      JSON.stringify({ provider: "claude", sessionId: "claude-session", sessionCostUsd: 93.8, fiveHourPct: 21 }),
+    );
+    runStatusline(home, { session_id: "chat-1", model: { display_name: "GPT" } });
+    const snapshot = JSON.parse(await readFile(path.join(cacheDir, "cursor-instance.json"), "utf8"));
+    expect(snapshot).toMatchObject({ provider: "cursor", sessionId: "chat-1", idSource: "env" });
+    expect(snapshot.sessionCostUsd).toBeUndefined();
+    expect(snapshot.fiveHourPct).toBeUndefined();
   });
 });

@@ -1,6 +1,12 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { useLiveStatus } from "../hooks/useLiveStatus";
-import { PROVIDER_DEFAULT_COMMANDS, PROVIDER_LABELS, formatCompactNumber, usagePctColorClass } from "../liveStatusFormatting";
+import {
+  PROVIDER_DEFAULT_COMMANDS,
+  PROVIDER_LABELS,
+  describeLiveStatus,
+  formatCompactNumber,
+  usagePctColorClass,
+} from "../liveStatusFormatting";
 import type { Instance, UpdateInstancePayload } from "../types";
 import { BottomSheet } from "./BottomSheet";
 
@@ -31,8 +37,13 @@ export function InstanceSettingsSheet({ instance, onUpdate, onDeleteRequest, onC
     setCommandDraft(instance.command);
   }, [instance.id, instance.label, instance.command]);
 
-  const liveBranch: string | undefined = liveStatus?.available === true ? liveStatus.branch ?? undefined : undefined;
+  // "No agent" / "no data" answers carry the pane's branch too, so it keeps following checkouts
+  // made with no agent running.
+  const liveBranch: string | undefined = liveStatus?.branch ?? undefined;
   const branch: string | undefined = liveBranch ?? gitBranch ?? undefined;
+  const view = describeLiveStatus(liveStatus, instance.provider);
+  const dimmed: string = view.kind === "data" && view.stale ? " opacity-60" : "";
+  const limitsDimmed: string = view.kind === "data" && view.limitsStale ? " opacity-60" : "";
 
   return (
     <BottomSheet onClose={onClose}>
@@ -61,6 +72,9 @@ export function InstanceSettingsSheet({ instance, onUpdate, onDeleteRequest, onC
 
         <Field label="Provider">
           <div className="mb-[7px] text-[12.5px] font-semibold text-txt-body">{PROVIDER_LABELS[instance.provider]}</div>
+          {view.kind === "data" && view.runningProvider !== null && (
+            <div className="mb-[7px] text-[12px] text-status-warn">Running: {PROVIDER_LABELS[view.runningProvider]}</div>
+          )}
           <input
             className="w-full rounded-sm border border-border-strong bg-app px-[11px] py-[9px] font-mono text-[12.5px] text-txt-body outline-none focus:border-accent-border"
             value={commandDraft}
@@ -88,8 +102,18 @@ export function InstanceSettingsSheet({ instance, onUpdate, onDeleteRequest, onC
           </Field>
         )}
 
-        {liveStatus !== null && liveStatus.available && (
-          <div className="grid grid-cols-2 gap-[14px]">
+        {view.kind === "empty" && <div className="text-[12px] leading-[1.5] text-txt-dimmer">{view.message}</div>}
+        {view.kind === "data" && view.unreachable && (
+          <div className="text-[12px] leading-[1.5] text-status-warn">Dashboard unreachable, showing the last data received.</div>
+        )}
+        {view.kind === "data" && view.fromTranscript && (
+          <div className="text-[12px] leading-[1.5] text-txt-dimmer">
+            Read from the agent's own files: it has not reported a statusline yet, so its cost is not available.
+          </div>
+        )}
+
+        {liveStatus !== null && liveStatus.available && view.kind === "data" && (
+          <div className={`grid grid-cols-2 gap-[14px]${dimmed}`}>
             {liveStatus.model !== undefined && (
               <Field label="Model">
                 <div className="font-mono text-[12.5px] text-txt-body">{liveStatus.model}</div>
@@ -108,22 +132,27 @@ export function InstanceSettingsSheet({ instance, onUpdate, onDeleteRequest, onC
                 </div>
               </Field>
             )}
+            {liveStatus.contextUsed !== undefined && liveStatus.contextSize === undefined && (
+              <Field label="Context">
+                <div className="font-mono text-[12.5px] text-txt-body">{formatCompactNumber(liveStatus.contextUsed)} tokens</div>
+              </Field>
+            )}
             {liveStatus.sessionCostUsd !== undefined && (
               <Field label="Session cost">
                 <div className="font-mono text-[12.5px] text-txt-body">${liveStatus.sessionCostUsd.toFixed(2)}</div>
               </Field>
             )}
-            {liveStatus.fiveHourPct != null && (
+            {view.fiveHour !== null && (
               <Field label="5H limit">
-                <div className={`font-mono text-[12.5px] ${usagePctColorClass(liveStatus.fiveHourPct)}`}>
-                  {Math.round(liveStatus.fiveHourPct)}%
+                <div className={`font-mono text-[12.5px] ${usagePctColorClass(view.fiveHour.pct)}${limitsDimmed}`}>
+                  {Math.round(view.fiveHour.pct)}%
                 </div>
               </Field>
             )}
-            {liveStatus.sevenDayPct != null && (
+            {view.sevenDay !== null && (
               <Field label="7D limit">
-                <div className={`font-mono text-[12.5px] ${usagePctColorClass(liveStatus.sevenDayPct)}`}>
-                  {Math.round(liveStatus.sevenDayPct)}%
+                <div className={`font-mono text-[12.5px] ${usagePctColorClass(view.sevenDay.pct)}${limitsDimmed}`}>
+                  {Math.round(view.sevenDay.pct)}%
                 </div>
               </Field>
             )}
@@ -135,6 +164,11 @@ export function InstanceSettingsSheet({ instance, onUpdate, onDeleteRequest, onC
             {liveStatus.dayTotalUsd != null && (
               <Field label="Today">
                 <div className="font-mono text-[12.5px] text-txt-body">${liveStatus.dayTotalUsd.toFixed(2)}</div>
+              </Field>
+            )}
+            {view.updatedAgo !== null && (
+              <Field label="Updated">
+                <div className={`font-mono text-[12.5px] ${view.stale ? "text-status-warn" : "text-txt-body"}`}>{view.updatedAgo}</div>
               </Field>
             )}
           </div>

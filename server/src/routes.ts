@@ -9,7 +9,18 @@ import { isAgentProvider, PROVIDERS, sessionKeyFor } from "./providers";
 import { pathExists } from "./paths";
 import { loadState, updateState } from "./store";
 import { getPaneCurrentPath, getSessionPresence, killSession, signalChannel } from "./tmux";
-import { isRemoteUnreachableError, NETWORK_GIT_TIMEOUT_MS, runGit } from "./git";
+import { currentBranch, isRemoteUnreachableError, NETWORK_GIT_TIMEOUT_MS, runGit } from "./git";
+import { claudeFallback, codexFallback, enrichCodexStatus, findCodexSessionFile } from "./agentFallback";
+import {
+  listSiblingSnapshots,
+  ownedSessionIds,
+  persistableSession,
+  resolveLiveStatus,
+  snapshotDirectory,
+  type PersistableSession,
+  type Snapshot,
+} from "./liveStatus";
+import { findPaneAgent, type PaneAgent } from "./paneAgent";
 import { LaunchProgress } from "./launchProgress";
 import { initializeInstanceSession } from "./terminal";
 import { withSessionLock } from "./sessionLock";
@@ -77,15 +88,6 @@ function getLanUrl(): string | null {
     }
   }
   return null;
-}
-
-async function currentBranch(cwd: string): Promise<string | null> {
-  try {
-    return await runGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
-  } catch {
-    // Not a git repo, git not installed, or the folder does not exist anymore
-    return null;
-  }
 }
 
 async function localBranches(cwd: string): Promise<string[]> {
@@ -159,24 +161,29 @@ async function findStaleBranches(cwd: string): Promise<StaleBranchesResponse> {
 }
 
 function resolveLiveStatusSnapshotPath(instance: InstanceRecord): string {
-  // ~/Library/Application Support, not ~/.cache - see with-writable-tmpdir.mjs's
-  // resolveTmuxTmpdir comment: a folder literally named "cache" anywhere under $HOME is a
-  // target for third-party junk cleaners (CleanMyMac and similar), which have deleted files
-  // out from under this app before. Application Support is the macOS convention these tools
-  // are built to leave alone.
-  return path.join(os.homedir(), "Library", "Application Support", "ai-multi-instance", `${instance.id}.json`);
+  return path.join(snapshotDirectory(), `${instance.id}.json`);
 }
 
-async function readLiveSessionId(instance: InstanceRecord): Promise<string | null> {
+async function readInstanceSnapshot(instance: InstanceRecord): Promise<Snapshot | null> {
   try {
-    const snapshotPath: string = resolveLiveStatusSnapshotPath(instance);
-    const snapshot = JSON.parse(await fs.readFile(snapshotPath, "utf8")) as { sessionId?: string | null };
-    return typeof snapshot.sessionId === "string" && snapshot.sessionId !== "" ? snapshot.sessionId : null;
+    return JSON.parse(await fs.readFile(resolveLiveStatusSnapshotPath(instance), "utf8")) as Snapshot;
   } catch {
     // No statusLine snapshot yet for this directory (not configured, or Claude Code
     // hasn't redrawn its statusline here since this dashboard instance was launched)
     return null;
   }
+}
+
+// What the instance's pane is running right now. A custom command is whatever the user typed:
+// "no known agent" says nothing about it, so unless a known agent is actually found there it is
+// served from its snapshot like before instead of being reported as not running.
+async function probePaneAgent(instance: InstanceRecord): Promise<PaneAgent> {
+  const found: PaneAgent = await findPaneAgent(instance.tmuxSession);
+  return instance.provider === "custom" && found.kind !== "agent" ? { kind: "unknown" } : found;
+}
+
+async function readLiveSession(instance: InstanceRecord): Promise<PersistableSession | null> {
+  return persistableSession(instance, await readInstanceSnapshot(instance), await probePaneAgent(instance));
 }
 
 async function writeSessionSnapshot(
@@ -198,66 +205,6 @@ async function writeSessionSnapshot(
     }),
     "utf8"
   );
-}
-
-async function findCodexSessionFile(sessionId: string): Promise<string | undefined> {
-  const sessionsRoot: string = path.join(process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex"), "sessions");
-  try {
-    const entries = await fs.readdir(sessionsRoot, { recursive: true });
-    const relativePath: string | undefined = entries.find(
-      (entry) => typeof entry === "string" && entry.endsWith(`${sessionId}.jsonl`)
-    );
-    return relativePath === undefined ? undefined : path.join(sessionsRoot, relativePath);
-  } catch {
-    return undefined;
-  }
-}
-
-async function enrichCodexStatus(snapshot: Record<string, unknown>): Promise<Record<string, unknown>> {
-  if (typeof snapshot.sessionFile !== "string") return snapshot;
-  try {
-    const content: string = await fs.readFile(snapshot.sessionFile, "utf8");
-    let model: string | undefined;
-    let effort: string | undefined;
-    let tokenInfo: Record<string, unknown> | null = null;
-    let rateLimits: Record<string, unknown> | null = null;
-    for (const line of content.trim().split("\n")) {
-      const event = JSON.parse(line) as { type?: string; payload?: Record<string, unknown> };
-      if (event.type === "turn_context") {
-        if (typeof event.payload?.model === "string") model = event.payload.model;
-        const collaboration = event.payload?.collaboration_mode as { settings?: { reasoning_effort?: string } } | undefined;
-        if (typeof collaboration?.settings?.reasoning_effort === "string") effort = collaboration.settings.reasoning_effort;
-      }
-      if (event.type === "event_msg" && event.payload?.type === "token_count") {
-        tokenInfo = (event.payload.info as Record<string, unknown> | null) ?? null;
-        rateLimits = (event.payload.rate_limits as Record<string, unknown> | null) ?? null;
-      }
-    }
-    const totalUsage = tokenInfo?.total_token_usage as { total_tokens?: number } | undefined;
-    const contextSize = tokenInfo?.model_context_window;
-    const primary = rateLimits?.primary as { used_percent?: number; resets_at?: number } | undefined;
-    const secondary = rateLimits?.secondary as { used_percent?: number; resets_at?: number } | undefined;
-    const contextUsed: number | undefined = totalUsage?.total_tokens;
-    return {
-      ...snapshot,
-      ...(model ? { model } : {}),
-      ...(effort ? { effort } : {}),
-      ...(typeof contextUsed === "number" ? { contextUsed } : {}),
-      ...(typeof contextSize === "number"
-        ? {
-            contextSize,
-            contextPct: contextUsed === undefined ? 0 : (contextUsed / contextSize) * 100,
-          }
-        : {}),
-      ...(typeof primary?.used_percent === "number" ? { fiveHourPct: primary.used_percent } : {}),
-      ...(typeof primary?.resets_at === "number" ? { fiveHourResetsAt: primary.resets_at } : {}),
-      ...(typeof secondary?.used_percent === "number" ? { sevenDayPct: secondary.used_percent } : {}),
-      ...(typeof secondary?.resets_at === "number" ? { sevenDayResetsAt: secondary.resets_at } : {}),
-      updatedAt: new Date().toISOString(),
-    };
-  } catch {
-    return snapshot;
-  }
 }
 
 export const apiRouter: Router = express.Router();
@@ -1043,34 +990,46 @@ apiRouter.get(
       return;
     }
 
-    const snapshotPath: string = resolveLiveStatusSnapshotPath(instance);
+    const [snapshot, agent, siblings] = await Promise.all([
+      readInstanceSnapshot(instance),
+      probePaneAgent(instance),
+      listSiblingSnapshots(),
+    ]);
+    const now: number = Date.now();
+    const owned: Set<string> = ownedSessionIds(siblings, instance.id, now);
+    const { response: liveStatus, persist } = await resolveLiveStatus({
+      instance,
+      agent,
+      snapshot,
+      siblings,
+      fallback: (found) => (found.provider === "codex" ? codexFallback(found, owned) : claudeFallback(found, owned)),
+      enrichCodex: enrichCodexStatus,
+    }).catch(() => ({ response: { available: false } as Record<string, unknown>, persist: null }));
 
-    try {
-      let snapshot = JSON.parse(await fs.readFile(snapshotPath, "utf8")) as Record<string, unknown>;
-      if (instance.provider === "codex") {
-        snapshot = await enrichCodexStatus(snapshot);
-      }
-      const sessionId: unknown = snapshot.sessionId;
-      if (typeof sessionId === "string" && sessionId !== "" && instance.sessionId !== sessionId) {
-        // Re-find the instance inside the transaction: the reads above are async, so a
-        // DELETE (or rename) from another device may have committed meanwhile. Saving the
-        // pre-read `state` here would resurrect a deleted instance or undo that change.
-        await updateState(async (draft) => {
-          const current = draft.instances.find((candidate) => candidate.id === instance.id);
-          if (current === undefined || current.sessionId === sessionId) {
-            return { result: undefined };
-          }
-          current.sessionId = sessionId;
-          draft.sessionsByKey[sessionKeyFor(current.provider, current.locationPath, current.label)] = sessionId;
-          return { result: undefined, nextState: draft };
-        });
-      }
-      response.json({ available: true, ...snapshot });
-    } catch {
-      // No statusLine snapshot yet for this directory (not configured, or Claude Code
-      // hasn't redrawn its statusline here since this dashboard instance was launched)
-      response.json({ available: false });
+    if (persist !== null && (instance.sessionId !== persist.sessionId || persist.pinConfigDir !== undefined)) {
+      // Re-find the instance inside the transaction: the reads above are async, so a
+      // DELETE (or rename) from another device may have committed meanwhile. Saving the
+      // pre-read `state` here would resurrect a deleted instance or undo that change.
+      await updateState(async (draft) => {
+        const current = draft.instances.find((candidate) => candidate.id === instance.id);
+        if (current === undefined) return { result: undefined };
+        const pinProfile: boolean = persist.pinConfigDir !== undefined && current.configDir === undefined;
+        if (current.sessionId === persist.sessionId && !pinProfile) return { result: undefined };
+        current.sessionId = persist.sessionId;
+        if (pinProfile) current.configDir = persist.pinConfigDir;
+        draft.sessionsByKey[sessionKeyFor(current.provider, current.locationPath, current.label)] = persist.sessionId;
+        return { result: undefined, nextState: draft };
+      });
     }
+
+    // Nothing to show for the agent: still say which branch the pane is on, since the sidebar's
+    // own one-time lookup would otherwise stay stuck on whatever it saw when it was opened.
+    if (liveStatus.available === false && typeof liveStatus.reason === "string") {
+      const cwd: string = await getPaneCurrentPath(instance.tmuxSession).catch(() => instance.locationPath);
+      const branch: string | null = await currentBranch(cwd);
+      if (branch !== null) liveStatus.branch = branch;
+    }
+    response.json(liveStatus);
   })
 );
 
@@ -1096,11 +1055,11 @@ apiRouter.delete(
       // OWN transaction, before any kill attempt: it is non-destructive, and losing it would
       // cost a future resume even on the ordinary happy path, so there's no reason to gate it
       // on how the kill goes.
-      const liveSessionId: string | null = await readLiveSessionId(preInstance);
-      if (liveSessionId !== null) {
+      const liveSession: PersistableSession | null = await readLiveSession(preInstance);
+      if (liveSession !== null) {
         const resumeKey: string = sessionKeyFor(preInstance.provider, preInstance.locationPath, preInstance.label);
         await updateState(async (draft) => {
-          draft.sessionsByKey[resumeKey] = liveSessionId;
+          draft.sessionsByKey[resumeKey] = liveSession.sessionId;
           return { result: undefined, nextState: draft };
         });
       }

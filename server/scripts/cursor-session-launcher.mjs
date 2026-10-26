@@ -3,6 +3,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { resolvePaneIdentity } from "./lib/pane-identity.mjs";
 
 const [command, instanceId, cwd, model = ""] = process.argv.slice(2);
 
@@ -16,6 +17,9 @@ try {
   // under $HOME.
   const cacheRoot = path.join(os.homedir(), "Library", "Application Support", "ai-multi-instance");
   await fs.mkdir(cacheRoot, { recursive: true });
+  // The pane job pid lets the sidebar tell this snapshot belongs to the Cursor process running
+  // now, not to an earlier session left in the same pane.
+  const identity = await resolvePaneIdentity();
   const snapshotPath = path.join(cacheRoot, `${instanceId}.json`);
   await fs.writeFile(
     snapshotPath,
@@ -24,6 +28,8 @@ try {
       sessionId,
       cwd,
       ...(model ? { model } : {}),
+      idSource: "env",
+      ...(identity?.paneJobPid != null ? { paneJobPid: identity.paneJobPid } : {}),
       updatedAt: new Date().toISOString(),
     }),
     "utf8"

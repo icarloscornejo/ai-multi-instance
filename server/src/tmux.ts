@@ -362,6 +362,29 @@ export async function getPaneCurrentPath(sessionName: string): Promise<string> {
   return runTmux(["display-message", "-p", "-t", sessionName, "#{pane_current_path}"]);
 }
 
+// The instance IS its original pane: a user split or an agent-team teammate pane in the same
+// session must not be mistaken for it. Pane ids (%N) only grow, so the lowest one in the
+// session is the pane the session was created with.
+export function pickOriginalPane(listPanesOutput: string): { paneId: string; panePid: number } | null {
+  let original: { paneId: string; panePid: number; order: number } | null = null;
+  for (const line of listPanesOutput.split("\n")) {
+    const match = /^%(\d+) (\d+)$/.exec(line.trim());
+    if (match === null) continue;
+    const order: number = Number(match[1]);
+    if (original === null || order < original.order) {
+      original = { paneId: `%${match[1]}`, panePid: Number(match[2]), order };
+    }
+  }
+  return original === null ? null : { paneId: original.paneId, panePid: original.panePid };
+}
+
+export async function getOriginalPanePid(sessionName: string): Promise<number> {
+  const output: string = await runTmux(["list-panes", "-s", "-t", sessionName, "-F", "#{pane_id} #{pane_pid}"]);
+  const original = pickOriginalPane(output);
+  if (original === null) throw new TmuxError(`No pane found for session ${sessionName}`);
+  return original.panePid;
+}
+
 // TMUX_TMPDIRs the dashboard pinned before the current one (see resolveTmuxTmpdir in
 // scripts/with-writable-tmpdir.mjs). Anything ccdash-* still alive there is unreachable from
 // this server yet keeps its agent running, and the CLI's own name-collision check (which

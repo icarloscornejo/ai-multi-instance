@@ -1,26 +1,14 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { PROVIDER_DEFAULT_COMMANDS, PROVIDER_LABELS, formatCompactNumber, usagePctColorClass } from "../liveStatusFormatting";
+import {
+  PROVIDER_DEFAULT_COMMANDS,
+  PROVIDER_LABELS,
+  describeLiveStatus,
+  formatCompactNumber,
+  formatLongResetTime,
+  formatShortResetTime,
+  usagePctColorClass,
+} from "../liveStatusFormatting";
 import type { Instance, LiveStatus, UpdateInstancePayload } from "../types";
-
-function formatShortResetTime(epochSeconds: number): string {
-  return new Date(epochSeconds * 1000).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
-}
-
-function formatLongResetTime(epochSeconds: number): string {
-  return new Date(epochSeconds * 1000).toLocaleString(undefined, {
-    weekday: "short",
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
-}
-
-function formatAge(isoTimestamp: string): string {
-  const ageSeconds: number = Math.max(0, Math.round((Date.now() - new Date(isoTimestamp).getTime()) / 1000));
-  return ageSeconds < 60 ? `${ageSeconds}s ago` : `${Math.round(ageSeconds / 60)}m ago`;
-}
 
 // Splits an absolute path into indented tree lines so long paths read top-to-bottom
 // instead of wrapping mid-word in the narrow sidebar.
@@ -123,7 +111,12 @@ export function Sidebar({ instance, liveStatus, gitBranch, onUpdate, onDeleteReq
     setCommandDraft(instance.command);
   }, [instance.id, instance.command]);
 
-  const liveBranch: string | undefined = liveStatus?.available === true ? liveStatus.branch ?? undefined : undefined;
+  // "No agent" / "no data" answers carry the pane's branch too, so it keeps following checkouts
+  // made with no agent running.
+  const liveBranch: string | undefined = liveStatus?.branch ?? undefined;
+  const view = describeLiveStatus(liveStatus, instance.provider);
+  const dimmed: string = view.kind === "data" && view.stale ? " opacity-60" : "";
+  const limitsDimmed: string = view.kind === "data" && view.limitsStale ? " opacity-60" : "";
 
   return (
     <aside className="flex w-[286px] flex-none flex-col gap-[14px] overflow-y-auto border-l border-border bg-surface p-[18px_16px]">
@@ -146,6 +139,9 @@ export function Sidebar({ instance, liveStatus, gitBranch, onUpdate, onDeleteReq
       <Section>
         <Eyebrow>Provider</Eyebrow>
         <div className="mb-[5px] text-[12px] font-semibold text-txt-body">{PROVIDER_LABELS[instance.provider]}</div>
+        {view.kind === "data" && view.runningProvider !== null && (
+          <div className="mb-[5px] text-[11px] text-status-warn">Running: {PROVIDER_LABELS[view.runningProvider]}</div>
+        )}
         <input
           className="note-field font-mono text-[12px] text-txt-body"
           value={commandDraft}
@@ -159,15 +155,25 @@ export function Sidebar({ instance, liveStatus, gitBranch, onUpdate, onDeleteReq
         />
       </Section>
 
-      {liveStatus === null && (
+      {view.kind === "loading" && (
         <Section>
           <div className="text-[11px] text-txt-dimmer">Loading...</div>
         </Section>
       )}
-      {liveStatus !== null && !liveStatus.available && (
+      {view.kind === "empty" && (
+        <Section>
+          <div className="text-[11px] leading-[1.5] text-txt-dimmer">{view.message}</div>
+        </Section>
+      )}
+      {view.kind === "data" && view.unreachable && (
+        <Section>
+          <div className="text-[11px] leading-[1.5] text-status-warn">Dashboard unreachable, showing the last data received.</div>
+        </Section>
+      )}
+      {view.kind === "data" && view.fromTranscript && (
         <Section>
           <div className="text-[11px] leading-[1.5] text-txt-dimmer">
-            No live provider data yet. Session and git information will appear when {PROVIDER_LABELS[instance.provider]} exposes it.
+            Read from the agent's own files: it has not reported a statusline yet, so its cost is not available.
           </div>
         </Section>
       )}
@@ -190,8 +196,8 @@ export function Sidebar({ instance, liveStatus, gitBranch, onUpdate, onDeleteReq
         </Section>
       )}
 
-      {liveStatus !== null && liveStatus.available && (
-        <>
+      {liveStatus !== null && liveStatus.available && view.kind === "data" && (
+        <div className={`flex flex-col gap-[14px] border-t border-border pt-[12px]${dimmed}`}>
           {liveStatus.model !== undefined && (
             <Section>
               <Eyebrow>Model</Eyebrow>
@@ -215,6 +221,14 @@ export function Sidebar({ instance, liveStatus, gitBranch, onUpdate, onDeleteReq
             </Section>
           )}
 
+          {/* Recovered from a transcript: the window size is unknown, so only the tokens in use. */}
+          {liveStatus.contextUsed !== undefined && liveStatus.contextSize === undefined && (
+            <Section>
+              <Eyebrow>Context</Eyebrow>
+              <div className="font-mono text-[12px] text-txt-body">{formatCompactNumber(liveStatus.contextUsed)} tokens</div>
+            </Section>
+          )}
+
           {(liveStatus.inputTokens !== undefined || liveStatus.outputTokens !== undefined) && (
             <Section>
               <Eyebrow>Tokens</Eyebrow>
@@ -233,22 +247,22 @@ export function Sidebar({ instance, liveStatus, gitBranch, onUpdate, onDeleteReq
             </Section>
           )}
 
-          {liveStatus.fiveHourPct != null && (
+          {view.fiveHour !== null && (
             <Section>
               <Eyebrow>5H LIMIT</Eyebrow>
-              <div className="font-mono text-[12px] text-txt-body">
-                <span className={usagePctColorClass(liveStatus.fiveHourPct)}>{Math.round(liveStatus.fiveHourPct)}%</span>
-                {liveStatus.fiveHourResetsAt != null && <span> → {formatShortResetTime(liveStatus.fiveHourResetsAt)}</span>}
+              <div className={`font-mono text-[12px] text-txt-body${limitsDimmed}`}>
+                <span className={usagePctColorClass(view.fiveHour.pct)}>{Math.round(view.fiveHour.pct)}%</span>
+                {view.fiveHour.resetsAt !== null && <span> → {formatShortResetTime(view.fiveHour.resetsAt)}</span>}
               </div>
             </Section>
           )}
 
-          {liveStatus.sevenDayPct != null && (
+          {view.sevenDay !== null && (
             <Section>
               <Eyebrow>7D LIMIT</Eyebrow>
-              <div className="font-mono text-[12px] text-txt-body">
-                <span className={usagePctColorClass(liveStatus.sevenDayPct)}>{Math.round(liveStatus.sevenDayPct)}%</span>
-                {liveStatus.sevenDayResetsAt != null && <span> → {formatLongResetTime(liveStatus.sevenDayResetsAt)}</span>}
+              <div className={`font-mono text-[12px] text-txt-body${limitsDimmed}`}>
+                <span className={usagePctColorClass(view.sevenDay.pct)}>{Math.round(view.sevenDay.pct)}%</span>
+                {view.sevenDay.resetsAt !== null && <span> → {formatLongResetTime(view.sevenDay.resetsAt)}</span>}
               </div>
             </Section>
           )}
@@ -280,10 +294,10 @@ export function Sidebar({ instance, liveStatus, gitBranch, onUpdate, onDeleteReq
             </Section>
           )}
 
-          {liveStatus.updatedAt !== undefined && (
-            <div className="text-[11px] text-txt-dimmer">Updated {formatAge(liveStatus.updatedAt)}</div>
+          {view.updatedAgo !== null && (
+            <div className={`text-[11px] ${view.stale ? "text-status-warn" : "text-txt-dimmer"}`}>Updated {view.updatedAgo}</div>
           )}
-        </>
+        </div>
       )}
 
       <button

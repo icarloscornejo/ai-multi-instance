@@ -7,6 +7,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { resolvePaneIdentity } from "./lib/pane-identity.mjs";
 
 const execFileAsync = promisify(execFile);
 const input = await readStdin();
@@ -14,8 +15,12 @@ const payload = parsePayload(input);
 
 await renderOriginalStatusline(input, payload);
 
-if (payload !== null && process.env.AI_MULTI_INSTANCE_ID) {
-  await writeSnapshot(payload, process.env.AI_MULTI_INSTANCE_ID);
+// This statusline is installed globally in ~/.cursor, so it also runs for Cursor sessions that
+// have nothing to do with the dashboard: it only writes when the caller is a dashboard
+// instance's own pane.
+const identity = payload === null ? null : await resolvePaneIdentity();
+if (payload !== null && identity !== null) {
+  await writeSnapshot(payload, identity);
 }
 
 function readStdin() {
@@ -90,12 +95,20 @@ function runShellCommand(command, input) {
   });
 }
 
-async function writeSnapshot(payload, instanceId) {
+async function writeSnapshot(payload, { instanceId, idSource, paneJobPid }) {
   // ~/Library/Application Support, not ~/.cache - see scripts/with-writable-tmpdir.mjs's
   // resolveTmuxTmpdir comment: third-party junk cleaners target folders named "cache" anywhere
   // under $HOME.
   const cacheRoot = path.join(os.homedir(), "Library", "Application Support", "ai-multi-instance");
-  const existing = await readSnapshot(cacheRoot, instanceId);
+  const previous = await readSnapshot(cacheRoot, instanceId);
+  // Carry fields over only from this same Cursor job (or the server's own pre-launch snapshot,
+  // which has no pid yet). Anything else is another agent's or an earlier session's: spreading
+  // it would leave a Claude run's cost and rate limits sitting in a Cursor snapshot that now
+  // carries a fresh updatedAt.
+  const existing =
+    previous.provider === "cursor" && (previous.paneJobPid == null || previous.paneJobPid === paneJobPid)
+      ? previous
+      : {};
   const cwd = stringAt(payload, ["workspace", "current_dir"]) ?? stringAt(payload, ["cwd"]);
   const contextSize = numberAt(payload, ["context_window", "context_window_size"]);
   const contextPct = contextPercentage(payload);
@@ -122,6 +135,8 @@ async function writeSnapshot(payload, instanceId) {
     ...(inputTokens !== undefined ? { inputTokens } : {}),
     ...(outputTokens !== undefined ? { outputTokens } : {}),
     ...(cwd ? await gitStatus(cwd) : {}),
+    idSource,
+    ...(paneJobPid !== null ? { paneJobPid } : {}),
     updatedAt: new Date().toISOString(),
   };
 

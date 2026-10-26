@@ -36,6 +36,13 @@ fi
 # Nothing meaningful to key a snapshot on without a cwd
 [ -z "$cwd" ] && exit 0
 
+# Only a dashboard instance's own pane writes a snapshot: the id comes from the launch
+# command's AI_MULTI_INSTANCE_ID or, for an agent started by hand, from the tmux session name.
+# A user split or any non-dashboard terminal gets the visual output above and nothing else.
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$script_dir/lib/pane-identity.sh"
+ai_resolve_pane_identity || exit 0
+
 size=$(echo "$input" | jq -r '.context_window.context_window_size // 200000')
 [ "$size" -eq 0 ] 2>/dev/null && size=200000
 input_tokens=$(echo "$input" | jq -r '.context_window.current_usage.input_tokens // 0')
@@ -162,7 +169,7 @@ else
   fi
 fi
 
-snapshot_id="${AI_MULTI_INSTANCE_ID:-$(echo -n "$cwd" | shasum -a 256 | cut -c1-16)}"
+snapshot_id="$AI_INSTANCE_ID"
 tmp_file=$(mktemp "${cache_dir}/.snapshot.XXXXXX")
 
 jq -n \
@@ -187,6 +194,9 @@ jq -n \
   --arg dayTotalUsd "$day_total_usd" \
   --arg burnPerHour "$burn_per_hour" \
   --arg updatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg idSource "$AI_ID_SOURCE" \
+  --arg paneJobPid "$AI_PANE_JOB_PID" \
+  --arg configDir "${claude_config_dir%/}" \
   '
   # select() inside an object value would make the WHOLE object produce no
   # output whenever it filters that one field out; use if/then/else null instead
@@ -213,6 +223,9 @@ jq -n \
     extraLimitUsd: ($extraLimitUsd | optNum),
     dayTotalUsd: ($dayTotalUsd | optNum),
     burnPerHour: ($burnPerHour | optNum),
+    idSource: $idSource,
+    paneJobPid: ($paneJobPid | optNum),
+    configDir: $configDir,
     updatedAt: $updatedAt
   }' > "$tmp_file" && mv "$tmp_file" "$cache_dir/${snapshot_id}.json"
 

@@ -44,4 +44,8 @@ describe("buildShellOnlyReadyCommand", () => {
     expect(command).toContain("clear;");
     expect(command).toContain("tmux wait-for -S 'ccdash-ready-instance-1-123'");
   });
+
+  it("puts the agent shims on PATH first, so a hand-started agent in a shell-only instance reports to the sidebar", () => {
+    expect(buildShellOnlyReadyCommand("c")).toMatch(/^export PATH='\/.*\/scripts\/shims':"\$PATH"; clear;/);
+  });
 });

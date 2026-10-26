@@ -15,6 +15,10 @@ export interface InstanceRecord {
   model: string | null;
   effort: string | null;
   sessionId?: string | null;
+  // Claude profile (CLAUDE_CONFIG_DIR) the dashboard launched this instance with, learned from
+  // its first dashboard-launched snapshot. Only sessions of this profile may become the resume
+  // target (see persistableSession in liveStatus.ts).
+  configDir?: string;
   fontSize: number;
   createdAt: string;
   shellOnly?: boolean;
