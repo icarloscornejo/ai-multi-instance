@@ -100,7 +100,7 @@ A way to reach the dashboard beyond `http://ai.local` on the same machine. Both 
 ## How it works
 
 - **Backend** (`server/`): Node + Express + ws. Each instance is a tmux session (`ccdash-<id>`) created in its location folder. The browser attaches via WebSocket: the server spawns a pty running `tmux attach-session` and bridges the two. Detach on tab close, session stays alive.
-- **Frontend** (`web/`): React + Vite + xterm.js + Tailwind, dev server on port 5173. `setup.sh` adds `ai.local` to `/etc/hosts` and configures [Caddy](https://caddyserver.com) to proxy port 80 to Vite.
+- **Frontend** (`web/`): React + Vite + xterm.js + Tailwind, dev server on port 5173. `setup.sh` adds `ai.local` to `/etc/hosts` and configures [Caddy](https://caddyserver.com) to proxy port 80 to the dashboard server (port 3001), which serves the built frontend from `web/dist`.
 - **State** (`data/instances.json`): instance registry and config, persists across restarts.
 - **Providers**: a small adapter layer builds valid launch and resume commands for each CLI. Custom commands are executed exactly as entered.
 - **Resume**: Claude uses its session ID, Codex captures the UUID from local session metadata, and Cursor creates and stores a chat ID before launch.

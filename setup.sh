@@ -74,7 +74,7 @@ done
 # The server uses import.meta.dirname, available since node 20.11: if there is an old
 # node floating around (nvm, prior installs), install a current one via brew
 node_is_recent() {
-  command -v node >/dev/null 2>&1 && node -e 'process.exit(parseInt(process.versions.node, 10) >= 20 ? 0 : 1)'
+  command -v node >/dev/null 2>&1 && node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 20 || (major === 20 && minor >= 11) ? 0 : 1)'
 }
 if node_is_recent; then
   ok "node already installed ($(node --version))"
@@ -282,13 +282,34 @@ else
   ok "caddy installed"
 fi
 
-# cloudflared powers the "Remote access" tunnel in Settings (ai.local only): installed
-# here, not run as a service, since the tunnel itself is started/stopped from the UI.
-if command -v cloudflared >/dev/null 2>&1; then
-  ok "cloudflared already installed ($(cloudflared --version 2>/dev/null | head -1))"
-else
+# cloudflared powers both remote-access tunnels: the Quick Tunnel the server spawns, and the
+# Named Tunnel connector that runs as its own LaunchAgent. It is upgraded on every run, not just
+# installed: it is network-facing and ships its own trusted CA set, so a stale binary stays
+# exposed (e.g. Cloudflare's 2026-10 eMudhra advisory, fixed in 2026.10.2).
+tunnel_service_target="gui/$(id -u)/com.ai-multi-instance.tunnel"
+if ! command -v cloudflared >/dev/null 2>&1; then
   brew install cloudflared
   ok "cloudflared installed"
+elif brew list --versions cloudflared >/dev/null 2>&1; then
+  cloudflared_before="$(cloudflared --version 2>/dev/null | head -1)"
+  # brew upgrade refreshes its index first and is a no-op when already current
+  if ! brew upgrade cloudflared; then
+    warn "brew upgrade cloudflared failed; retry it manually"
+  fi
+  cloudflared_after="$(cloudflared --version 2>/dev/null | head -1)"
+  if [[ "${cloudflared_before}" == "${cloudflared_after}" ]]; then
+    ok "cloudflared up to date (${cloudflared_after})"
+  else
+    ok "cloudflared upgraded (${cloudflared_after})"
+    # A running connector keeps the old binary until restarted. Only kick it if it is running,
+    # so a tunnel stopped on purpose (no enabled sentinel) stays stopped.
+    if launchctl print "${tunnel_service_target}" 2>/dev/null | grep -q 'pid = '; then
+      launchctl kickstart -k "${tunnel_service_target}"
+      ok "Named Tunnel connector restarted on the new cloudflared"
+    fi
+  fi
+else
+  warn "cloudflared at $(command -v cloudflared) was not installed with Homebrew: keep it at 2026.10.2+ yourself"
 fi
 
 # Local HTTPS (mkcert + a generated Caddyfile.https) used to exist for the PWA, which
