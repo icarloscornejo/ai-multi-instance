@@ -6,6 +6,8 @@ import {
   formatCompactNumber,
   formatLongResetTime,
   formatShortResetTime,
+  formatUpstream,
+  upstreamFor,
   usagePctColorClass,
 } from "../liveStatusFormatting";
 import type { Instance, LiveStatus, UpdateInstancePayload } from "../types";
@@ -114,6 +116,8 @@ export function Sidebar({ instance, liveStatus, gitBranch, onUpdate, onDeleteReq
   // "No agent" / "no data" answers carry the pane's branch too, so it keeps following checkouts
   // made with no agent running.
   const liveBranch: string | undefined = liveStatus?.branch ?? undefined;
+  const displayedUpstream = upstreamFor(liveStatus, liveBranch ?? gitBranch ?? undefined);
+  const upstreamView = displayedUpstream === null ? null : formatUpstream(displayedUpstream);
   const view = describeLiveStatus(liveStatus, instance.provider);
   const dimmed: string = view.kind === "data" && view.stale ? " opacity-60" : "";
   const limitsDimmed: string = view.kind === "data" && view.limitsStale ? " opacity-60" : "";
@@ -193,6 +197,7 @@ export function Sidebar({ instance, liveStatus, gitBranch, onUpdate, onDeleteReq
               </span>
             )}
           </div>
+          {upstreamView !== null && <div className={`mt-[3px] font-mono text-[11px] ${upstreamView.colorClass}`}>{upstreamView.text}</div>}
         </Section>
       )}
 

@@ -59,6 +59,66 @@ export async function currentBranch(cwd: string): Promise<string | null> {
   }
 }
 
+// Whether the checked-out branch has been published, judged by where `git push` would send it
+// and not by `@{upstream}`: a branch cut with `git checkout -b feat origin/main` has upstream
+// origin/main but was never pushed anywhere. `branch` rides along so the client can check it is
+// describing the same branch it is displaying.
+export type BranchUpstream = { branch: string } & (
+  | { state: "unpublished" }
+  | { state: "gone" }
+  | { state: "tracking"; ahead: number; behind: number; remoteName: string; pushRef: string }
+);
+
+// Fields separated by NUL, one branch per line, `%(HEAD)` is `*` on the checked-out one.
+//   %(upstream) is the configured upstream, %(push) where `git push` would send the branch,
+//   %(push:track) how far the push ref is ahead/behind ("gone" when it no longer exists).
+// `refname:lstrip=2` and not `:short`: short returns "heads/<name>" when a tag shares the name.
+const BRANCH_UPSTREAM_FORMAT: string =
+  "%(HEAD)%00%(refname:lstrip=2)%00%(upstream)%00%(push)%00%(push:track,nobracket)%00%(push:remotename)";
+
+// Pure so the push.default quirks below are testable without a repo. Takes the raw output of
+// `for-each-ref --points-at=HEAD` because several branches can point at the same commit and only
+// the line marked `*` is the checked-out one.
+export function parseBranchUpstream(forEachRefOutput: string): BranchUpstream | null {
+  const checkedOutLine: string | undefined = forEachRefOutput.split("\n").find((line) => line.startsWith("*"));
+  if (checkedOutLine === undefined) {
+    // Detached HEAD: no branch to describe
+    return null;
+  }
+  const [, branch = "", upstreamRef = "", pushRef = "", pushTrack = "", remoteName = ""] = checkedOutLine.split("\0");
+  const remoteBranchPrefix: string = `refs/remotes/${remoteName}/`;
+
+  // push.default=simple leaves %(push) empty for a branch that was never pushed. A remote of "."
+  // means the push target is another local branch. A remote branch with another name is not this
+  // branch's own publication (checkout -b feat origin/main, then push would go to origin/feat).
+  if (pushRef === "" || remoteName === "" || remoteName === "." || pushRef !== `${remoteBranchPrefix}${branch}`) {
+    return { branch, state: "unpublished" };
+  }
+  if (pushTrack === "gone") {
+    // push.default=current|matching builds %(push) even when that ref never existed, which also
+    // reads as "gone". It only really was published when it was this branch's configured upstream.
+    return { branch, state: upstreamRef === pushRef ? "gone" : "unpublished" };
+  }
+  const ahead: number = Number(/ahead (\d+)/.exec(pushTrack)?.[1] ?? 0);
+  const behind: number = Number(/behind (\d+)/.exec(pushTrack)?.[1] ?? 0);
+  return { branch, state: "tracking", ahead, behind, remoteName, pushRef };
+}
+
+// Local only (no fetch): a `git push` updates the remote-tracking ref, so "unpublished" and
+// "ahead N" are exact; "behind" and "gone" are as fresh as the last fetch.
+export async function branchUpstream(cwd: string): Promise<BranchUpstream | null> {
+  try {
+    const output: string = await runGit(cwd, ["for-each-ref", "--points-at=HEAD", `--format=${BRANCH_UPSTREAM_FORMAT}`, "refs/heads"]);
+    return parseBranchUpstream(output);
+  } catch (error) {
+    if (error instanceof GitError) {
+      // Not a git repo, git not installed, or the folder does not exist anymore
+      return null;
+    }
+    throw error;
+  }
+}
+
 // Always passes `-C <cwd>` so callers never have to. `timeoutMs` picks between the two
 // constants above based on whether the command touches the network.
 export async function runGit(

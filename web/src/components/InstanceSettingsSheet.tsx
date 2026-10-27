@@ -5,6 +5,8 @@ import {
   PROVIDER_LABELS,
   describeLiveStatus,
   formatCompactNumber,
+  formatUpstream,
+  upstreamFor,
   usagePctColorClass,
 } from "../liveStatusFormatting";
 import type { Instance, UpdateInstancePayload } from "../types";
@@ -41,6 +43,8 @@ export function InstanceSettingsSheet({ instance, onUpdate, onDeleteRequest, onC
   // made with no agent running.
   const liveBranch: string | undefined = liveStatus?.branch ?? undefined;
   const branch: string | undefined = liveBranch ?? gitBranch ?? undefined;
+  const displayedUpstream = upstreamFor(liveStatus, branch);
+  const upstreamView = displayedUpstream === null ? null : formatUpstream(displayedUpstream);
   const view = describeLiveStatus(liveStatus, instance.provider);
   const dimmed: string = view.kind === "data" && view.stale ? " opacity-60" : "";
   const limitsDimmed: string = view.kind === "data" && view.limitsStale ? " opacity-60" : "";
@@ -99,6 +103,7 @@ export function InstanceSettingsSheet({ instance, onUpdate, onDeleteRequest, onC
                 </span>
               )}
             </div>
+            {upstreamView !== null && <div className={`mt-[3px] font-mono text-[11.5px] ${upstreamView.colorClass}`}>{upstreamView.text}</div>}
           </Field>
         )}
 

@@ -9,7 +9,7 @@ import { isAgentProvider, PROVIDERS, sessionKeyFor } from "./providers";
 import { pathExists } from "./paths";
 import { loadState, updateState } from "./store";
 import { getPaneCurrentPath, getSessionPresence, killSession, signalChannel } from "./tmux";
-import { currentBranch, isRemoteUnreachableError, NETWORK_GIT_TIMEOUT_MS, runGit } from "./git";
+import { branchUpstream, currentBranch, isRemoteUnreachableError, NETWORK_GIT_TIMEOUT_MS, runGit, type BranchUpstream } from "./git";
 import { claudeFallback, codexFallback, enrichCodexStatus, findCodexSessionFile } from "./agentFallback";
 import {
   listSiblingSnapshots,
@@ -1022,12 +1022,30 @@ apiRouter.get(
       });
     }
 
+    // The folder the branch shown in the sidebar came from. A snapshot's own cwd only counts when
+    // it also carried a branch: Codex snapshots have a cwd but no branch (the sidebar then shows
+    // the pane's), and codexFallback can report "", which `git -C ""` would resolve to this
+    // server's own repo.
+    const snapshotCwd: string | null =
+      typeof liveStatus.cwd === "string" && path.isAbsolute(liveStatus.cwd) && typeof liveStatus.branch === "string"
+        ? liveStatus.cwd
+        : null;
+    const paneCwd: string = snapshotCwd ?? (await getPaneCurrentPath(instance.tmuxSession).catch(() => instance.locationPath));
+
     // Nothing to show for the agent: still say which branch the pane is on, since the sidebar's
     // own one-time lookup would otherwise stay stuck on whatever it saw when it was opened.
     if (liveStatus.available === false && typeof liveStatus.reason === "string") {
-      const cwd: string = await getPaneCurrentPath(instance.tmuxSession).catch(() => instance.locationPath);
-      const branch: string | null = await currentBranch(cwd);
+      const branch: string | null = await currentBranch(paneCwd);
       if (branch !== null) liveStatus.branch = branch;
+    }
+
+    // Best-effort extra: a git failure here must not turn the whole live-status poll into a 500,
+    // which the client would show as every field being unreachable.
+    try {
+      const upstream: BranchUpstream | null = await branchUpstream(paneCwd);
+      if (upstream !== null) liveStatus.upstream = upstream;
+    } catch (error) {
+      console.error("[server] could not read the branch upstream state:", (error as Error).message);
     }
     response.json(liveStatus);
   })

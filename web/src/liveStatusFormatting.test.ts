@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { describeLiveStatus, formatAge } from "./liveStatusFormatting";
-import type { LiveStatus } from "./types";
+import { describeLiveStatus, formatAge, formatUpstream, upstreamFor } from "./liveStatusFormatting";
+import type { BranchUpstream, LiveStatus } from "./types";
 
 const NOW = Date.parse("2026-10-25T22:30:00Z");
 const nowSeconds = NOW / 1000;
@@ -15,6 +15,52 @@ describe("formatAge", () => {
     expect(formatAge("2026-10-25T22:00:00Z", NOW)).toBe("30m ago");
     expect(formatAge("2026-10-25T09:30:00Z", NOW)).toBe("13h ago");
     expect(formatAge("2026-10-22T22:30:00Z", NOW)).toBe("3d ago");
+  });
+});
+
+function tracking(ahead: number, behind: number): BranchUpstream {
+  return { branch: "feat", state: "tracking", ahead, behind, remoteName: "origin", pushRef: "refs/remotes/origin/feat" };
+}
+
+describe("formatUpstream", () => {
+  it("flags an unpublished branch as a warning", () => {
+    expect(formatUpstream({ branch: "feat", state: "unpublished" })).toEqual({ text: "unpublished", colorClass: "text-status-warn" });
+  });
+
+  it("says a vanished remote branch is gone, without alarm", () => {
+    expect(formatUpstream({ branch: "feat", state: "gone" })).toEqual({ text: "remote gone", colorClass: "text-txt-dim" });
+  });
+
+  it("shows up to date when nothing is ahead or behind", () => {
+    expect(formatUpstream(tracking(0, 0))).toEqual({ text: "up to date", colorClass: "text-txt-dim" });
+  });
+
+  it("warns only when there are unpushed commits", () => {
+    expect(formatUpstream(tracking(2, 0))).toEqual({ text: "↑2", colorClass: "text-status-warn" });
+    expect(formatUpstream(tracking(2, 1))).toEqual({ text: "↑2 ↓1", colorClass: "text-status-warn" });
+    expect(formatUpstream(tracking(0, 3))).toEqual({ text: "↓3", colorClass: "text-txt-dim" });
+  });
+});
+
+describe("upstreamFor", () => {
+  const unpublished: BranchUpstream = { branch: "foo", state: "unpublished" };
+
+  it("returns the upstream state when it names the displayed branch", () => {
+    expect(upstreamFor(status({ upstream: unpublished }), "foo")).toEqual(unpublished);
+  });
+
+  it("hides it when it describes another branch than the displayed one", () => {
+    expect(upstreamFor(status({ upstream: unpublished }), "bar")).toBeNull();
+  });
+
+  it("matches a displayed branch that rev-parse printed as heads/<name>", () => {
+    expect(upstreamFor(status({ upstream: unpublished }), "heads/foo")).toEqual(unpublished);
+  });
+
+  it("is null without a status, a displayed branch or an upstream state", () => {
+    expect(upstreamFor(null, "foo")).toBeNull();
+    expect(upstreamFor(status({ upstream: unpublished }), undefined)).toBeNull();
+    expect(upstreamFor(status(), "foo")).toBeNull();
   });
 });
 

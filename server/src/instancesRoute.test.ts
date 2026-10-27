@@ -80,17 +80,25 @@ vi.mock("./auth", () => ({
   setStoredPassword: vi.fn(),
   verifyToken: vi.fn(),
 }));
-// `git.ts` keeps its real classifier/constants; only runGit (which shells out) is a stub.
+// `git.ts` keeps its real classifier/constants; runGit (which shells out) and branchUpstream (it
+// calls the module's own runGit, which this mock cannot intercept) are stubs.
 vi.mock("./git", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./git")>();
-  return { ...actual, runGit: vi.fn() };
+  return { ...actual, runGit: vi.fn(), branchUpstream: vi.fn() };
+});
+// Passthrough by default; the branch-state tests below pick what the resolver answers, since an
+// "available" answer otherwise needs a live agent process behind the pane.
+vi.mock("./liveStatus", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./liveStatus")>();
+  return { ...actual, resolveLiveStatus: vi.fn(actual.resolveLiveStatus) };
 });
 
 import { loadState, saveState, updateState } from "./store";
 import { pathExists } from "./paths";
 import { initializeInstanceSession } from "./terminal";
-import { getSessionPresence, killSession } from "./tmux";
-import { GitError, runGit } from "./git";
+import { getPaneCurrentPath, getSessionPresence, killSession } from "./tmux";
+import { branchUpstream, GitError, runGit } from "./git";
+import { resolveLiveStatus } from "./liveStatus";
 import { apiRouter } from "./routes";
 
 const runGitMock = vi.mocked(runGit);
@@ -174,6 +182,9 @@ beforeEach(() => {
   initMock.mockReset();
   killSessionMock.mockReset().mockResolvedValue(undefined);
   getSessionPresenceMock.mockReset().mockResolvedValue("absent");
+  // live-status asks for the pane folder on every poll, not only when no agent is running
+  vi.mocked(getPaneCurrentPath).mockReset().mockResolvedValue("/work/repo");
+  vi.mocked(branchUpstream).mockReset().mockResolvedValue(null);
   vi.mocked(loadState).mockReset();
   vi.mocked(saveState).mockReset().mockResolvedValue(undefined);
   vi.mocked(updateState).mockClear();
@@ -389,6 +400,95 @@ describe("DELETE /instances/:id", () => {
 // stateful in-memory store whose saveState is slow, so a route that still did its own
 // loadState + saveState would read a snapshot that a concurrent commit is about to replace,
 // and its later save would silently undo that commit (a lost update).
+describe("GET /instances/:id/live-status - branch upstream state", () => {
+  let temporaryHomeDirectory: string;
+
+  const answerWith = (response: Record<string, unknown>): void => {
+    vi.mocked(resolveLiveStatus).mockResolvedValueOnce({ response, persist: null } as Awaited<ReturnType<typeof resolveLiveStatus>>);
+  };
+  const getLiveStatus = async (): Promise<{ status: number; body: Record<string, unknown> }> => {
+    const response = await fetch(`${baseUrl}/instances/aaa111/live-status`);
+    return { status: response.status, body: (await response.json()) as Record<string, unknown> };
+  };
+  const trackingUpstream = { branch: "feat", state: "tracking", ahead: 1, behind: 0, remoteName: "origin", pushRef: "refs/remotes/origin/feat" } as const;
+
+  beforeEach(async () => {
+    vi.mocked(loadState).mockResolvedValue({
+      ...baseState(),
+      instances: [makeRunningInstance({ id: "aaa111", tmuxSession: "ccdash-aaa111" })],
+    } as DashboardState);
+    // live-status reads agent snapshots from the home directory: keep it off the real one
+    temporaryHomeDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "ccdash-home-"));
+    vi.spyOn(os, "homedir").mockReturnValue(temporaryHomeDirectory);
+  });
+
+  afterEach(async () => {
+    await fs.rm(temporaryHomeDirectory, { recursive: true, force: true });
+  });
+
+  it("attaches the upstream state when no agent is running, read from the pane folder", async () => {
+    answerWith({ available: false, reason: "no-agent" });
+    vi.mocked(branchUpstream).mockResolvedValue(trackingUpstream);
+
+    const { status, body } = await getLiveStatus();
+
+    expect(status).toBe(200);
+    expect(body.upstream).toEqual(trackingUpstream);
+    expect(vi.mocked(branchUpstream)).toHaveBeenCalledWith("/work/repo");
+  });
+
+  it("reads the agent's folder when its snapshot carries both an absolute cwd and a branch", async () => {
+    answerWith({ available: true, cwd: "/agent/worktree", branch: "feat" });
+    vi.mocked(branchUpstream).mockResolvedValue(trackingUpstream);
+
+    const { body } = await getLiveStatus();
+
+    expect(body.upstream).toEqual(trackingUpstream);
+    expect(vi.mocked(branchUpstream)).toHaveBeenCalledWith("/agent/worktree");
+    expect(vi.mocked(getPaneCurrentPath)).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the pane folder for an empty cwd or a snapshot without a branch", async () => {
+    answerWith({ available: true, cwd: "", branch: "feat" });
+    await getLiveStatus();
+    answerWith({ available: true, cwd: "/codex/folder" });
+    await getLiveStatus();
+
+    expect(vi.mocked(branchUpstream)).toHaveBeenNthCalledWith(1, "/work/repo");
+    expect(vi.mocked(branchUpstream)).toHaveBeenNthCalledWith(2, "/work/repo");
+  });
+
+  it("omits the field when the folder is not a git repo", async () => {
+    answerWith({ available: false, reason: "no-agent" });
+
+    const { status, body } = await getLiveStatus();
+
+    expect(status).toBe(200);
+    expect("upstream" in body).toBe(false);
+  });
+
+  it("still answers 200 without the field when reading the upstream state throws", async () => {
+    answerWith({ available: true, cwd: "/agent/worktree", branch: "feat", model: "opus" });
+    vi.mocked(branchUpstream).mockRejectedValue(new Error("boom"));
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const { status, body } = await getLiveStatus();
+
+    expect(status).toBe(200);
+    expect(body.model).toBe("opus");
+    expect("upstream" in body).toBe(false);
+  });
+
+  it("is attached to an available answer without clobbering the agent fields", async () => {
+    answerWith({ available: true, cwd: "/agent/worktree", branch: "feat", model: "opus" });
+    vi.mocked(branchUpstream).mockResolvedValue({ branch: "feat", state: "unpublished" });
+
+    const { body } = await getLiveStatus();
+
+    expect(body).toMatchObject({ available: true, model: "opus", upstream: { branch: "feat", state: "unpublished" } });
+  });
+});
+
 describe("concurrent writers never lose each other's commits", () => {
   let committedState: DashboardState;
   let temporaryHomeDirectory: string;

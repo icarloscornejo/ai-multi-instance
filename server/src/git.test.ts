@@ -10,7 +10,7 @@ vi.mock("node:child_process", () => {
 });
 
 import { execFile } from "node:child_process";
-import { GitError, isRemoteUnreachableError, LOCAL_GIT_TIMEOUT_MS, runGit } from "./git";
+import { branchUpstream, GitError, isRemoteUnreachableError, LOCAL_GIT_TIMEOUT_MS, parseBranchUpstream, runGit } from "./git";
 
 const promisifyCustomSymbol = Symbol.for("nodejs.util.promisify.custom");
 const runGitMock = (execFile as unknown as Record<symbol, ReturnType<typeof vi.fn>>)[promisifyCustomSymbol];
@@ -148,5 +148,107 @@ describe("isRemoteUnreachableError", () => {
     // "could not resolve hostname" must stay false - the phrase is mid-line, not the whole line.
     const error = new GitError("fatal: A branch named 'could not resolve hostname' already exists.");
     expect(isRemoteUnreachableError(error)).toBe(false);
+  });
+});
+
+// `%(HEAD)`, branch, upstream, push, push:track, push:remotename: what for-each-ref prints
+// (measured against real repos under push.default=simple and push.default=current).
+function branchLine(...fields: string[]): string {
+  return fields.join("\0");
+}
+
+describe("parseBranchUpstream", () => {
+  it("reports tracking with zero ahead and behind for a branch in sync", () => {
+    const output: string = branchLine("*", "feat", "refs/remotes/origin/feat", "refs/remotes/origin/feat", "", "origin");
+    expect(parseBranchUpstream(output)).toEqual({
+      branch: "feat",
+      state: "tracking",
+      ahead: 0,
+      behind: 0,
+      remoteName: "origin",
+      pushRef: "refs/remotes/origin/feat",
+    });
+  });
+
+  it("reads ahead and behind counts", () => {
+    const aheadOnly: string = branchLine("*", "feat", "refs/remotes/origin/feat", "refs/remotes/origin/feat", "ahead 2", "origin");
+    const both: string = branchLine("*", "feat", "refs/remotes/origin/feat", "refs/remotes/origin/feat", "ahead 2, behind 1", "origin");
+    expect(parseBranchUpstream(aheadOnly)).toMatchObject({ state: "tracking", ahead: 2, behind: 0 });
+    expect(parseBranchUpstream(both)).toMatchObject({ state: "tracking", ahead: 2, behind: 1 });
+  });
+
+  it("is gone only when the vanished ref was the configured upstream", () => {
+    const output: string = branchLine("*", "feat", "refs/remotes/origin/feat", "refs/remotes/origin/feat", "gone", "origin");
+    expect(parseBranchUpstream(output)).toEqual({ branch: "feat", state: "gone" });
+  });
+
+  it("is unpublished when push.default=simple leaves the push ref empty", () => {
+    expect(parseBranchUpstream(branchLine("*", "feat", "", "", "", ""))).toEqual({ branch: "feat", state: "unpublished" });
+  });
+
+  it("is unpublished for a branch cut from origin/main that has never been pushed", () => {
+    // push.default=simple: no push ref at all
+    const underSimple: string = branchLine("*", "x", "refs/remotes/origin/main", "", "", "origin");
+    // push.default=current: git invents origin/x, which does not exist, so track says gone
+    const underCurrent: string = branchLine("*", "x", "refs/remotes/origin/main", "refs/remotes/origin/x", "gone", "origin");
+    expect(parseBranchUpstream(underSimple)).toEqual({ branch: "x", state: "unpublished" });
+    expect(parseBranchUpstream(underCurrent)).toEqual({ branch: "x", state: "unpublished" });
+  });
+
+  it("is unpublished under push.default=current for a new branch with no upstream and no remote", () => {
+    const output: string = branchLine("*", "feat1", "", "refs/remotes/origin/feat1", "gone", "");
+    expect(parseBranchUpstream(output)).toEqual({ branch: "feat1", state: "unpublished" });
+  });
+
+  it("is unpublished when the upstream is a local branch (remote is .)", () => {
+    const output: string = branchLine("*", "feat", "refs/heads/main", "refs/heads/main", "", ".");
+    expect(parseBranchUpstream(output)).toEqual({ branch: "feat", state: "unpublished" });
+  });
+
+  it("is unpublished when the push ref belongs to a differently named remote branch", () => {
+    const output: string = branchLine("*", "feat", "refs/remotes/origin/main", "refs/remotes/origin/main", "", "origin");
+    expect(parseBranchUpstream(output)).toEqual({ branch: "feat", state: "unpublished" });
+  });
+
+  it("handles branch names with slashes and a branch named like a tag", () => {
+    const slashed: string = branchLine("*", "jira/RN-1-x", "refs/remotes/origin/jira/RN-1-x", "refs/remotes/origin/jira/RN-1-x", "", "origin");
+    expect(parseBranchUpstream(slashed)).toMatchObject({ branch: "jira/RN-1-x", state: "tracking" });
+    // refname:lstrip=2 yields the bare name even when a tag v1.2 exists, where :short would say heads/v1.2
+    const tagLike: string = branchLine("*", "v1.2", "refs/remotes/origin/v1.2", "refs/remotes/origin/v1.2", "", "origin");
+    expect(parseBranchUpstream(tagLike)).toMatchObject({ branch: "v1.2", state: "tracking" });
+  });
+
+  it("picks the checked-out line when several branches point at HEAD", () => {
+    const output: string = [
+      branchLine(" ", "other", "", "", "", ""),
+      branchLine("*", "feat", "refs/remotes/origin/feat", "refs/remotes/origin/feat", "ahead 1", "origin"),
+    ].join("\n");
+    expect(parseBranchUpstream(output)).toMatchObject({ branch: "feat", ahead: 1 });
+  });
+
+  it("is null on a detached HEAD or empty output", () => {
+    expect(parseBranchUpstream("")).toBeNull();
+    expect(parseBranchUpstream(branchLine(" ", "other", "", "", "", ""))).toBeNull();
+  });
+});
+
+describe("branchUpstream", () => {
+  it("asks for-each-ref about the branch at HEAD and parses the checked-out line", async () => {
+    runGitMock.mockResolvedValue({
+      stdout: `${branchLine("*", "feat", "refs/remotes/origin/feat", "refs/remotes/origin/feat", "ahead 1", "origin")}\n`,
+      stderr: "",
+    });
+
+    const result = await branchUpstream("/repo");
+
+    expect(result).toMatchObject({ branch: "feat", state: "tracking", ahead: 1 });
+    const args: string[] = runGitMock.mock.calls[0][1];
+    expect(args.slice(0, 3)).toEqual(["-C", "/repo", "for-each-ref"]);
+    expect(args).toContain("--points-at=HEAD");
+  });
+
+  it("is null when git fails (not a repo, folder gone)", async () => {
+    runGitMock.mockRejectedValue(execError({ stderr: "fatal: not a git repository" }));
+    expect(await branchUpstream("/not-a-repo")).toBeNull();
   });
 });

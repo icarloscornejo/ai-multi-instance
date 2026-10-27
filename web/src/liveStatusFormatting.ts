@@ -2,7 +2,7 @@
 // (InstanceSettingsSheet.tsx), which render the same live-status fields in two different
 // layouts. Hoisted here instead of duplicated so a label or a usage-severity threshold only
 // needs to change in one place.
-import type { AgentProvider, LiveStatus } from "./types";
+import type { AgentProvider, BranchUpstream, LiveStatus } from "./types";
 
 export const PROVIDER_LABELS = {
   claude: "Claude Code",
@@ -41,6 +41,27 @@ export function formatLongResetTime(epochSeconds: number): string {
     minute: "2-digit",
     hour12: false,
   });
+}
+
+// The upstream state is read from a folder that can differ from the one the displayed branch
+// came from (an agent in another worktree, a checkout made while the agent was idle), so it is
+// shown only when it names the displayed branch. A leading "heads/" is stripped from the
+// displayed one: `rev-parse --abbrev-ref` adds it when a tag shares the branch's name.
+export function upstreamFor(liveStatus: LiveStatus | null, displayedBranch: string | undefined): BranchUpstream | null {
+  const upstream: BranchUpstream | undefined = liveStatus?.upstream;
+  if (upstream === undefined || displayedBranch === undefined) return null;
+  return upstream.branch === displayedBranch.replace(/^heads\//, "") ? upstream : null;
+}
+
+// "behind" and "gone" are only as fresh as the last fetch, there is no network here.
+export function formatUpstream(upstream: BranchUpstream): { text: string; colorClass: string } {
+  if (upstream.state === "unpublished") return { text: "unpublished", colorClass: "text-status-warn" };
+  if (upstream.state === "gone") return { text: "remote gone", colorClass: "text-txt-dim" };
+  const parts: string[] = [];
+  if (upstream.ahead > 0) parts.push(`↑${upstream.ahead}`);
+  if (upstream.behind > 0) parts.push(`↓${upstream.behind}`);
+  if (parts.length === 0) return { text: "up to date", colorClass: "text-txt-dim" };
+  return { text: parts.join(" "), colorClass: upstream.ahead > 0 ? "text-status-warn" : "text-txt-dim" };
 }
 
 export function formatAge(isoTimestamp: string, nowMs: number = Date.now()): string {
