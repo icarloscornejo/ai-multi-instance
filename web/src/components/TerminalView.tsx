@@ -7,7 +7,14 @@ import { useWakeRetry } from "../hooks/useWakeRetry";
 import { FONT_SIZE_CHANGE_EVENT, getHostFontSize, setHostFontSize } from "../hostPrefs";
 import { PROVIDER_OPTIONS } from "../providerOptions";
 import { INITIAL_RECONNECT_STATE, reduceConnection, type ReconnectState } from "../reconnectPolicy";
-import { hasVisibleText, isDomRendererPath } from "../terminalPaint";
+import {
+  hasVisibleText,
+  isBackgroundLoss,
+  isDomRendererPath,
+  recordWebglLoss,
+  releaseWebglContexts,
+  shouldHoldWebgl,
+} from "../terminalPaint";
 import { btnGhost } from "../ui";
 import { RetryRing } from "./RetryRing";
 import type { Instance } from "../types";
@@ -20,9 +27,6 @@ export interface TerminalViewHandle {
 // Mostly 1px steps; 14.9 is inserted between 14 and 15 because that jump felt too big.
 const FONT_SIZES = [10, 11, 12, 13, 14, 14.9, 15, 16, 17, 18] as const;
 const MIN_FONT_SIZE = FONT_SIZES[0];
-// Caps recreation attempts after a WebGL context loss so a genuinely dead GPU/driver falls
-// back to the DOM renderer instead of retrying forever.
-const MAX_WEBGL_CONTEXT_LOSS_RETRIES = 3;
 
 // Mobile OSes and flaky networks can kill a socket's underlying TCP connection without
 // either side ever seeing a "close" event: readyState stays OPEN and no error fires, it
@@ -190,6 +194,24 @@ const liveTerminals = new Set<Terminal>();
 // re-trigger the same cross-terminal corruption this fix is for.
 let fontsAtlasWipeDone = false;
 
+// The slice of xterm's private core used to put the DOM renderer back (see restoreDomRenderer).
+interface XtermCoreInternals {
+  _createRenderer(): unknown;
+  _renderService: { setRenderer(renderer: unknown): void; handleResize(cols: number, rows: number): void };
+}
+
+// Page-wide WebGL fallback state, shared by every terminal: a GPU that cannot keep a context
+// fails for all of them, so once it is given up on no terminal asks for WebGL again until the
+// page is reloaded (the page itself is never reloaded automatically).
+let webglGivenUp = false;
+let webglLossTimes: number[] = [];
+// performance.now() of the last time the page went to the background. See isBackgroundLoss.
+let lastPageHiddenAtMs: number | null = null;
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") {
+    lastPageHiddenAtMs = performance.now();
+  }
+});
 
 function DisconnectedOverlay({
   onReconnect,
@@ -296,6 +318,12 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const webglAddonRef = useRef<WebglAddon | null>(null);
+  // attach/release live in the terminal-creation effect's closure (they need the terminal);
+  // the visibility effect, which runs on its own schedule, reaches them through this ref.
+  const webglControlsRef = useRef<{ attach: () => void; release: () => void } | null>(null);
+  // Read by attach inside that closure, which would otherwise see the value from mount time.
+  const visibleRef = useRef<boolean>(visible);
+  visibleRef.current = visible;
   const socketRef = useRef<WebSocket | null>(null);
   // Lives outside the connection effect (which reruns on every connectionEpoch bump) so the
   // backoff keeps counting across reconnect attempts instead of resetting each time. This is
@@ -557,38 +585,142 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     // degrade to the DOM renderer for the rest of the session; the DOM renderer draws text
     // through the browser's own text engine instead of the WebGL glyph atlas, so the font
     // visibly changed shape mid-session until the next reload. Recreating the addon on loss
-    // (bounded by MAX_WEBGL_CONTEXT_LOSS_RETRIES, since a real GPU/driver failure would
-    // otherwise retry forever) keeps the renderer, and therefore the glyph shapes, stable.
-    let webglRetries = 0;
-    const attachWebglAddon = (): void => {
+    // keeps the renderer, and therefore the glyph shapes, stable.
+    //
+    // Only the visible terminal holds a context (see shouldHoldWebgl): every instance stays
+    // mounted, and a context per mounted terminal exceeds what mobile Chrome allows per page,
+    // which kills the oldest terminals' canvas (the terminal area shows Chrome's sad face).
+    // Hidden terminals use xterm's DOM renderer, the same path as a browser with no WebGL.
+    //
+    // The addon's canvases are found by diffing .xterm-screen's children around loadAddon, which
+    // avoids reaching into the addon's internals.
+    let webglCanvases: HTMLCanvasElement[] = [];
+    let webglAttachedAtMs = 0;
+    const screenCanvases = (): HTMLCanvasElement[] =>
+      Array.from(container.querySelectorAll<HTMLCanvasElement>(".xterm-screen canvas"));
+
+    // Safe to call twice. Disposing the addon alone does not free its GL context in Chromium,
+    // so the context is lost explicitly first.
+    const releaseWebglAddon = (): void => {
+      const webglAddon = webglAddonRef.current;
+      if (webglAddon === null) {
+        return;
+      }
+      webglAddonRef.current = null;
+      liveWebglAddons.delete(webglAddon);
+      releaseWebglContexts(webglCanvases);
+      webglCanvases = [];
       try {
-        const webglAddon = new WebglAddon();
+        webglAddon.dispose();
+      } catch {
+        // Expected on this xterm version, see restoreDomRenderer. The context was already
+        // released above, so there is nothing left to free.
+      }
+      restoreDomRenderer();
+    };
+
+    // The addon's dispose ends by putting xterm's DOM renderer back, but on xterm 5.5 it throws
+    // just before that step (it reads core._store, which this version lacks), leaving the
+    // terminal with no renderer at all: a blank area, which defeats the fallback to DOM. So the
+    // same step is repeated here when the DOM renderer is missing. Uses xterm internals, like
+    // the addon itself.
+    const restoreDomRenderer = (): void => {
+      if (container.querySelector(".xterm-rows") !== null) {
+        return;
+      }
+      try {
+        const core = (terminal as unknown as { _core: XtermCoreInternals })._core;
+        core._renderService.setRenderer(core._createRenderer());
+        core._renderService.handleResize(terminal.cols, terminal.rows);
+      } catch (error) {
+        console.warn("Could not restore the DOM renderer after releasing WebGL", error);
+      }
+    };
+
+    const attachWebglAddon = (): void => {
+      // Idempotent: the visibility effect also reruns while still visible (focusOnVisible
+      // flips across the mobile breakpoint), and a second addon would orphan the first one's
+      // context.
+      if (
+        webglAddonRef.current !== null ||
+        !shouldHoldWebgl({
+          visible: visibleRef.current,
+          pageVisible: document.visibilityState === "visible",
+          domRendererPath: isDomRendererPath(window.location.pathname),
+          givenUp: webglGivenUp,
+        })
+      ) {
+        return;
+      }
+      const canvasesBefore = new Set<HTMLCanvasElement>(screenCanvases());
+      const addedCanvases = (): HTMLCanvasElement[] =>
+        screenCanvases().filter((canvas) => !canvasesBefore.has(canvas));
+      const webglAddon = new WebglAddon();
+      try {
         webglAddon.onContextLoss(() => {
-          liveWebglAddons.delete(webglAddon);
-          webglAddon.dispose();
-          webglAddonRef.current = null;
-          if (webglRetries < MAX_WEBGL_CONTEXT_LOSS_RETRIES) {
-            webglRetries += 1;
-            attachWebglAddon();
+          // A loss reported for an addon we already released (our own loseContext() fires it
+          // 3 s later) is not a failure and must not trigger a retry.
+          if (webglAddonRef.current !== webglAddon) {
+            return;
           }
-          // Whether the retry above lands on WebGL again or the catch below falls through
-          // to the DOM renderer, the canvas is stale until new data writes a row; if
-          // nothing is being written (e.g. a prompt already sitting idle), force every row
-          // to repaint immediately.
+          const backgroundLoss = isBackgroundLoss({
+            pageVisible: document.visibilityState === "visible",
+            lastPageHiddenAtMs,
+            attachedAtMs: webglAttachedAtMs,
+          });
+          releaseWebglAddon();
+          if (!backgroundLoss) {
+            const result = recordWebglLoss(webglLossTimes, performance.now());
+            webglLossTimes = result.lossTimes;
+            webglGivenUp = webglGivenUp || result.givenUp;
+          }
+          // Skipped by the check inside when the page is hidden or WebGL was just given up on.
+          attachWebglAddon();
+          // Whether that lands on WebGL again or falls through to the DOM renderer, the canvas
+          // is stale until new data writes a row; if nothing is being written (e.g. a prompt
+          // already sitting idle), force every row to repaint immediately.
           terminal.refresh(0, terminal.rows - 1);
         });
         terminal.loadAddon(webglAddon);
-        webglAddonRef.current = webglAddon;
-        liveWebglAddons.add(webglAddon);
       } catch {
-        // no WebGL support; xterm keeps using its default DOM renderer
+        // No WebGL2 support, or the renderer threw halfway: its constructor appends its canvases
+        // before creating the shaders and only registers their cleanup afterwards, so they would
+        // stay on top of the DOM renderer's rows and keep their context.
+        const leftoverCanvases = addedCanvases();
+        releaseWebglContexts(leftoverCanvases);
+        for (const canvas of leftoverCanvases) {
+          canvas.remove();
+        }
+        try {
+          webglAddon.dispose();
+        } catch {
+          // Half-built addon: nothing further to free.
+        }
+        // Retrying on every instance switch would repeat the same failure.
+        webglGivenUp = true;
+        terminal.refresh(0, terminal.rows - 1);
+        return;
+      }
+      webglAddonRef.current = webglAddon;
+      webglCanvases = addedCanvases();
+      webglAttachedAtMs = performance.now();
+      liveWebglAddons.add(webglAddon);
+    };
+    webglControlsRef.current = { attach: attachWebglAddon, release: releaseWebglAddon };
+    attachWebglAddon();
+
+    // A retry that was skipped because the page was in the background has nothing else to
+    // bring WebGL back for the visible terminal once the page returns.
+    const handlePageVisibilityChange = (): void => {
+      if (document.visibilityState !== "visible" || webglAddonRef.current !== null) {
+        return;
+      }
+      attachWebglAddon();
+      if (webglAddonRef.current !== null) {
+        terminal.refresh(0, terminal.rows - 1);
       }
     };
-    // /dom is the diagnostic entry that skips WebGL altogether (see isDomRendererPath): same path
-    // as a browser with no WebGL support, which everything below already copes with.
-    if (!isDomRendererPath(window.location.pathname)) {
-      attachWebglAddon();
-    }
+    document.addEventListener("visibilitychange", handlePageVisibilityChange);
 
     // terminal.open() (above) creates .xterm-viewport internally: the actual scrollable
     // element xterm's own touch/wheel handling and local scrollback (buffer.active) live on
@@ -857,9 +989,10 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       stopDraining();
       socketRef.current?.close();
       liveTerminals.delete(terminal);
-      if (webglAddonRef.current !== null) {
-        liveWebglAddons.delete(webglAddonRef.current);
-      }
+      document.removeEventListener("visibilitychange", handlePageVisibilityChange);
+      webglControlsRef.current = null;
+      // terminal.dispose() alone would leave the active instance's GL context alive.
+      releaseWebglAddon();
       try {
         terminal.dispose();
       } catch {
@@ -1140,23 +1273,28 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   // Double rAF because returning from Settings may leave the flex layout not yet settled
   // on the first frame (a single rAF sometimes measures the container mid-transition).
   useEffect(() => {
-    if (visible) {
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          safeFit();
-          // Coming back from background can leave the canvas stale if the WebGL context
-          // was reclaimed while hidden; force a full repaint rather than waiting for the
-          // next write to touch every row.
-          const terminal = terminalRef.current;
-          if (terminal !== null) {
-            terminal.refresh(0, terminal.rows - 1);
-          }
-          if (focusOnVisible && !suppressAutoFocusRef.current) {
-            terminalRef.current?.focus();
-          }
-        });
-      });
+    if (!visible) {
+      // Only the visible terminal holds a WebGL context (see the comment where it is attached).
+      webglControlsRef.current?.release();
+      return;
     }
+    // A no-op when it already holds one: this effect also reruns when focusOnVisible changes.
+    webglControlsRef.current?.attach();
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        safeFit();
+        // The terminal may have just switched renderers, or its canvas gone stale while it
+        // was hidden; force a full repaint rather than waiting for the next write to touch
+        // every row.
+        const terminal = terminalRef.current;
+        if (terminal !== null) {
+          terminal.refresh(0, terminal.rows - 1);
+        }
+        if (focusOnVisible && !suppressAutoFocusRef.current) {
+          terminalRef.current?.focus();
+        }
+      });
+    });
   }, [visible, safeFit, focusOnVisible]);
 
   // Selecting a rail row and double-clicking to rename it race: the click already made this
