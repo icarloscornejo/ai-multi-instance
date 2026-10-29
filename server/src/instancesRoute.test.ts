@@ -79,6 +79,11 @@ vi.mock("./auth", () => ({
   readCookie: vi.fn(),
   setStoredPassword: vi.fn(),
   verifyToken: vi.fn(),
+  isLoginLocked: vi.fn(),
+  isPasswordFromEnv: vi.fn(),
+  recordFailedLogin: vi.fn(),
+  resetFailedLogins: vi.fn(),
+  rotateSecret: vi.fn(),
 }));
 // `git.ts` keeps its real classifier/constants; runGit (which shells out) and branchUpstream (it
 // calls the module's own runGit, which this mock cannot intercept) are stubs.

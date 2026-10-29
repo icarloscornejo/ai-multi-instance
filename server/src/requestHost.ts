@@ -1,3 +1,5 @@
+import type { IncomingHttpHeaders } from "node:http";
+
 // The named-tunnel connector (see namedTunnel.ts) outlives the Node process, so a handful of
 // protections the quick tunnel got for free - it died with the server, so a broken/passwordless
 // state was never reachable from the public URL for long - now have to be enforced per request.
@@ -60,4 +62,13 @@ export function isLocalRequestHost(hostHeader: string | undefined): boolean {
     return true;
   }
   return isPrivateIPv4(hostname);
+}
+
+// The Host header alone is not enough: the Quick Tunnel runs cloudflared with
+// --http-host-header ai.local (tunnel.ts), so every public visitor through it looks local by
+// Host. Cloudflare adds cf-connecting-ip to everything that crosses any of its tunnels, so its
+// presence marks the request as public. A LAN client that forges the header only downgrades
+// itself to "public", which fails closed.
+export function isLocalRequest(request: { headers: IncomingHttpHeaders }): boolean {
+  return isLocalRequestHost(request.headers.host) && request.headers["cf-connecting-ip"] === undefined;
 }
