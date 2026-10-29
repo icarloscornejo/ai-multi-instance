@@ -100,6 +100,11 @@ app.use("/api", apiRouter);
 // for local development with HMR intact; it is simply no longer what LAN/tunnel requests reach.
 const webDistPath: string = path.resolve(import.meta.dirname, "../../web/dist");
 app.use(express.static(webDistPath));
+// No SPA fallback exists, so the diagnostic /dom entry (web/src/terminalPaint.ts's
+// isDomRendererPath: same app, terminal drawn without WebGL) needs its own route, or it would 404.
+app.get("/dom", (_request: Request, response: Response) => {
+  response.sendFile(path.join(webDistPath, "index.html"));
+});
 
 app.use((error: Error, _request: Request, response: Response, next: NextFunction) => {
   console.error("[server] unhandled error:", error.message);

@@ -7,7 +7,7 @@ import { useWakeRetry } from "../hooks/useWakeRetry";
 import { FONT_SIZE_CHANGE_EVENT, getHostFontSize, setHostFontSize } from "../hostPrefs";
 import { PROVIDER_OPTIONS } from "../providerOptions";
 import { INITIAL_RECONNECT_STATE, reduceConnection, type ReconnectState } from "../reconnectPolicy";
-import { hasVisibleText } from "../terminalPaint";
+import { hasVisibleText, isDomRendererPath } from "../terminalPaint";
 import { btnGhost } from "../ui";
 import { RetryRing } from "./RetryRing";
 import type { Instance } from "../types";
@@ -584,7 +584,11 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
         // no WebGL support; xterm keeps using its default DOM renderer
       }
     };
-    attachWebglAddon();
+    // /dom is the diagnostic entry that skips WebGL altogether (see isDomRendererPath): same path
+    // as a browser with no WebGL support, which everything below already copes with.
+    if (!isDomRendererPath(window.location.pathname)) {
+      attachWebglAddon();
+    }
 
     // terminal.open() (above) creates .xterm-viewport internally: the actual scrollable
     // element xterm's own touch/wheel handling and local scrollback (buffer.active) live on

@@ -1,5 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { hasVisibleText, type PaintBuffer, type PaintBufferLine } from "./terminalPaint";
+import { hasVisibleText, isDomRendererPath, type PaintBuffer, type PaintBufferLine } from "./terminalPaint";
+
+describe("isDomRendererPath", () => {
+  it("is true for /dom, with or without a trailing slash", () => {
+    expect(isDomRendererPath("/dom")).toBe(true);
+    expect(isDomRendererPath("/dom/")).toBe(true);
+  });
+
+  it("is false for the normal app and for look-alike paths", () => {
+    expect(isDomRendererPath("/")).toBe(false);
+    expect(isDomRendererPath("")).toBe(false);
+    expect(isDomRendererPath("/domain")).toBe(false);
+    expect(isDomRendererPath("/dom/x")).toBe(false);
+  });
+});
 
 function line(text: string): PaintBufferLine {
   return { translateToString: () => text };

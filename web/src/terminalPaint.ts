@@ -9,6 +9,14 @@ export interface PaintBuffer {
   getLine(index: number): PaintBufferLine | undefined;
 }
 
+// Opening the app at /dom draws every terminal with xterm's DOM renderer instead of WebGL. It is
+// a diagnostic switch: when a device's GPU cannot draw the WebGL canvas (the terminal area fails
+// while the rest of the page works), this is the quickest way to tell. The trailing slash is
+// tolerated because the server answers /dom/ too.
+export function isDomRendererPath(pathname: string): boolean {
+  return pathname.replace(/\/+$/, "") === "/dom";
+}
+
 // Only the current viewport (baseY..baseY+rows-1), never the scrollback: a `clear` leaves the
 // agent's old prompt sitting above the viewport, and that old text must not count as "painted".
 export function hasVisibleText(buffer: PaintBuffer, rows: number): boolean {
