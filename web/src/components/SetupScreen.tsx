@@ -518,6 +518,91 @@ function TunnelSection() {
   );
 }
 
+// Killswitch for lost or stolen devices. Same ai.local-only rule as the tunnel controls: the
+// server refuses both calls from the public URL, this just avoids offering a dead button.
+// A new password is the stronger option: without it, a device that saved the old password logs
+// straight back in.
+function SessionsSection() {
+  const isAllowedHost: boolean = window.location.hostname === TUNNEL_SECTION_ALLOWED_HOSTNAME;
+  const [newPassword, setNewPassword] = useState<string>("");
+  const [isConfirming, setIsConfirming] = useState<boolean>(false);
+  const [isWorking, setIsWorking] = useState<boolean>(false);
+  const [resultMessage, setResultMessage] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  if (!isAllowedHost) {
+    return null;
+  }
+
+  const handleSignOutOtherDevices = async (): Promise<void> => {
+    // Two taps instead of confirm(): the first arms the button, the second fires it.
+    if (!isConfirming) {
+      setIsConfirming(true);
+      return;
+    }
+    const trimmedPassword: string = newPassword.trim();
+    if (trimmedPassword.length > 0 && trimmedPassword.length < 8) {
+      setErrorMessage("Password must be at least 8 characters.");
+      setIsConfirming(false);
+      return;
+    }
+    setErrorMessage(null);
+    setResultMessage(null);
+    setIsWorking(true);
+    try {
+      if (trimmedPassword.length > 0) {
+        await api.setPassword(trimmedPassword);
+      } else {
+        await api.revokeAllSessions();
+      }
+      setNewPassword("");
+      setResultMessage("All other devices were signed out.");
+    } catch (error) {
+      setErrorMessage(error instanceof ApiError ? error.message : "Unexpected error signing out other devices.");
+    } finally {
+      setIsWorking(false);
+      setIsConfirming(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-[8px]">
+      <h2 className="text-[12.5px] font-semibold text-txt-bright">Sign out other devices</h2>
+      <p className="text-[11.5px] leading-[1.5] text-txt-secondary">
+        Ends every session except this one, including open terminals. If a device was lost, also set a new
+        password and revoke its Cloudflare Access session, or a saved password logs it back in.
+      </p>
+      <input
+        type="password"
+        value={newPassword}
+        placeholder="New password (optional, recommended if a device was lost)"
+        className={errorMessage !== null ? inputErrorClassName : inputClassName}
+        onChange={(event) => {
+          setNewPassword(event.target.value);
+          setIsConfirming(false);
+        }}
+      />
+      {errorMessage !== null && <div className={errorTextClassName}>{errorMessage}</div>}
+      {resultMessage !== null && <div className={hintTextClassName}>{resultMessage}</div>}
+      <div className="flex gap-[8px]">
+        <button
+          type="button"
+          onClick={() => void handleSignOutOtherDevices()}
+          disabled={isWorking}
+          className={btnOutline}
+        >
+          {isWorking ? "Signing out…" : isConfirming ? "Tap again to confirm" : "Sign out other devices"}
+        </button>
+        {isConfirming && !isWorking && (
+          <button type="button" onClick={() => setIsConfirming(false)} className={btnGhost}>
+            Cancel
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function SetupScreen({
   initialLocations,
   initialEnabledProviders,
@@ -855,6 +940,7 @@ export function SetupScreen({
             >
               <LanAccessSection />
               <TunnelSection />
+              <SessionsSection />
             </div>
           )}
         </div>

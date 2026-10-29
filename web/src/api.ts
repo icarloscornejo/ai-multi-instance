@@ -51,6 +51,8 @@ export const api = {
   setPassword: (password: string): Promise<{ ok: boolean }> =>
     requestJson("/api/auth/set-password", { method: "POST", body: JSON.stringify({ password }) }),
 
+  revokeAllSessions: (): Promise<{ ok: boolean }> => requestJson("/api/auth/revoke-all", { method: "POST" }),
+
   getConfig: (): Promise<DashboardConfig> => requestJson("/api/config"),
 
   getUpdateStatus: (): Promise<UpdateStatus> => requestJson("/api/update-status"),

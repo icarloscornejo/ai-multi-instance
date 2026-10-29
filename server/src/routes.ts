@@ -3,7 +3,21 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import express, { type Request, type Response, type NextFunction, type Router } from "express";
-import { AUTH_COOKIE_NAME, checkPassword, isAuthEnabled, issueToken, readCookie, requireAuth, setStoredPassword, verifyToken } from "./auth";
+import {
+  AUTH_COOKIE_NAME,
+  checkPassword,
+  isAuthEnabled,
+  isLoginLocked,
+  isPasswordFromEnv,
+  issueToken,
+  readCookie,
+  recordFailedLogin,
+  requireAuth,
+  resetFailedLogins,
+  rotateSecret,
+  setStoredPassword,
+  verifyToken,
+} from "./auth";
 import { clearAgentReadiness, getReadyChannel } from "./agentReadiness";
 import { isAgentProvider, PROVIDERS, sessionKeyFor } from "./providers";
 import { pathExists } from "./paths";
@@ -27,7 +41,7 @@ import { initializeInstanceSession } from "./terminal";
 import { withSessionLock } from "./sessionLock";
 import { getTunnelStatus, readTunnelLog, startTunnel, stopTunnel } from "./tunnel";
 import { getNamedTunnelStatus, getTunnelMode, startNamedTunnel, stopNamedTunnel } from "./namedTunnel";
-import { isLocalRequestHost } from "./requestHost";
+import { isLocalRequest, isLocalRequestHost } from "./requestHost";
 import { applyUpdate, checkForUpdate, getUpdateStatus, resetToRemote } from "./updater";
 import type {
   BranchAction,
@@ -232,10 +246,12 @@ apiRouter.use((request: Request, response: Response, next: NextFunction): void =
 // by an authenticated visitor: whoever finds that URL could otherwise tear down or spin up the
 // tunnel, or read the connector log. The UI already hides these off ai.local (SetupScreen.tsx),
 // this is the server-side backstop for that policy. Authentication stays a separate, additional
-// requirement via requireAuth below.
+// requirement via requireAuth below. Also guards revoke-all, for the same reason: a stolen
+// session must not be able to sign the owner out. It keys off isLocalRequest rather than the
+// Host alone because the Quick Tunnel rewrites Host to ai.local (see requestHost.ts).
 function requireLocalHost(request: Request, response: Response, next: NextFunction): void {
-  if (!isLocalRequestHost(request.headers.host)) {
-    response.status(403).json({ error: "Tunnel controls are only available on the local network." });
+  if (!isLocalRequest(request)) {
+    response.status(403).json({ error: "This action is only available on the local network." });
     return;
   }
   next();
@@ -269,11 +285,23 @@ apiRouter.post(
       response.json({ ok: true });
       return;
     }
+    // Public attempts only: the LAN stays exempt so an attacker hammering the public URL cannot
+    // also lock the owner out at home. Checked before checkPassword so a locked-out caller
+    // learns nothing, not even from a correct guess.
+    const isPublicRequest: boolean = !isLocalRequest(request);
+    if (isPublicRequest && isLoginLocked()) {
+      response.status(429).json({ error: "Too many attempts, try again later." });
+      return;
+    }
     const { password } = request.body as { password?: unknown };
     if (typeof password !== "string" || !checkPassword(password)) {
+      if (isPublicRequest) {
+        recordFailedLogin();
+      }
       response.status(401).json({ error: "Incorrect password" });
       return;
     }
+    resetFailedLogins();
     const { value, maxAgeMs } = await issueToken();
     response.cookie(AUTH_COOKIE_NAME, value, authCookieOptions(request, maxAgeMs));
     response.json({ ok: true });
@@ -292,14 +320,39 @@ apiRouter.post(
       response.status(400).json({ error: "Password must be at least 8 characters." });
       return;
     }
-    if (isAuthEnabled()) {
+    // Read before setStoredPassword: afterwards auth is always enabled.
+    const hadPassword: boolean = isAuthEnabled();
+    if (hadPassword) {
+      // Changing an existing password now also rotates the secret, which signs everyone out.
+      // From the public URL that would let a stolen session lock the owner out and keep the
+      // only valid cookie, so it is local-only (the UI only offers it on ai.local anyway).
+      if (!isLocalRequest(request)) {
+        response.status(403).json({ error: "This action is only available on the local network." });
+        return;
+      }
       const token: string | undefined = readCookie(request.headers.cookie, AUTH_COOKIE_NAME);
       if (!(await verifyToken(token))) {
         response.status(401).json({ error: "Unauthorized" });
         return;
       }
+      if (isPasswordFromEnv()) {
+        response.status(409).json({
+          error: "DASHBOARD_PASSWORD is set in the environment and overrides this; remove it first.",
+        });
+        return;
+      }
     }
-    setStoredPassword(trimmedPassword);
+    await setStoredPassword(trimmedPassword);
+    // Only an existing password has sessions worth revoking; the bootstrap case has none.
+    if (hadPassword) {
+      try {
+        await rotateSecret();
+      } catch (error) {
+        console.error("[server] secret rotation failed after password change:", (error as Error).message);
+        response.status(500).json({ error: "Password changed but other sessions were NOT signed out." });
+        return;
+      }
+    }
     const { value, maxAgeMs } = await issueToken();
     response.cookie(AUTH_COOKIE_NAME, value, authCookieOptions(request, maxAgeMs));
     response.json({ ok: true });
@@ -307,6 +360,20 @@ apiRouter.post(
 );
 
 apiRouter.use(requireAuth);
+
+// Killswitch: rotating the signing secret invalidates every cookie and, through the listener
+// registered in index.ts, cuts the open terminal sockets. The caller gets a fresh cookie so the
+// device that pressed the button stays signed in.
+apiRouter.post(
+  "/auth/revoke-all",
+  requireLocalHost,
+  wrapAsync(async (request, response) => {
+    await rotateSecret();
+    const { value, maxAgeMs } = await issueToken();
+    response.cookie(AUTH_COOKIE_NAME, value, authCookieOptions(request, maxAgeMs));
+    response.json({ ok: true });
+  })
+);
 
 apiRouter.get(
   "/config",

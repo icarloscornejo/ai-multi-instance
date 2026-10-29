@@ -3,7 +3,14 @@ import http from "node:http";
 import path from "node:path";
 import express, { type Request, type Response, type NextFunction } from "express";
 import { WebSocketServer, type WebSocket, type RawData } from "ws";
-import { AUTH_COOKIE_NAME, isAuthEnabled, readCookie, verifyToken } from "./auth";
+import {
+  AUTH_COOKIE_NAME,
+  isAuthEnabled,
+  readCookie,
+  revokeLiveSockets,
+  setSecretRotatedListener,
+  verifyToken,
+} from "./auth";
 import {
   AttachCancelledError,
   PtySpawnError,
@@ -127,6 +134,11 @@ const MAX_WS_PAYLOAD_BYTES = 1024 * 1024;
 
 const httpServer = http.createServer(app);
 const webSocketServer = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_PAYLOAD_BYTES });
+
+// Sockets are only authenticated at upgrade time, so rotating the signing secret (the killswitch,
+// or a password change) must also cut the ones already open. Clients reconnect, hit a 401 on the
+// upgrade and land on the login screen.
+setSecretRotatedListener(() => revokeLiveSockets(webSocketServer.clients));
 
 // EventEmitter contract: an "error" event with no listener throws as an uncaught exception
 // instead of just emitting (see Node's EventEmitter docs). Neither of these two servers had

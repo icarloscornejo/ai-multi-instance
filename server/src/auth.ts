@@ -1,7 +1,8 @@
 import { randomBytes, timingSafeEqual, createHmac, scryptSync } from "node:crypto";
-import { promises as fs, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { promises as fs, readFileSync } from "node:fs";
 import path from "node:path";
 import type { Request, Response, NextFunction } from "express";
+import { writeStateFileAtomic } from "./store";
 
 // Data directory mirrors store.ts's; kept separate to avoid coupling the auth
 // secret's lifecycle to the instance registry file.
@@ -12,8 +13,19 @@ const passwordFilePath: string = path.join(dataDirectory, "auth-password.json");
 export const AUTH_COOKIE_NAME = "ccdash_auth";
 const TOKEN_TTL_MS: number = 180 * 24 * 60 * 60 * 1000; // ~180 days
 const SCRYPT_KEY_LENGTH = 64;
+const SECRET_BYTE_LENGTH = 32;
+
+// ponytail: one global counter because there is a single user; if this ever serves several
+// people, key it per cf-connecting-ip so one attacker cannot lock everyone out.
+const LOGIN_FAILURE_LIMIT = 5;
+const LOGIN_FAILURE_WINDOW_MS: number = 15 * 60 * 1000;
+let failedLoginTimestamps: number[] = [];
 
 let cachedSecret: Buffer | null = null;
+// Serializes every secret write (first creation and rotations): two overlapping writers could
+// otherwise leave the in-memory key different from the one on disk.
+let secretWriteQueueTail: Promise<unknown> = Promise.resolve();
+let secretRotatedListener: (() => void) | null = null;
 
 interface StoredPassword {
   salt: string;
@@ -40,22 +52,43 @@ function loadStoredPassword(): StoredPassword | null {
 // Persists a password set from the UI (e.g. the "Start tunnel" flow), hashed with a random
 // salt via scrypt so the plaintext password never sits on disk. DASHBOARD_PASSWORD, if set,
 // still takes priority in checkPassword below; this is only consulted when that env var is absent.
-export function setStoredPassword(password: string): void {
+// Written atomically (tmp + rename) and cached only afterwards: a torn password file parses as
+// "no password" in loadStoredPassword, which would silently turn the gate off on the LAN.
+export async function setStoredPassword(password: string): Promise<void> {
   const salt: Buffer = randomBytes(16);
   const hash: Buffer = scryptSync(password, salt, SCRYPT_KEY_LENGTH);
   const stored: StoredPassword = { salt: salt.toString("hex"), hash: hash.toString("hex") };
-  mkdirSync(dataDirectory, { recursive: true });
-  writeFileSync(passwordFilePath, JSON.stringify(stored), "utf8");
+  await writeStateFileAtomic(passwordFilePath, JSON.stringify(stored));
   cachedStoredPassword = stored;
+}
+
+// DASHBOARD_PASSWORD wins over the stored hash (see checkPassword), so while it is set a
+// password saved from the UI has no effect.
+export function isPasswordFromEnv(): boolean {
+  return typeof process.env.DASHBOARD_PASSWORD === "string" && process.env.DASHBOARD_PASSWORD.length > 0;
 }
 
 // The password gate is opt-in: with neither DASHBOARD_PASSWORD nor a stored password set,
 // every check below is skipped and the dashboard behaves exactly as it did before auth existed.
 export function isAuthEnabled(): boolean {
-  return (
-    (typeof process.env.DASHBOARD_PASSWORD === "string" && process.env.DASHBOARD_PASSWORD.length > 0) ||
-    loadStoredPassword() !== null
-  );
+  return isPasswordFromEnv() || loadStoredPassword() !== null;
+}
+
+// Generates a fresh secret, persists it atomically and only then swaps the cached key, so a
+// failed write leaves both the old file and the old key in place. With onlyIfMissing, a caller
+// that lost the race to another creator reuses its secret instead of replacing it.
+function writeNewSecret(onlyIfMissing: boolean): Promise<Buffer> {
+  const write: Promise<Buffer> = secretWriteQueueTail.then(async () => {
+    if (onlyIfMissing && cachedSecret !== null) {
+      return cachedSecret;
+    }
+    const generated: Buffer = randomBytes(SECRET_BYTE_LENGTH);
+    await writeStateFileAtomic(secretFilePath, generated.toString("hex"));
+    cachedSecret = generated;
+    return generated;
+  });
+  secretWriteQueueTail = write.catch(() => undefined);
+  return write;
 }
 
 async function getOrCreateSecret(): Promise<Buffer> {
@@ -63,16 +96,51 @@ async function getOrCreateSecret(): Promise<Buffer> {
     return cachedSecret;
   }
   try {
-    const existing: string = await fs.readFile(secretFilePath, "utf8");
-    cachedSecret = Buffer.from(existing.trim(), "hex");
-    return cachedSecret;
-  } catch {
-    const generated: Buffer = randomBytes(32);
-    await fs.mkdir(dataDirectory, { recursive: true });
-    await fs.writeFile(secretFilePath, generated.toString("hex"), "utf8");
-    cachedSecret = generated;
-    return cachedSecret;
+    const existing: Buffer = Buffer.from((await fs.readFile(secretFilePath, "utf8")).trim(), "hex");
+    // A short key (an empty file left by a torn write) is still accepted by createHmac, and
+    // anyone could then forge cookies with it, so anything under the full length is discarded.
+    if (existing.length >= SECRET_BYTE_LENGTH) {
+      cachedSecret = existing;
+      return cachedSecret;
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
   }
+  return writeNewSecret(true);
+}
+
+// Invalidates every cookie issued so far (they are HMACs of the old secret), then lets the
+// registered listener cut the sockets that were already authenticated at upgrade time.
+export async function rotateSecret(): Promise<void> {
+  await writeNewSecret(false);
+  secretRotatedListener?.();
+}
+
+export function setSecretRotatedListener(listener: (() => void) | null): void {
+  secretRotatedListener = listener;
+}
+
+// terminate(), not close(): ws keeps delivering messages from a client that ignores the close
+// frame until its 30s close timer fires, and terminal.ts writes them straight into the pty.
+export function revokeLiveSockets(clients: Iterable<{ terminate(): void }>): void {
+  for (const client of clients) {
+    client.terminate();
+  }
+}
+
+export function isLoginLocked(now: number = Date.now()): boolean {
+  failedLoginTimestamps = failedLoginTimestamps.filter((failedAt: number) => now - failedAt < LOGIN_FAILURE_WINDOW_MS);
+  return failedLoginTimestamps.length >= LOGIN_FAILURE_LIMIT;
+}
+
+export function recordFailedLogin(now: number = Date.now()): void {
+  failedLoginTimestamps.push(now);
+}
+
+export function resetFailedLogins(): void {
+  failedLoginTimestamps = [];
 }
 
 function sign(secret: Buffer, expiresAt: number): string {
@@ -80,8 +148,8 @@ function sign(secret: Buffer, expiresAt: number): string {
 }
 
 export function checkPassword(candidate: string): boolean {
-  if (typeof process.env.DASHBOARD_PASSWORD === "string" && process.env.DASHBOARD_PASSWORD.length > 0) {
-    const expectedBuffer: Buffer = Buffer.from(process.env.DASHBOARD_PASSWORD);
+  if (isPasswordFromEnv()) {
+    const expectedBuffer: Buffer = Buffer.from(process.env.DASHBOARD_PASSWORD ?? "");
     const candidateBuffer: Buffer = Buffer.from(candidate);
     // Lengths must match before timingSafeEqual, but that comparison itself is not
     // timing-safe: it is cheap and reveals only length, not content.
