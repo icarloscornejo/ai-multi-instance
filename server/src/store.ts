@@ -162,7 +162,7 @@ export function isValidDashboardState(value: unknown): value is DashboardState {
 // Atomic tmp+rename, shared by every writer of either the primary file or the backup: a
 // process dying mid-write must never leave a half-written file where a reader (or a future
 // recovery attempt reading the backup itself) could see a truncated, unparseable result.
-async function writeStateFileAtomic(filePath: string, serializedState: string): Promise<void> {
+export async function writeStateFileAtomic(filePath: string, serializedState: string): Promise<void> {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const temporaryFilePath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   await fs.writeFile(temporaryFilePath, serializedState, "utf8");

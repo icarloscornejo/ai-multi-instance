@@ -2,7 +2,7 @@
 // (InstanceSettingsSheet.tsx), which render the same live-status fields in two different
 // layouts. Hoisted here instead of duplicated so a label or a usage-severity threshold only
 // needs to change in one place.
-import type { AgentProvider, BranchUpstream, LiveStatus } from "./types";
+import type { AgentProvider, BranchUpstream, LiveStatus, ReviewRequest } from "./types";
 
 export const PROVIDER_LABELS = {
   claude: "Claude Code",
@@ -62,6 +62,21 @@ export function formatUpstream(upstream: BranchUpstream): { text: string; colorC
   if (upstream.behind > 0) parts.push(`↓${upstream.behind}`);
   if (parts.length === 0) return { text: "up to date", colorClass: "text-txt-dim" };
   return { text: parts.join(" "), colorClass: upstream.ahead > 0 ? "text-status-warn" : "text-txt-dim" };
+}
+
+// "!7" is GitLab's notation for a merge request, "#45" GitHub's for a pull request. The link is
+// only offered for an https URL: it is built by the server, but it ends up in an href.
+export function formatReview(review: ReviewRequest): { text: string; href: string | null; dimmed: boolean; title: string | undefined } {
+  if (review.state === "unknown") {
+    return { text: "MR/PR ?", href: null, dimmed: true, title: "Not checked yet" };
+  }
+  const checkedTime: string = new Date(review.checkedAt).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
+  const title: string | undefined = review.stale ? `Last checked ${checkedTime}, remote unreachable, may be outdated` : undefined;
+  if (review.state === "none") {
+    return { text: "no MR/PR", href: null, dimmed: review.stale, title };
+  }
+  const href: string | null = review.url !== null && review.url.startsWith("https://") ? review.url : null;
+  return { text: `${review.kind === "github" ? "#" : "!"}${review.number}`, href, dimmed: review.stale, title };
 }
 
 export function formatAge(isoTimestamp: string, nowMs: number = Date.now()): string {
