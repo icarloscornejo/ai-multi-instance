@@ -10,6 +10,7 @@ import { pathExists } from "./paths";
 import { loadState, updateState } from "./store";
 import { getPaneCurrentPath, getSessionPresence, killSession, signalChannel } from "./tmux";
 import { branchUpstream, currentBranch, isRemoteUnreachableError, NETWORK_GIT_TIMEOUT_MS, runGit, type BranchUpstream } from "./git";
+import { reviewRequestFor, type ReviewRequest } from "./reviewRequests";
 import { claudeFallback, codexFallback, enrichCodexStatus, findCodexSessionFile } from "./agentFallback";
 import {
   listSiblingSnapshots,
@@ -1041,11 +1042,21 @@ apiRouter.get(
 
     // Best-effort extra: a git failure here must not turn the whole live-status poll into a 500,
     // which the client would show as every field being unreachable.
+    let upstream: BranchUpstream | null = null;
     try {
-      const upstream: BranchUpstream | null = await branchUpstream(paneCwd);
+      upstream = await branchUpstream(paneCwd);
       if (upstream !== null) liveStatus.upstream = upstream;
     } catch (error) {
       console.error("[server] could not read the branch upstream state:", (error as Error).message);
+    }
+    // Its own try: losing the MR/PR must not also take the push state down with it
+    if (upstream !== null) {
+      try {
+        const review: ReviewRequest | null = await reviewRequestFor(paneCwd, upstream);
+        if (review !== null) liveStatus.review = review;
+      } catch (error) {
+        console.error("[server] could not read the merge request state:", (error as Error).message);
+      }
     }
     response.json(liveStatus);
   })

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describeLiveStatus, formatAge, formatUpstream, upstreamFor } from "./liveStatusFormatting";
+import { describeLiveStatus, formatAge, formatReview, formatUpstream, upstreamFor } from "./liveStatusFormatting";
 import type { BranchUpstream, LiveStatus } from "./types";
 
 const NOW = Date.parse("2026-10-25T22:30:00Z");
@@ -39,6 +39,37 @@ describe("formatUpstream", () => {
     expect(formatUpstream(tracking(2, 0))).toEqual({ text: "↑2", colorClass: "text-status-warn" });
     expect(formatUpstream(tracking(2, 1))).toEqual({ text: "↑2 ↓1", colorClass: "text-status-warn" });
     expect(formatUpstream(tracking(0, 3))).toEqual({ text: "↓3", colorClass: "text-txt-dim" });
+  });
+});
+
+describe("formatReview", () => {
+  const checkedAt = "2026-10-26T20:00:00.000Z";
+
+  it("writes a GitLab merge request as !N and a GitHub pull request as #N, linked to the page", () => {
+    const merge = formatReview({ state: "found", number: 7, kind: "gitlab", url: "https://h/g/r/-/merge_requests/7", checkedAt, stale: false });
+    const pull = formatReview({ state: "found", number: 45, kind: "github", url: "https://github.com/o/r/pull/45", checkedAt, stale: false });
+    expect(merge).toEqual({ text: "!7", href: "https://h/g/r/-/merge_requests/7", dimmed: false, title: undefined });
+    expect(pull).toMatchObject({ text: "#45", href: "https://github.com/o/r/pull/45" });
+  });
+
+  it("shows the number without a link when the server could not build the URL, or it is not https", () => {
+    expect(formatReview({ state: "found", number: 7, kind: "gitlab", url: null, checkedAt, stale: false }).href).toBeNull();
+    expect(formatReview({ state: "found", number: 7, kind: "gitlab", url: "javascript:alert(1)", checkedAt, stale: false })).toMatchObject({
+      text: "!7",
+      href: null,
+    });
+  });
+
+  it("dims a stale answer and says it may be outdated", () => {
+    const stale = formatReview({ state: "found", number: 7, kind: "gitlab", url: "https://h/g/r/-/merge_requests/7", checkedAt, stale: true });
+    expect(stale.dimmed).toBe(true);
+    expect(stale.title).toContain("may be outdated");
+    expect(formatReview({ state: "none", checkedAt, stale: true })).toMatchObject({ text: "no MR/PR", dimmed: true });
+  });
+
+  it("says there is none, and that it has not been checked yet", () => {
+    expect(formatReview({ state: "none", checkedAt, stale: false })).toEqual({ text: "no MR/PR", href: null, dimmed: false, title: undefined });
+    expect(formatReview({ state: "unknown" })).toMatchObject({ text: "MR/PR ?", href: null, title: "Not checked yet" });
   });
 });
 

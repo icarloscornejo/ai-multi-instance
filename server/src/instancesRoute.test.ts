@@ -86,6 +86,7 @@ vi.mock("./git", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./git")>();
   return { ...actual, runGit: vi.fn(), branchUpstream: vi.fn() };
 });
+vi.mock("./reviewRequests", () => ({ reviewRequestFor: vi.fn() }));
 // Passthrough by default; the branch-state tests below pick what the resolver answers, since an
 // "available" answer otherwise needs a live agent process behind the pane.
 vi.mock("./liveStatus", async (importOriginal) => {
@@ -99,6 +100,7 @@ import { initializeInstanceSession } from "./terminal";
 import { getPaneCurrentPath, getSessionPresence, killSession } from "./tmux";
 import { branchUpstream, GitError, runGit } from "./git";
 import { resolveLiveStatus } from "./liveStatus";
+import { reviewRequestFor } from "./reviewRequests";
 import { apiRouter } from "./routes";
 
 const runGitMock = vi.mocked(runGit);
@@ -185,6 +187,7 @@ beforeEach(() => {
   // live-status asks for the pane folder on every poll, not only when no agent is running
   vi.mocked(getPaneCurrentPath).mockReset().mockResolvedValue("/work/repo");
   vi.mocked(branchUpstream).mockReset().mockResolvedValue(null);
+  vi.mocked(reviewRequestFor).mockReset().mockResolvedValue(null);
   vi.mocked(loadState).mockReset();
   vi.mocked(saveState).mockReset().mockResolvedValue(undefined);
   vi.mocked(updateState).mockClear();
@@ -477,6 +480,50 @@ describe("GET /instances/:id/live-status - branch upstream state", () => {
     expect(status).toBe(200);
     expect(body.model).toBe("opus");
     expect("upstream" in body).toBe(false);
+  });
+
+  it("attaches the merge request state, asked about the same folder and upstream", async () => {
+    const review = { state: "found", number: 7, kind: "gitlab", url: "https://h/g/r/-/merge_requests/7", checkedAt: "2026-10-26T20:00:00.000Z", stale: false } as const;
+    answerWith({ available: false, reason: "no-agent" });
+    vi.mocked(branchUpstream).mockResolvedValue(trackingUpstream);
+    vi.mocked(reviewRequestFor).mockResolvedValue(review);
+
+    const { body } = await getLiveStatus();
+
+    expect(body.review).toEqual(review);
+    expect(vi.mocked(reviewRequestFor)).toHaveBeenCalledWith("/work/repo", trackingUpstream);
+  });
+
+  it("does not ask about a merge request when there is no upstream state", async () => {
+    answerWith({ available: false, reason: "no-agent" });
+
+    const { body } = await getLiveStatus();
+
+    expect(vi.mocked(reviewRequestFor)).not.toHaveBeenCalled();
+    expect("review" in body).toBe(false);
+  });
+
+  it("omits the review field when there is nothing to show for the branch", async () => {
+    answerWith({ available: false, reason: "no-agent" });
+    vi.mocked(branchUpstream).mockResolvedValue(trackingUpstream);
+
+    const { body } = await getLiveStatus();
+
+    expect("review" in body).toBe(false);
+  });
+
+  it("keeps the push state and answers 200 when reading the merge request throws", async () => {
+    answerWith({ available: true, cwd: "/agent/worktree", branch: "feat", model: "opus" });
+    vi.mocked(branchUpstream).mockResolvedValue(trackingUpstream);
+    vi.mocked(reviewRequestFor).mockRejectedValue(new Error("boom"));
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const { status, body } = await getLiveStatus();
+
+    expect(status).toBe(200);
+    expect(body.model).toBe("opus");
+    expect(body.upstream).toEqual(trackingUpstream);
+    expect("review" in body).toBe(false);
   });
 
   it("is attached to an available answer without clobbering the agent fields", async () => {

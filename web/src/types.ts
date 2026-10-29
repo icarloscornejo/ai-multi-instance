@@ -128,6 +128,14 @@ export type BranchUpstream = { branch: string } & (
   | { state: "tracking"; ahead: number; behind: number; remoteName: string; pushRef: string }
 );
 
+// Mirrors ReviewRequest in server/src/reviewRequests.ts: the merge request (GitLab) or pull
+// request (GitHub) of the branch, found by its tip commit. `stale` means the host could not be
+// asked lately (no VPN) and this is the last answer it gave.
+export type ReviewRequest =
+  | { state: "found"; number: number; kind: "gitlab" | "github"; url: string | null; checkedAt: string; stale: boolean }
+  | { state: "none"; checkedAt: string; stale: boolean }
+  | { state: "unknown" };
+
 export interface LiveStatus {
   available: boolean;
   // Set when available is false and the server knows why: no agent is running in the pane, or
@@ -149,6 +157,9 @@ export interface LiveStatus {
   // Whether the branch is pushed. Read by the server from the same folder as `branch`, but only
   // meaningful next to it when the names match (see upstreamFor).
   upstream?: BranchUpstream;
+  // Absent when the branch cannot own one (the default branch) or there is no hosted remote.
+  // Same branch-name condition as `upstream`.
+  review?: ReviewRequest;
   gitAdded?: number;
   gitRemoved?: number;
   contextUsed?: number;

@@ -120,16 +120,20 @@ export async function branchUpstream(cwd: string): Promise<BranchUpstream | null
 }
 
 // Always passes `-C <cwd>` so callers never have to. `timeoutMs` picks between the two
-// constants above based on whether the command touches the network.
+// constants above based on whether the command touches the network. `maxBufferBytes` only
+// matters for commands with unbounded output (ls-remote on a repo with tens of thousands of
+// PRs): past Node's 1 MiB default execFile kills the child, which would read as a timeout.
 export async function runGit(
   cwd: string,
   gitArguments: string[],
-  timeoutMs: number = LOCAL_GIT_TIMEOUT_MS
+  timeoutMs: number = LOCAL_GIT_TIMEOUT_MS,
+  maxBufferBytes?: number
 ): Promise<string> {
   try {
     const { stdout } = await execFileAsync("git", ["-C", cwd, ...gitArguments], {
       timeout: timeoutMs,
       env: hardenedGitEnv(),
+      ...(maxBufferBytes !== undefined ? { maxBuffer: maxBufferBytes } : {}),
     });
     return stdout.trim();
   } catch (error) {
