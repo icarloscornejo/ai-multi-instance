@@ -22,6 +22,9 @@ export interface InstanceRecord {
   fontSize: number;
   createdAt: string;
   shellOnly?: boolean;
+  // Set when locationPath is a sibling git worktree made because the source folder already had a
+  // live session. `created` is false for a worktree that already existed: it is never auto-removed.
+  worktree?: { sourcePath: string; branch: string; created: boolean };
 }
 
 export interface DashboardState {

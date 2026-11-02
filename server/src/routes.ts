@@ -25,7 +25,15 @@ import { pathExists } from "./paths";
 import { PASTED_IMAGE_EXTENSIONS, savePastedImage } from "./pastedImages";
 import { loadState, updateState } from "./store";
 import { getPaneCurrentPath, getSessionPresence, killSession, signalChannel } from "./tmux";
-import { branchUpstream, currentBranch, isRemoteUnreachableError, NETWORK_GIT_TIMEOUT_MS, runGit, type BranchUpstream } from "./git";
+import {
+  branchUpstream,
+  currentBranch,
+  isRemoteUnreachableError,
+  NETWORK_GIT_TIMEOUT_MS,
+  runGit,
+  worktreeDirFor,
+  type BranchUpstream,
+} from "./git";
 import { reviewRequestFor, type ReviewRequest } from "./reviewRequests";
 import { claudeFallback, codexFallback, enrichCodexStatus, findCodexSessionFile } from "./agentFallback";
 import {
@@ -151,6 +159,50 @@ function localProtectedBranch(branches: string[]): string | null {
   return PROTECTED_BRANCH_NAMES.find((name) => branches.includes(name)) ?? null;
 }
 
+// git prints resolved paths while the registry may hold a symlinked one, so compare through
+// realpath; a folder that no longer exists falls back to a lexical resolve.
+async function resolvedPath(target: string): Promise<string> {
+  try {
+    return await fs.realpath(target);
+  } catch {
+    return path.resolve(target);
+  }
+}
+
+// Whether `inner` is `outer` itself or lives inside it.
+function isSameOrInside(outer: string, inner: string): boolean {
+  const relativePath: string = path.relative(outer, inner);
+  return relativePath === "" || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath));
+}
+
+// Removes a worktree the dashboard created, only when nothing in it would be lost (never
+// --force). Returns null when it was removed, else the reason it was kept, for the user.
+async function removeWorktreeIfClean(
+  worktreeDir: string,
+  worktree: NonNullable<InstanceRecord["worktree"]>,
+  shared: boolean
+): Promise<string | null> {
+  if (!worktree.created) {
+    return `The worktree ${worktreeDir} existed before this instance, so it was kept.`;
+  }
+  if (shared) {
+    return `The worktree ${worktreeDir} is still used by another instance, so it was kept.`;
+  }
+  try {
+    const dirtyFiles: string = await runGit(worktreeDir, [
+      "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none",
+    ]);
+    if (dirtyFiles !== "") {
+      return `The worktree ${worktreeDir} has uncommitted changes, so it was kept. Remove it yourself when you are done with it.`;
+    }
+    // Run from the source folder: git refuses to remove the worktree it is running in.
+    await runGit(worktree.sourcePath, ["worktree", "remove", worktreeDir]);
+    return null;
+  } catch (error) {
+    return `The worktree ${worktreeDir} could not be removed and was kept: ${(error as Error).message}`;
+  }
+}
+
 // Branches checked out in *other* worktrees of this repo (the primary worktree, cwd
 // itself, is excluded: its checked-out branch is handled like any other candidate, not
 // specially skipped, so that a branch you happen to be sitting on can still be cleaned
@@ -178,7 +230,7 @@ async function branchesCheckedOutInWorktrees(cwd: string): Promise<Map<string, s
 // Every local branch except the protected long-lived ones (main/master/develop/dev): no
 // merged/squash-merged check, you pick whatever you want to delete. Purely local git
 // calls, no network fetch, so this is effectively instant.
-async function findStaleBranches(cwd: string): Promise<StaleBranchesResponse> {
+async function findStaleBranches(cwd: string, instances: InstanceRecord[]): Promise<StaleBranchesResponse> {
   let branches: string[];
   let current: string | null;
   try {
@@ -189,8 +241,18 @@ async function findStaleBranches(cwd: string): Promise<StaleBranchesResponse> {
   }
 
   const worktreeBranches: Map<string, string> = await branchesCheckedOutInWorktrees(cwd);
+  // A worktree a registered instance works in must never be offered: cleanup force-removes it.
+  const instancePaths: Set<string> = new Set(
+    await Promise.all(instances.map((instance) => resolvedPath(instance.locationPath)))
+  );
+  const usedBranches: Set<string> = new Set();
+  for (const [branch, worktreePath] of worktreeBranches) {
+    if (instancePaths.has(await resolvedPath(worktreePath))) {
+      usedBranches.add(branch);
+    }
+  }
   const candidates: { branch: string; worktreePath?: string }[] = branches
-    .filter((branch) => !isProtectedBranchName(branch))
+    .filter((branch) => !isProtectedBranchName(branch) && !usedBranches.has(branch))
     .map((branch) => {
       const worktreePath: string | undefined = worktreeBranches.get(branch);
       return worktreePath !== undefined ? { branch, worktreePath } : { branch };
@@ -552,7 +614,7 @@ apiRouter.get(
       response.status(404).json({ error: `Folder does not exist: ${locationPath}` });
       return;
     }
-    response.json(await findStaleBranches(locationPath));
+    response.json(await findStaleBranches(locationPath, state.instances));
   })
 );
 
@@ -582,7 +644,7 @@ apiRouter.post(
     // Recompute candidates now, rather than trusting the client's earlier snapshot: the
     // repo may have changed (new commits, a checkout, a new worktree) between when the
     // list was fetched and when the user clicked delete.
-    const { candidates, currentBranch: checkedOutBranch } = await findStaleBranches(locationPath);
+    const { candidates, currentBranch: checkedOutBranch } = await findStaleBranches(locationPath, state.instances);
     const candidatesByName: Map<string, { branch: string; worktreePath?: string }> = new Map(
       candidates.map((candidate) => [candidate.branch, candidate])
     );
@@ -800,6 +862,11 @@ apiRouter.post(
         return;
       }
       branchActionBase = branchAction.type === "create" ? (branchAction.baseBranch as string).trim() : "";
+      // A leading dash would be parsed by git as an option, not a branch name.
+      if (branchActionBranch.startsWith("-") || branchActionBase.startsWith("-")) {
+        response.status(400).json({ error: "Branch names cannot start with '-'." });
+        return;
+      }
     }
 
     const shellOnly: boolean = payload.shellOnly === true;
@@ -847,7 +914,7 @@ apiRouter.post(
     };
 
     const resumeKey: string = sessionKeyFor(provider, locationPath, requestedLabel);
-    const resumeSessionId: string | undefined =
+    let resumeSessionId: string | undefined =
       payload.resumeSession === false ? undefined : state.sessionsByKey[resumeKey];
 
     // ===================================================================================
@@ -877,7 +944,40 @@ apiRouter.post(
     };
 
     let persisted = false;
+    let createdWorktreeDir: string | null = null;
+    // Best-effort and never forced: a failed launch must not leave a worktree behind, but must
+    // never discard work either. A branch created for it stays and is named in the error.
+    const removeCreatedWorktree = async (): Promise<string> => {
+      if (createdWorktreeDir === null) return "";
+      try {
+        await runGit(locationPath, ["worktree", "remove", createdWorktreeDir]);
+        return branchAction?.type === "create" ? ` The new branch '${branchActionBranch}' was left in place.` : "";
+      } catch (removeError) {
+        return ` The worktree ${createdWorktreeDir} could not be removed: ${(removeError as Error).message}`;
+      }
+    };
     try {
+      // Decided before anything touches git or the resume snapshot: a folder with a live session
+      // must keep its branch, so the new instance gets a sibling worktree instead.
+      let useWorktree = false;
+      if (branchAction !== undefined) {
+        let folderHasLiveInstance = false;
+        for (const existing of state.instances) {
+          if (existing.locationPath === locationPath && (await getSessionPresence(existing.tmuxSession)) !== "absent") {
+            folderHasLiveInstance = true;
+            break;
+          }
+        }
+        useWorktree =
+          folderHasLiveInstance &&
+          (branchAction.type === "create" || (await currentBranch(locationPath)) !== branchActionBranch);
+      }
+      if (useWorktree && resumeSessionId !== undefined) {
+        // The saved session belongs to the shared folder, not to the worktree.
+        resumeSessionId = undefined;
+        progress.stepWarning("prepare-resume", "Session resume skipped: this instance runs in a new worktree.");
+      }
+
       if (resumeSessionId !== undefined) {
         progress.stepStart("prepare-resume", "Preparing session resume");
         instance.sessionId = resumeSessionId;
@@ -887,7 +987,52 @@ apiRouter.post(
         progress.stepDone("prepare-resume");
       }
 
-      if (branchAction !== undefined) {
+      if (branchAction !== undefined && useWorktree) {
+        try {
+          const worktreeDir: string = worktreeDirFor(locationPath, branchActionBranch);
+          let reuseExisting = false;
+          if (await pathExists(worktreeDir)) {
+            const existingWorktreePath: string | undefined = (await branchesCheckedOutInWorktrees(locationPath)).get(
+              branchActionBranch
+            );
+            reuseExisting =
+              branchAction.type === "checkout" &&
+              existingWorktreePath !== undefined &&
+              (await resolvedPath(existingWorktreePath)) === (await resolvedPath(worktreeDir));
+            if (!reuseExisting) {
+              progress.fail(
+                `${worktreeDir} already exists and is not a worktree on '${branchActionBranch}'. Move or remove it, then try again.`
+              );
+              return;
+            }
+          } else if (branchAction.type === "checkout") {
+            progress.stepStart("checkout-branch", `Adding worktree for ${branchActionBranch}`);
+            await runGit(locationPath, ["worktree", "add", "--", worktreeDir, branchActionBranch]);
+            createdWorktreeDir = worktreeDir;
+            progress.stepDone("checkout-branch");
+          } else {
+            progress.stepStart("fetch-base", `Fetching ${branchActionBase} from origin`);
+            await runGit(locationPath, ["fetch", "origin", branchActionBase], NETWORK_GIT_TIMEOUT_MS);
+            progress.stepDone("fetch-base");
+
+            progress.stepStart("create-branch", `Creating branch ${branchActionBranch} in a new worktree`);
+            await runGit(locationPath, [
+              "worktree", "add", "--no-track", "-b", branchActionBranch, "--", worktreeDir, `origin/${branchActionBase}`,
+            ]);
+            createdWorktreeDir = worktreeDir;
+            progress.stepDone("create-branch");
+          }
+          instance.locationPath = worktreeDir;
+          instance.worktree = { sourcePath: locationPath, branch: branchActionBranch, created: !reuseExisting };
+        } catch (error) {
+          progress.fail(
+            isRemoteUnreachableError(error)
+              ? REMOTE_UNREACHABLE_MESSAGE
+              : `Could not create the worktree: ${(error as Error).message}`
+          );
+          return;
+        }
+      } else if (branchAction !== undefined) {
         try {
           if (branchAction.type === "checkout") {
             progress.stepStart("checkout-branch", `Checking out ${branchActionBranch}`);
@@ -947,7 +1092,7 @@ apiRouter.post(
               progress.stepStart("persist", "Saving instance");
               await updateState(async (draft) => {
                 const nameCollision: boolean = draft.instances.some(
-                  (existing) => existing.locationPath === locationPath && existing.label === requestedLabel
+                  (existing) => existing.locationPath === instance.locationPath && existing.label === requestedLabel
                 );
                 const idCollision: boolean = draft.instances.some((existing) => existing.id === instance.id);
                 const sessionCollision: boolean = draft.instances.some(
@@ -977,7 +1122,7 @@ apiRouter.post(
         );
       } catch (error) {
         if (!persisted) {
-          progress.fail(`Could not create the instance: ${(error as Error).message}`);
+          progress.fail(`Could not create the instance: ${(error as Error).message}${await removeCreatedWorktree()}`);
           return;
         }
         console.error(
@@ -994,7 +1139,9 @@ apiRouter.post(
     } catch (error) {
       // A failure with no more specific handler (writeSessionSnapshot, an unexpected throw).
       // Never rethrow: headers are already sent.
-      progress.fail(`Could not create the instance: ${(error as Error).message}`);
+      progress.fail(
+        `Could not create the instance: ${(error as Error).message}${persisted ? "" : await removeCreatedWorktree()}`
+      );
     } finally {
       response.end();
     }
@@ -1266,17 +1413,30 @@ apiRouter.delete(
         return;
       }
 
-      await updateState(async (draft) => {
+      const removal = await updateState<{ removedByThisRequest: boolean; shared: boolean }>(async (draft) => {
         const current = draft.instances.find((candidate) => candidate.id === instanceId);
         if (current === undefined) {
           // Already removed by a concurrent DELETE that won the race for this same instance
           // (both held the session lock in turn, sequentially) - idempotent, nothing to save.
-          return { result: undefined };
+          return { result: { removedByThisRequest: false, shared: false } };
         }
         draft.instances = draft.instances.filter((candidate) => candidate.id !== instanceId);
-        return { result: undefined, nextState: draft };
+        // Another instance at, or inside, the worktree folder still needs it.
+        const shared: boolean = draft.instances.some((other) => isSameOrInside(current.locationPath, other.locationPath));
+        return { result: { removedByThisRequest: true, shared }, nextState: draft };
       });
-      response.status(204).end();
+
+      const worktree = preInstance.worktree;
+      if (!removal.removedByThisRequest || worktree === undefined) {
+        response.status(204).end();
+        return;
+      }
+      const warning: string | null = await removeWorktreeIfClean(preInstance.locationPath, worktree, removal.shared);
+      if (warning === null) {
+        response.status(204).end();
+      } else {
+        response.status(200).json({ warning });
+      }
     });
   })
 );

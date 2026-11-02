@@ -10,6 +10,7 @@ import {
 } from "../liveStatusFormatting";
 import type { Instance, LiveStatus, UpdateInstancePayload } from "../types";
 import { BranchGitLine } from "./BranchGitLine";
+import { worktreeLabel } from "../worktreeLabel";
 
 // Splits an absolute path into indented tree lines so long paths read top-to-bottom
 // instead of wrapping mid-word in the narrow sidebar.
@@ -124,6 +125,7 @@ export function Sidebar({ instance, liveStatus, gitBranch, onUpdate, onDeleteReq
   // "No agent" / "no data" answers carry the pane's branch too, so it keeps following checkouts
   // made with no agent running.
   const liveBranch: string | undefined = liveStatus?.branch ?? undefined;
+  const worktreeInfo = worktreeLabel(instance);
   const view = describeLiveStatus(liveStatus, instance.provider);
   const dimmed: string = view.kind === "data" && view.stale ? " opacity-60" : "";
   const limitsDimmed: string = view.kind === "data" && view.limitsStale ? " opacity-60" : "";
@@ -144,6 +146,11 @@ export function Sidebar({ instance, liveStatus, gitBranch, onUpdate, onDeleteReq
           </div>
           <CopyButton value={instance.locationPath} title="Copy location path" />
         </div>
+        {worktreeInfo !== null && (
+          <div className="mt-[4px] text-[11px] text-txt-dim">
+            Worktree of {worktreeInfo.sourceName} ({worktreeInfo.branch})
+          </div>
+        )}
       </Section>
 
       <Section>

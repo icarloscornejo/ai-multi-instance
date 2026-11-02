@@ -13,6 +13,7 @@ export interface Instance {
   fontSize: number;
   createdAt: string;
   shellOnly?: boolean;
+  worktree?: { sourcePath: string; branch: string; created: boolean };
 }
 
 export interface DashboardConfig {

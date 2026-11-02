@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { api } from "../api";
 import type { Instance } from "../types";
+import { worktreeLabel } from "../worktreeLabel";
 
 const PROVIDER_LABELS = {
   claude: "Claude",
@@ -23,6 +24,7 @@ interface InstanceCardProps {
 }
 
 export function InstanceCard({ instance, isFirst, onOpen, onLongPress }: InstanceCardProps) {
+  const worktreeInfo = worktreeLabel(instance);
   const [branch, setBranch] = useState<string | null>(null);
   const pressTimerRef = useRef<number | null>(null);
   const pressStartRef = useRef<{ x: number; y: number } | null>(null);
@@ -98,6 +100,7 @@ export function InstanceCard({ instance, isFirst, onOpen, onLongPress }: Instanc
             {instance.effort !== null ? ` · ${instance.effort}` : ""}
           </span>
           {branch !== null && <span className="font-mono text-[11px] text-txt-dim">{branch}</span>}
+          {worktreeInfo !== null && <span className="text-[11px] text-txt-dim">Worktree of {worktreeInfo.sourceName}</span>}
         </div>
       </div>
       <svg

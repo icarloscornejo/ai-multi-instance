@@ -597,12 +597,12 @@ export function App() {
     });
   }, [trackMutation]);
 
-  const confirmDelete = async (): Promise<void> => {
+  const confirmDelete = async (): Promise<{ warning?: string }> => {
     if (deleteRequest === null) {
-      return;
+      return {};
     }
     const targetInstance: Instance = deleteRequest;
-    await trackMutation(() => api.deleteInstance(targetInstance.id));
+    const deleteResult: { warning?: string } = await trackMutation(() => api.deleteInstance(targetInstance.id));
     setInstances((previousInstances) => {
       const remainingInstances: Instance[] = previousInstances.filter(
         (candidate) => candidate.id !== targetInstance.id
@@ -612,7 +612,11 @@ export function App() {
       }
       return remainingInstances;
     });
-    setDeleteRequest(null);
+    // With a warning the modal stays mounted to show it; the user closes it.
+    if (deleteResult.warning === undefined) {
+      setDeleteRequest(null);
+    }
+    return deleteResult;
   };
 
   const reorderInstances = (orderedIds: string[]): void => {

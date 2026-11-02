@@ -90,7 +90,7 @@ vi.mock("./auth", () => ({
 // calls the module's own runGit, which this mock cannot intercept) are stubs.
 vi.mock("./git", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./git")>();
-  return { ...actual, runGit: vi.fn(), branchUpstream: vi.fn() };
+  return { ...actual, runGit: vi.fn(), branchUpstream: vi.fn(), currentBranch: vi.fn() };
 });
 vi.mock("./reviewRequests", () => ({ reviewRequestFor: vi.fn() }));
 // Passthrough by default; the branch-state tests below pick what the resolver answers, since an
@@ -104,7 +104,7 @@ import { loadState, saveState, updateState } from "./store";
 import { pathExists } from "./paths";
 import { initializeInstanceSession } from "./terminal";
 import { getPaneCurrentPath, getSessionPresence, killSession } from "./tmux";
-import { branchUpstream, GitError, runGit } from "./git";
+import { branchUpstream, currentBranch, GitError, runGit } from "./git";
 import { resolveLiveStatus } from "./liveStatus";
 import { reviewRequestFor } from "./reviewRequests";
 import { apiRouter } from "./routes";
@@ -193,6 +193,7 @@ beforeEach(() => {
   // live-status asks for the pane folder on every poll, not only when no agent is running
   vi.mocked(getPaneCurrentPath).mockReset().mockResolvedValue("/work/repo");
   vi.mocked(branchUpstream).mockReset().mockResolvedValue(null);
+  vi.mocked(currentBranch).mockReset().mockResolvedValue(null);
   vi.mocked(reviewRequestFor).mockReset().mockResolvedValue(null);
   vi.mocked(loadState).mockReset();
   vi.mocked(saveState).mockReset().mockResolvedValue(undefined);
@@ -233,6 +234,21 @@ describe("POST /instances - phase 1 validation still fails with its status code,
   it("400 for a disabled provider - and it is rejected BEFORE any git call", async () => {
     const response = await createInstanceRequest({ locationPath: "/work/repo", provider: "cursor" });
     expect(response.status).toBe(400);
+    expect(runGitMock).not.toHaveBeenCalled();
+  });
+
+  it("400 for a branch or base name that starts with a dash, before any git call", async () => {
+    const checkout = await createInstanceRequest({
+      locationPath: "/work/repo",
+      branchAction: { type: "checkout", branch: "--detach" },
+    });
+    const create = await createInstanceRequest({
+      locationPath: "/work/repo",
+      branchAction: { type: "create", branch: "feature/x", baseBranch: "-main" },
+    });
+
+    expect(checkout.status).toBe(400);
+    expect(create.status).toBe(400);
     expect(runGitMock).not.toHaveBeenCalled();
   });
 });
@@ -539,6 +555,420 @@ describe("GET /instances/:id/live-status - branch upstream state", () => {
     const { body } = await getLiveStatus();
 
     expect(body).toMatchObject({ available: true, model: "opus", upstream: { branch: "feat", state: "unpublished" } });
+  });
+});
+
+// ---- Worktree support: a folder that already has a live instance must not be switched ----
+
+type GitCall = { cwd: string; args: string[] };
+const gitCalls = (): GitCall[] =>
+  runGitMock.mock.calls.map((call) => ({ cwd: call[0] as string, args: call[1] as string[] }));
+const gitCallsStartingWith = (...prefix: string[]): GitCall[] =>
+  gitCalls().filter((call) => prefix.every((word, position) => call.args[position] === word));
+
+const SOURCE_FOLDER = "/work/repo";
+const FEATURE_DIR = "/work/repo-feature-x";
+
+function porcelain(entries: { path: string; branch: string }[]): string {
+  return entries.map((entry) => `worktree ${entry.path}\nHEAD abc123\nbranch refs/heads/${entry.branch}\n`).join("\n");
+}
+
+// Answers per git subcommand; anything not listed succeeds with empty output.
+function scriptGit(handlers: {
+  worktreeList?: string;
+  status?: string | Error;
+  remove?: Error;
+  add?: Error;
+}): void {
+  runGitMock.mockImplementation(async (_cwd, args) => {
+    if (args[0] === "worktree" && args[1] === "list") {
+      return handlers.worktreeList ?? porcelain([{ path: SOURCE_FOLDER, branch: "main" }]);
+    }
+    if (args[0] === "status") {
+      if (handlers.status instanceof Error) throw handlers.status;
+      return handlers.status ?? "";
+    }
+    if (args[0] === "worktree" && args[1] === "remove" && handlers.remove) throw handlers.remove;
+    if (args[0] === "worktree" && args[1] === "add" && handlers.add) throw handlers.add;
+    return "";
+  });
+}
+
+function pathExistsOnly(existing: string[]): void {
+  vi.mocked(pathExists).mockImplementation(async (candidate: string) => existing.includes(candidate));
+}
+
+const liveInstance = (): InstanceRecord =>
+  makeRunningInstance({ id: "live01", label: "main-agent", tmuxSession: "ccdash-live01", locationPath: SOURCE_FOLDER });
+
+const worktreeInstance = (overrides: Partial<InstanceRecord> = {}, created = true): InstanceRecord =>
+  makeRunningInstance({
+    id: "wt0001",
+    label: "wt",
+    tmuxSession: "ccdash-wt0001",
+    locationPath: FEATURE_DIR,
+    worktree: { sourcePath: SOURCE_FOLDER, branch: "feature/x", created },
+    ...overrides,
+  } as Partial<InstanceRecord>);
+
+function initCommitsInstance(): void {
+  initMock.mockImplementation(async (_instance, onSessionCreated) => {
+    await onSessionCreated?.();
+  });
+}
+
+describe("POST /instances - sibling worktree when the folder already has a live session", () => {
+  beforeEach(() => {
+    vi.mocked(loadState).mockResolvedValue({ ...baseState(), instances: [liveInstance()] } as DashboardState);
+    getSessionPresenceMock.mockResolvedValue("present");
+    vi.mocked(currentBranch).mockResolvedValue("main");
+    pathExistsOnly([SOURCE_FOLDER]);
+    scriptGit({});
+    initCommitsInstance();
+  });
+
+  const savedInstance = (): InstanceRecord => {
+    const savedState = vi.mocked(saveState).mock.calls[0][0] as DashboardState;
+    return savedState.instances.find((instance) => instance.label === "wt") as InstanceRecord;
+  };
+
+  it("checkout of a different branch adds a sibling worktree and never switches the shared folder", async () => {
+    const response = await createInstanceRequest({
+      locationPath: SOURCE_FOLDER,
+      label: "wt",
+      branchAction: { type: "checkout", branch: "feature/x" },
+    });
+    const events = await readNdjson(response);
+
+    expect(events.at(-1)?.type).toBe("done");
+    expect(gitCallsStartingWith("worktree", "add").map((call) => call.args)).toEqual([["worktree", "add", "--", FEATURE_DIR, "feature/x"]]);
+    expect(gitCallsStartingWith("checkout")).toHaveLength(0);
+    expect(gitCallsStartingWith("merge")).toHaveLength(0);
+    expect(savedInstance().locationPath).toBe(FEATURE_DIR);
+    expect(savedInstance().worktree).toEqual({ sourcePath: SOURCE_FOLDER, branch: "feature/x", created: true });
+  });
+
+  it("create fetches the base then adds the worktree on a new untracked branch, without touching the shared folder", async () => {
+    const response = await createInstanceRequest({
+      locationPath: SOURCE_FOLDER,
+      label: "wt",
+      branchAction: { type: "create", branch: "feature/x", baseBranch: "develop" },
+    });
+    const events = await readNdjson(response);
+
+    expect(events.at(-1)?.type).toBe("done");
+    expect(gitCallsStartingWith("fetch").map((call) => call.args)).toEqual([["fetch", "origin", "develop"]]);
+    expect(gitCallsStartingWith("worktree", "add").map((call) => call.args)).toEqual([
+      ["worktree", "add", "--no-track", "-b", "feature/x", "--", FEATURE_DIR, "origin/develop"],
+    ]);
+    expect(gitCallsStartingWith("checkout")).toHaveLength(0);
+    expect(gitCallsStartingWith("merge")).toHaveLength(0);
+    expect(savedInstance().locationPath).toBe(FEATURE_DIR);
+    expect(savedInstance().worktree).toEqual({ sourcePath: SOURCE_FOLDER, branch: "feature/x", created: true });
+  });
+
+  it("an unknown session state counts as live", async () => {
+    getSessionPresenceMock.mockResolvedValue("unknown");
+    await readNdjson(
+      await createInstanceRequest({ locationPath: SOURCE_FOLDER, label: "wt", branchAction: { type: "checkout", branch: "feature/x" } })
+    );
+    expect(gitCallsStartingWith("worktree", "add")).toHaveLength(1);
+    expect(gitCallsStartingWith("checkout")).toHaveLength(0);
+  });
+
+  it("a resume request is ignored for a worktree instance: no session id and a step warning", async () => {
+    vi.mocked(loadState).mockResolvedValue({
+      ...baseState(),
+      instances: [liveInstance()],
+      sessionsByKey: { "claude::/work/repo::wt": "old-session" },
+    } as unknown as DashboardState);
+    const events = await readNdjson(
+      await createInstanceRequest({
+        locationPath: SOURCE_FOLDER,
+        label: "wt",
+        resumeSession: true,
+        branchAction: { type: "checkout", branch: "feature/x" },
+      })
+    );
+    expect(events.some((event) => event.type === "step-warning")).toBe(true);
+    expect(savedInstance().sessionId).toBeUndefined();
+  });
+
+  it("no live instance on the folder keeps today's sequence", async () => {
+    getSessionPresenceMock.mockResolvedValue("absent");
+    await readNdjson(
+      await createInstanceRequest({ locationPath: SOURCE_FOLDER, label: "wt", branchAction: { type: "checkout", branch: "feature/x" } })
+    );
+    expect(gitCallsStartingWith("checkout").map((call) => call.args)).toEqual([["checkout", "feature/x"]]);
+    expect(gitCallsStartingWith("worktree", "add")).toHaveLength(0);
+    expect(savedInstance().locationPath).toBe(SOURCE_FOLDER);
+    expect(savedInstance().worktree).toBeUndefined();
+  });
+
+  it("checkout of the branch the folder is already on keeps today's sequence even with a live instance", async () => {
+    vi.mocked(currentBranch).mockResolvedValue("feature/x");
+    await readNdjson(
+      await createInstanceRequest({ locationPath: SOURCE_FOLDER, label: "wt", branchAction: { type: "checkout", branch: "feature/x" } })
+    );
+    expect(gitCallsStartingWith("checkout").map((call) => call.args)).toEqual([["checkout", "feature/x"]]);
+    expect(gitCallsStartingWith("worktree", "add")).toHaveLength(0);
+    expect(savedInstance().worktree).toBeUndefined();
+  });
+
+  it("an existing sibling folder that is not a worktree on the branch is rejected and nothing is created", async () => {
+    pathExistsOnly([SOURCE_FOLDER, FEATURE_DIR]);
+    const events = await readNdjson(
+      await createInstanceRequest({ locationPath: SOURCE_FOLDER, label: "wt", branchAction: { type: "checkout", branch: "feature/x" } })
+    );
+    const terminal = events.at(-1) as { type: string; message: string };
+    expect(terminal.type).toBe("error");
+    expect(terminal.message).toContain(FEATURE_DIR);
+    expect(initMock).not.toHaveBeenCalled();
+    expect(gitCallsStartingWith("worktree", "add")).toHaveLength(0);
+    expect(vi.mocked(saveState)).not.toHaveBeenCalled();
+  });
+
+  it("an existing worktree on the requested branch is reused without adding, flagged as not created", async () => {
+    pathExistsOnly([SOURCE_FOLDER, FEATURE_DIR]);
+    scriptGit({
+      worktreeList: porcelain([
+        { path: SOURCE_FOLDER, branch: "main" },
+        { path: FEATURE_DIR, branch: "feature/x" },
+      ]),
+    });
+    const events = await readNdjson(
+      await createInstanceRequest({ locationPath: SOURCE_FOLDER, label: "wt", branchAction: { type: "checkout", branch: "feature/x" } })
+    );
+    expect(events.at(-1)?.type).toBe("done");
+    expect(gitCallsStartingWith("worktree", "add")).toHaveLength(0);
+    expect(savedInstance().locationPath).toBe(FEATURE_DIR);
+    expect(savedInstance().worktree).toEqual({ sourcePath: SOURCE_FOLDER, branch: "feature/x", created: false });
+  });
+
+  it("an existing sibling folder is never reused for a create request", async () => {
+    pathExistsOnly([SOURCE_FOLDER, FEATURE_DIR]);
+    scriptGit({
+      worktreeList: porcelain([
+        { path: SOURCE_FOLDER, branch: "main" },
+        { path: FEATURE_DIR, branch: "feature/x" },
+      ]),
+    });
+    const events = await readNdjson(
+      await createInstanceRequest({
+        locationPath: SOURCE_FOLDER,
+        label: "wt",
+        branchAction: { type: "create", branch: "feature/x", baseBranch: "main" },
+      })
+    );
+    expect(events.at(-1)?.type).toBe("error");
+    expect(gitCallsStartingWith("worktree", "add")).toHaveLength(0);
+    expect(initMock).not.toHaveBeenCalled();
+    expect(vi.mocked(saveState)).not.toHaveBeenCalled();
+  });
+
+  it("a failure after the worktree was added removes it without force and saves nothing", async () => {
+    initMock.mockRejectedValue(new Error("tmux new-session timed out"));
+    const events = await readNdjson(
+      await createInstanceRequest({ locationPath: SOURCE_FOLDER, label: "wt", branchAction: { type: "checkout", branch: "feature/x" } })
+    );
+    expect(events.at(-1)?.type).toBe("error");
+    const removals = gitCallsStartingWith("worktree", "remove");
+    expect(removals).toHaveLength(1);
+    expect(removals[0].args).toEqual(["worktree", "remove", FEATURE_DIR]);
+    expect(removals[0].args).not.toContain("--force");
+    expect(vi.mocked(saveState)).not.toHaveBeenCalled();
+  });
+
+  it("the same label inside an already registered worktree is rejected at commit", async () => {
+    pathExistsOnly([SOURCE_FOLDER, FEATURE_DIR]);
+    vi.mocked(loadState).mockResolvedValue({
+      ...baseState(),
+      instances: [liveInstance(), worktreeInstance()],
+    } as DashboardState);
+    scriptGit({
+      worktreeList: porcelain([
+        { path: SOURCE_FOLDER, branch: "main" },
+        { path: FEATURE_DIR, branch: "feature/x" },
+      ]),
+    });
+    const events = await readNdjson(
+      await createInstanceRequest({ locationPath: SOURCE_FOLDER, label: "wt", branchAction: { type: "checkout", branch: "feature/x" } })
+    );
+    expect(events.at(-1)?.type).toBe("error");
+    expect(vi.mocked(saveState)).not.toHaveBeenCalled();
+  });
+});
+
+describe("DELETE /instances/:id - worktree instances", () => {
+  const statusArgs = ["status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"];
+  const stateWith = (...instances: InstanceRecord[]): void => {
+    vi.mocked(loadState).mockResolvedValue({ ...baseState(), instances } as DashboardState);
+  };
+  const savedInstanceIds = (): string[] =>
+    (vi.mocked(saveState).mock.calls[0][0] as DashboardState).instances.map((instance) => instance.id);
+
+  beforeEach(() => {
+    scriptGit({});
+  });
+
+  it("clean created worktree: status checked inside it, removed from the source without force, 204", async () => {
+    stateWith(worktreeInstance());
+    const response = await deleteInstanceRequest("wt0001");
+
+    expect(response.status).toBe(204);
+    expect(gitCalls().find((call) => call.args[0] === "status")).toEqual({ cwd: FEATURE_DIR, args: statusArgs });
+    const removals = gitCallsStartingWith("worktree", "remove");
+    expect(removals).toEqual([{ cwd: SOURCE_FOLDER, args: ["worktree", "remove", FEATURE_DIR] }]);
+    expect(savedInstanceIds()).toEqual([]);
+  });
+
+  it("dirty worktree: kept, 200 with a warning, the record is still removed", async () => {
+    scriptGit({ status: " M file.ts\n" });
+    stateWith(worktreeInstance());
+    const response = await deleteInstanceRequest("wt0001");
+
+    expect(response.status).toBe(200);
+    expect(typeof (await response.json()).warning).toBe("string");
+    expect(gitCallsStartingWith("worktree", "remove")).toHaveLength(0);
+    expect(savedInstanceIds()).toEqual([]);
+  });
+
+  it("remove failure: 200 with a warning, the record is removed", async () => {
+    scriptGit({ remove: new GitError("fatal: cannot remove") });
+    stateWith(worktreeInstance());
+    const response = await deleteInstanceRequest("wt0001");
+
+    expect(response.status).toBe(200);
+    expect(typeof (await response.json()).warning).toBe("string");
+    expect(savedInstanceIds()).toEqual([]);
+  });
+
+  it("another instance at the same path shares the worktree: kept with a warning", async () => {
+    stateWith(worktreeInstance(), worktreeInstance({ id: "wt0002", label: "other", tmuxSession: "ccdash-wt0002" }, false));
+    const response = await deleteInstanceRequest("wt0001");
+
+    expect(response.status).toBe(200);
+    expect(typeof (await response.json()).warning).toBe("string");
+    expect(gitCallsStartingWith("worktree", "remove")).toHaveLength(0);
+  });
+
+  it("another instance inside the worktree folder shares it: kept with a warning", async () => {
+    stateWith(
+      worktreeInstance(),
+      makeRunningInstance({ id: "nest01", label: "nested", tmuxSession: "ccdash-nest01", locationPath: `${FEATURE_DIR}/packages/app` })
+    );
+    const response = await deleteInstanceRequest("wt0001");
+
+    expect(response.status).toBe(200);
+    expect(gitCallsStartingWith("worktree", "remove")).toHaveLength(0);
+  });
+
+  it("a reused worktree (not created by the dashboard) is kept with a warning", async () => {
+    stateWith(worktreeInstance({}, false));
+    const response = await deleteInstanceRequest("wt0001");
+
+    expect(response.status).toBe(200);
+    expect(typeof (await response.json()).warning).toBe("string");
+    expect(gitCallsStartingWith("worktree", "remove")).toHaveLength(0);
+  });
+
+  it("a missing source folder (git fails) answers 200 with a warning and still removes the record", async () => {
+    runGitMock.mockRejectedValue(new GitError("fatal: cannot change to '/work/repo'"));
+    stateWith(worktreeInstance());
+    const response = await deleteInstanceRequest("wt0001");
+
+    expect(response.status).toBe(200);
+    expect(typeof (await response.json()).warning).toBe("string");
+    expect(savedInstanceIds()).toEqual([]);
+  });
+
+  it("two concurrent deletes remove the worktree once, the loser answers 204 without git", async () => {
+    let committedState: DashboardState = { ...baseState(), instances: [worktreeInstance()] } as DashboardState;
+    vi.mocked(loadState).mockImplementation(async () => committedState);
+    vi.mocked(saveState).mockImplementation(async (nextState: DashboardState) => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      committedState = structuredClone(nextState);
+    });
+
+    const responses = await Promise.all([deleteInstanceRequest("wt0001"), deleteInstanceRequest("wt0001")]);
+
+    expect(responses.map((response) => response.status)).toEqual([204, 204]);
+    expect(gitCallsStartingWith("worktree", "remove")).toHaveLength(1);
+    expect(gitCallsStartingWith("status")).toHaveLength(1);
+  });
+
+  it("an instance without a worktree still answers 204 and runs no git", async () => {
+    stateWith(makeRunningInstance());
+    const response = await deleteInstanceRequest("abc123");
+
+    expect(response.status).toBe(204);
+    expect(runGitMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("GET/POST /locations/stale-branches - worktrees used by instances", () => {
+  const BRANCHES = "main\nfeature/x\nold-branch\n";
+  const listWith = (worktreePath: string): void => {
+    runGitMock.mockImplementation(async (_cwd, args) => {
+      if (args[0] === "for-each-ref") return BRANCHES;
+      if (args[0] === "worktree" && args[1] === "list") {
+        return porcelain([
+          { path: SOURCE_FOLDER, branch: "main" },
+          { path: worktreePath, branch: "feature/x" },
+        ]);
+      }
+      return "";
+    });
+  };
+  const fetchCandidates = async (): Promise<string[]> => {
+    const response = await fetch(`${baseUrl}/locations/stale-branches?path=${encodeURIComponent(SOURCE_FOLDER)}`);
+    return ((await response.json()).candidates as { branch: string }[]).map((candidate) => candidate.branch);
+  };
+
+  beforeEach(() => {
+    vi.mocked(currentBranch).mockResolvedValue("main");
+  });
+
+  it("does not list the branch of a worktree a registered instance uses", async () => {
+    vi.mocked(loadState).mockResolvedValue({ ...baseState(), instances: [worktreeInstance()] } as DashboardState);
+    listWith(FEATURE_DIR);
+    expect(await fetchCandidates()).toEqual(["old-branch"]);
+  });
+
+  it("deleting it explicitly is refused and the worktree is never force-removed", async () => {
+    vi.mocked(loadState).mockResolvedValue({ ...baseState(), instances: [worktreeInstance()] } as DashboardState);
+    listWith(FEATURE_DIR);
+    const response = await fetch(`${baseUrl}/locations/stale-branches/delete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: SOURCE_FOLDER, branches: ["feature/x"] }),
+    });
+    expect(response.status).toBe(400);
+    expect(gitCallsStartingWith("worktree", "remove")).toHaveLength(0);
+  });
+
+  it("still lists the branch of a worktree no instance uses", async () => {
+    vi.mocked(loadState).mockResolvedValue({ ...baseState(), instances: [] } as DashboardState);
+    listWith(FEATURE_DIR);
+    expect(await fetchCandidates()).toEqual(["feature/x", "old-branch"]);
+  });
+
+  it("matches through a symlinked instance path when git lists the real path", async () => {
+    const temporaryRoot: string = await fs.mkdtemp(path.join(os.tmpdir(), "ccdash-wt-"));
+    try {
+      await fs.mkdir(path.join(temporaryRoot, "real"));
+      const realDirectory: string = await fs.realpath(path.join(temporaryRoot, "real"));
+      const linkedDirectory: string = path.join(temporaryRoot, "link");
+      await fs.symlink(realDirectory, linkedDirectory);
+      vi.mocked(loadState).mockResolvedValue({
+        ...baseState(),
+        instances: [worktreeInstance({ locationPath: linkedDirectory })],
+      } as DashboardState);
+      listWith(realDirectory);
+      expect(await fetchCandidates()).toEqual(["old-branch"]);
+    } finally {
+      await fs.rm(temporaryRoot, { recursive: true, force: true });
+    }
   });
 });
 

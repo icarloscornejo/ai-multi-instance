@@ -10,7 +10,15 @@ vi.mock("node:child_process", () => {
 });
 
 import { execFile } from "node:child_process";
-import { branchUpstream, GitError, isRemoteUnreachableError, LOCAL_GIT_TIMEOUT_MS, parseBranchUpstream, runGit } from "./git";
+import {
+  branchUpstream,
+  GitError,
+  isRemoteUnreachableError,
+  LOCAL_GIT_TIMEOUT_MS,
+  parseBranchUpstream,
+  runGit,
+  worktreeDirFor,
+} from "./git";
 
 const promisifyCustomSymbol = Symbol.for("nodejs.util.promisify.custom");
 const runGitMock = (execFile as unknown as Record<symbol, ReturnType<typeof vi.fn>>)[promisifyCustomSymbol];
@@ -250,5 +258,32 @@ describe("branchUpstream", () => {
   it("is null when git fails (not a repo, folder gone)", async () => {
     runGitMock.mockRejectedValue(execError({ stderr: "fatal: not a git repository" }));
     expect(await branchUpstream("/not-a-repo")).toBeNull();
+  });
+});
+
+describe("worktreeDirFor", () => {
+  it("appends the branch to the folder name as a sibling", () => {
+    expect(worktreeDirFor("/work/repo", "feature")).toBe("/work/repo-feature");
+  });
+
+  it("replaces slashes with dashes", () => {
+    expect(worktreeDirFor("/work/repo", "feature/login/ui")).toBe("/work/repo-feature-login-ui");
+  });
+
+  it("collapses repeated separators into one dash", () => {
+    expect(worktreeDirFor("/work/repo", "feat//a___b  c")).toBe("/work/repo-feat-a-b-c");
+  });
+
+  it("trims dashes and dots at the edges", () => {
+    expect(worktreeDirFor("/work/repo", "/.hidden./")).toBe("/work/repo-hidden");
+  });
+
+  it("keeps uppercase letters, dots and dashes", () => {
+    expect(worktreeDirFor("/work/repo", "Release-1.2")).toBe("/work/repo-Release-1.2");
+  });
+
+  it("throws an Error when nothing is left after sanitizing", () => {
+    expect(() => worktreeDirFor("/work/repo", "///")).toThrow(/branch/i);
+    expect(() => worktreeDirFor("/work/repo", "..")).toThrow(/branch/i);
   });
 });

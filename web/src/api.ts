@@ -145,8 +145,9 @@ export const api = {
   reorderInstances: (order: string[]): Promise<Instance[]> =>
     requestJson("/api/instances/order", { method: "PUT", body: JSON.stringify({ order }) }),
 
-  deleteInstance: (instanceId: string): Promise<void> =>
-    requestJson(`/api/instances/${instanceId}`, { method: "DELETE" }),
+  // 204 means a plain delete; 200 carries a warning (a worktree that was kept).
+  deleteInstance: async (instanceId: string): Promise<{ warning?: string }> =>
+    (await requestJson<{ warning?: string } | undefined>(`/api/instances/${instanceId}`, { method: "DELETE" })) ?? {},
 
   getTunnel: (): Promise<TunnelStatus> => requestJson("/api/tunnel"),
 

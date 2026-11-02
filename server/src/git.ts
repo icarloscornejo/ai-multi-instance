@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import path from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -57,6 +58,19 @@ export async function currentBranch(cwd: string): Promise<string | null> {
     // Not a git repo, git not installed, or the folder does not exist anymore
     return null;
   }
+}
+
+// Sibling folder for a worktree of `folder` on `branch`: <folder>-<sanitized branch>. Anything
+// outside [A-Za-z0-9.-] (underscores included) becomes a dash so the name is a single safe path segment.
+export function worktreeDirFor(folder: string, branch: string): string {
+  const sanitizedBranch: string = branch
+    .replace(/[^A-Za-z0-9.-]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^[-.]+|[-.]+$/g, "");
+  if (sanitizedBranch === "") {
+    throw new Error(`Branch name '${branch}' cannot be used to name a worktree folder`);
+  }
+  return path.join(path.dirname(folder), `${path.basename(folder)}-${sanitizedBranch}`);
 }
 
 // Whether the checked-out branch has been published, judged by where `git push` would send it

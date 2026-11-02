@@ -10,6 +10,7 @@ import {
 import type { Instance, UpdateInstancePayload } from "../types";
 import { BottomSheet } from "./BottomSheet";
 import { BranchGitLine } from "./BranchGitLine";
+import { worktreeLabel } from "../worktreeLabel";
 
 interface InstanceSettingsSheetProps {
   instance: Instance;
@@ -28,6 +29,7 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 }
 
 export function InstanceSettingsSheet({ instance, onUpdate, onDeleteRequest, onClose }: InstanceSettingsSheetProps) {
+  const worktreeInfo = worktreeLabel(instance);
   const [labelDraft, setLabelDraft] = useState<string>(instance.label);
   const [commandDraft, setCommandDraft] = useState<string>(instance.command);
   // Only polls while this sheet is open, unlike the desktop Sidebar which polls whenever visible
@@ -69,6 +71,11 @@ export function InstanceSettingsSheet({ instance, onUpdate, onDeleteRequest, onC
           <div className="break-all rounded-sm bg-raised px-[12px] py-[10px] font-mono text-[11.5px] text-txt-secondary">
             {instance.locationPath}
           </div>
+          {worktreeInfo !== null && (
+            <div className="mt-[5px] text-[11px] text-txt-dim">
+              Worktree of {worktreeInfo.sourceName} ({worktreeInfo.branch})
+            </div>
+          )}
         </Field>
 
         <Field label="Provider">
