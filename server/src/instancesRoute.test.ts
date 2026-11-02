@@ -83,6 +83,7 @@ vi.mock("./auth", () => ({
   isPasswordFromEnv: vi.fn(),
   recordFailedLogin: vi.fn(),
   resetFailedLogins: vi.fn(),
+  clearAllFailedLogins: vi.fn(),
   rotateSecret: vi.fn(),
 }));
 // `git.ts` keeps its real classifier/constants; runGit (which shells out) and branchUpstream (it

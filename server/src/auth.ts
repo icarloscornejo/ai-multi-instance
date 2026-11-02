@@ -15,11 +15,14 @@ const TOKEN_TTL_MS: number = 180 * 24 * 60 * 60 * 1000; // ~180 days
 const SCRYPT_KEY_LENGTH = 64;
 const SECRET_BYTE_LENGTH = 32;
 
-// ponytail: one global counter because there is a single user; if this ever serves several
-// people, key it per cf-connecting-ip so one attacker cannot lock everyone out.
+// Per-client keyed by cf-connecting-ip so one stranger cannot lock the owner out alone; the global
+// ceiling still lets about 20 distinct addresses lock the public login, recovery is a successful
+// local login. In memory only.
 const LOGIN_FAILURE_LIMIT = 5;
+const LOGIN_FAILURE_GLOBAL_LIMIT = 100;
 const LOGIN_FAILURE_WINDOW_MS: number = 15 * 60 * 1000;
-let failedLoginTimestamps: number[] = [];
+const failedLoginTimestampsByClient: Map<string, number[]> = new Map();
+let globalFailedLoginTimestamps: number[] = [];
 
 let cachedSecret: Buffer | null = null;
 // Serializes every secret write (first creation and rotations): two overlapping writers could
@@ -130,17 +133,38 @@ export function revokeLiveSockets(clients: Iterable<{ terminate(): void }>): voi
   }
 }
 
-export function isLoginLocked(now: number = Date.now()): boolean {
-  failedLoginTimestamps = failedLoginTimestamps.filter((failedAt: number) => now - failedAt < LOGIN_FAILURE_WINDOW_MS);
-  return failedLoginTimestamps.length >= LOGIN_FAILURE_LIMIT;
+export function isLoginLocked(clientKey: string, now: number = Date.now()): boolean {
+  const isFresh = (failedAt: number): boolean => now - failedAt < LOGIN_FAILURE_WINDOW_MS;
+  globalFailedLoginTimestamps = globalFailedLoginTimestamps.filter(isFresh);
+  // Sweep every client, not just the caller, so addresses that never return do not leak memory.
+  for (const [storedKey, timestamps] of failedLoginTimestampsByClient) {
+    const freshTimestamps: number[] = timestamps.filter(isFresh);
+    if (freshTimestamps.length === 0) {
+      failedLoginTimestampsByClient.delete(storedKey);
+    } else {
+      failedLoginTimestampsByClient.set(storedKey, freshTimestamps);
+    }
+  }
+  return (
+    (failedLoginTimestampsByClient.get(clientKey)?.length ?? 0) >= LOGIN_FAILURE_LIMIT ||
+    globalFailedLoginTimestamps.length >= LOGIN_FAILURE_GLOBAL_LIMIT
+  );
 }
 
-export function recordFailedLogin(now: number = Date.now()): void {
-  failedLoginTimestamps.push(now);
+export function recordFailedLogin(clientKey: string, now: number = Date.now()): void {
+  const clientTimestamps: number[] = failedLoginTimestampsByClient.get(clientKey) ?? [];
+  clientTimestamps.push(now);
+  failedLoginTimestampsByClient.set(clientKey, clientTimestamps);
+  globalFailedLoginTimestamps.push(now);
 }
 
-export function resetFailedLogins(): void {
-  failedLoginTimestamps = [];
+export function resetFailedLogins(clientKey: string): void {
+  failedLoginTimestampsByClient.delete(clientKey);
+}
+
+export function clearAllFailedLogins(): void {
+  failedLoginTimestampsByClient.clear();
+  globalFailedLoginTimestamps = [];
 }
 
 function sign(secret: Buffer, expiresAt: number): string {

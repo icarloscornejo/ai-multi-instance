@@ -151,30 +151,112 @@ describe("revokeLiveSockets", () => {
 });
 
 describe("login throttle", () => {
+  const windowMs: number = 15 * 60 * 1000;
+
+  function failTimes(auth: Awaited<ReturnType<typeof loadAuth>>, clientKey: string, count: number, now: number): void {
+    for (let attempt = 0; attempt < count; attempt += 1) {
+      auth.recordFailedLogin(clientKey, now);
+    }
+  }
+
   it("locks after five failures inside the window and releases when they age out", async () => {
     const auth = await loadAuth();
     const start = 1_000_000;
 
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      auth.recordFailedLogin(start);
-    }
-    expect(auth.isLoginLocked(start)).toBe(false);
+    failTimes(auth, "client-a", 4, start);
+    expect(auth.isLoginLocked("client-a", start)).toBe(false);
 
-    auth.recordFailedLogin(start);
-    expect(auth.isLoginLocked(start)).toBe(true);
-    expect(auth.isLoginLocked(start + 15 * 60 * 1000 - 1)).toBe(true);
-    expect(auth.isLoginLocked(start + 15 * 60 * 1000)).toBe(false);
+    auth.recordFailedLogin("client-a", start);
+    expect(auth.isLoginLocked("client-a", start)).toBe(true);
+    expect(auth.isLoginLocked("client-a", start + windowMs - 1)).toBe(true);
+    expect(auth.isLoginLocked("client-a", start + windowMs)).toBe(false);
   });
 
-  it("resetFailedLogins clears the counter", async () => {
+  it("resetFailedLogins clears the counter of that client", async () => {
     const auth = await loadAuth();
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      auth.recordFailedLogin(1);
+    failTimes(auth, "client-a", 5, 1);
+
+    auth.resetFailedLogins("client-a");
+
+    expect(auth.isLoginLocked("client-a", 1)).toBe(false);
+  });
+
+  it("keeps clients isolated: one at five failures does not lock another", async () => {
+    const auth = await loadAuth();
+    failTimes(auth, "client-a", 5, 1_000);
+
+    expect(auth.isLoginLocked("client-a", 1_000)).toBe(true);
+    expect(auth.isLoginLocked("client-b", 1_000)).toBe(false);
+  });
+
+  it("locks every client once the global ceiling of 100 failures is reached", async () => {
+    const auth = await loadAuth();
+    const start = 5_000_000;
+
+    for (let keyIndex = 0; keyIndex < 24; keyIndex += 1) {
+      failTimes(auth, `client-${keyIndex}`, 4, start);
     }
+    failTimes(auth, "client-24", 3, start);
+    expect(auth.isLoginLocked("fresh-client", start)).toBe(false);
 
-    auth.resetFailedLogins();
+    auth.recordFailedLogin("client-24", start);
+    expect(auth.isLoginLocked("fresh-client", start)).toBe(true);
+    expect(auth.isLoginLocked("fresh-client", start + windowMs)).toBe(false);
+    expect(auth.isLoginLocked("client-0", start + windowMs)).toBe(false);
+  });
 
-    expect(auth.isLoginLocked(1)).toBe(false);
+  it("scoped reset leaves other clients counted and keeps the reset client in the global total", async () => {
+    const auth = await loadAuth();
+    const start = 9_000_000;
+    failTimes(auth, "client-a", 4, start);
+    failTimes(auth, "client-b", 4, start);
+
+    auth.resetFailedLogins("client-a");
+
+    auth.recordFailedLogin("client-b", start);
+    expect(auth.isLoginLocked("client-b", start)).toBe(true);
+    expect(auth.isLoginLocked("client-a", start)).toBe(false);
+
+    // 4 (a, reset) + 5 (b) = 9 so far; 22 clients x 4 + 2 = 90 more make 99, one short of the ceiling.
+    for (let keyIndex = 0; keyIndex < 22; keyIndex += 1) {
+      failTimes(auth, `other-${keyIndex}`, 4, start);
+    }
+    failTimes(auth, "other-22", 2, start);
+    expect(auth.isLoginLocked("fresh-client", start)).toBe(false);
+    auth.recordFailedLogin("other-22", start);
+    expect(auth.isLoginLocked("fresh-client", start)).toBe(true);
+  });
+
+  it("clearAllFailedLogins unlocks every client and the global ceiling", async () => {
+    const auth = await loadAuth();
+    const start = 2_000_000;
+    for (let keyIndex = 0; keyIndex < 25; keyIndex += 1) {
+      failTimes(auth, `client-${keyIndex}`, 4, start);
+    }
+    failTimes(auth, "client-a", 5, start);
+    expect(auth.isLoginLocked("fresh-client", start)).toBe(true);
+    expect(auth.isLoginLocked("client-a", start)).toBe(true);
+
+    auth.clearAllFailedLogins();
+
+    expect(auth.isLoginLocked("fresh-client", start)).toBe(false);
+    expect(auth.isLoginLocked("client-a", start)).toBe(false);
+    expect(auth.isLoginLocked("client-0", start)).toBe(false);
+  });
+
+  it("does not let a long-expired client distort the counting of others", async () => {
+    const auth = await loadAuth();
+    const start = 3_000_000;
+    failTimes(auth, "stale-client", 5, start);
+
+    const later = start + windowMs + 1_000;
+    failTimes(auth, "client-b", 4, later);
+
+    expect(auth.isLoginLocked("stale-client", later)).toBe(false);
+    expect(auth.isLoginLocked("client-b", later)).toBe(false);
+    auth.recordFailedLogin("client-b", later);
+    expect(auth.isLoginLocked("client-b", later)).toBe(true);
+    expect(auth.isLoginLocked("fresh-client", later)).toBe(false);
   });
 });
 

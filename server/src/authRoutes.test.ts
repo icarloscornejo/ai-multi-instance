@@ -125,6 +125,8 @@ function send(
   options: {
     host?: string;
     cloudflare?: boolean;
+    // Value of cf-connecting-ip when cloudflare is true
+    clientIp?: string;
     cookie?: string;
     body?: unknown;
     // Sent as-is with its own content type, for the routes that take binary bodies
@@ -137,7 +139,7 @@ function send(
     "content-type": options.contentType ?? "application/json",
   };
   if (options.cloudflare === true) {
-    headers["cf-connecting-ip"] = "203.0.113.7";
+    headers["cf-connecting-ip"] = options.clientIp ?? "203.0.113.7";
   }
   if (options.cookie !== undefined) {
     headers.cookie = options.cookie;
@@ -161,7 +163,10 @@ function send(
   });
 }
 
-function login(password: string, options: { host?: string; cloudflare?: boolean } = {}): Promise<AppResponse> {
+function login(
+  password: string,
+  options: { host?: string; cloudflare?: boolean; clientIp?: string } = {}
+): Promise<AppResponse> {
   return send("/auth/login", { ...options, body: { password } });
 }
 
@@ -238,6 +243,55 @@ describe("login throttle", () => {
     for (let attempt = 0; attempt < 4; attempt += 1) {
       expect((await login("wrong-password", { host: PUBLIC_HOST })).status).toBe(401);
     }
+  });
+});
+
+describe("per-client login throttle", () => {
+  const clientA = { cloudflare: true, clientIp: "203.0.113.1" };
+  const clientB = { cloudflare: true, clientIp: "203.0.113.2" };
+
+  it("locks one client without blocking another", async () => {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      expect((await login("wrong-password", clientA)).status).toBe(401);
+    }
+
+    expect((await login(CORRECT_PASSWORD, clientA)).status).toBe(429);
+    expect((await login(CORRECT_PASSWORD, clientB)).status).toBe(200);
+  });
+
+  it("keeps the socket-address bucket apart from Cloudflare clients", async () => {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      expect((await login("wrong-password", { host: PUBLIC_HOST })).status).toBe(401);
+    }
+
+    expect((await login(CORRECT_PASSWORD, { host: PUBLIC_HOST })).status).toBe(429);
+    expect((await login(CORRECT_PASSWORD, { cloudflare: true, clientIp: "203.0.113.50" })).status).toBe(200);
+  });
+
+  it("resets only the client that logged in successfully", async () => {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await login("wrong-password", clientA);
+      await login("wrong-password", clientB);
+    }
+
+    expect((await login(CORRECT_PASSWORD, clientA)).status).toBe(200);
+
+    expect((await login("wrong-password", clientB)).status).toBe(401);
+    expect((await login("wrong-password", clientB)).status).toBe(429);
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      expect((await login("wrong-password", clientA)).status).toBe(401);
+    }
+  });
+
+  it("clears every public lockout when a local login succeeds", async () => {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      expect((await login("wrong-password", clientA)).status).toBe(401);
+    }
+    expect((await login(CORRECT_PASSWORD, clientA)).status).toBe(429);
+
+    expect((await login(CORRECT_PASSWORD)).status).toBe(200);
+
+    expect((await login(CORRECT_PASSWORD, clientA)).status).toBe(200);
   });
 });
 

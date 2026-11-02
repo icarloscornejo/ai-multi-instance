@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isLocalRequest, isLocalRequestHost } from "./requestHost";
+import { clientAddressOf, isLocalRequest, isLocalRequestHost } from "./requestHost";
 
 describe("isLocalRequestHost", () => {
   it("treats the local dev hostnames as local", () => {
@@ -49,5 +49,32 @@ describe("isLocalRequest", () => {
 
   it("is public when cf-connecting-ip is present, even if the Quick Tunnel rewrote Host to ai.local", () => {
     expect(isLocalRequest({ headers: { host: "ai.local", "cf-connecting-ip": "203.0.113.7" } })).toBe(false);
+  });
+});
+
+describe("clientAddressOf", () => {
+  it("uses the cf-connecting-ip header when present", () => {
+    expect(
+      clientAddressOf({ headers: { "cf-connecting-ip": "203.0.113.7" }, socket: { remoteAddress: "127.0.0.1" } })
+    ).toBe("203.0.113.7");
+  });
+
+  it("uses the first element when the header is an array", () => {
+    expect(clientAddressOf({ headers: { "cf-connecting-ip": ["203.0.113.1", "203.0.113.2"] } })).toBe("203.0.113.1");
+  });
+
+  it("falls back to the socket address when the header is an empty string", () => {
+    expect(clientAddressOf({ headers: { "cf-connecting-ip": "" }, socket: { remoteAddress: "127.0.0.1" } })).toBe(
+      "127.0.0.1"
+    );
+  });
+
+  it("uses the socket address when there is no header", () => {
+    expect(clientAddressOf({ headers: {}, socket: { remoteAddress: "10.0.0.9" } })).toBe("10.0.0.9");
+  });
+
+  it("answers unknown when neither the header nor the socket address exist", () => {
+    expect(clientAddressOf({ headers: {} })).toBe("unknown");
+    expect(clientAddressOf({ headers: {}, socket: {} })).toBe("unknown");
   });
 });

@@ -7,6 +7,7 @@ import {
   AUTH_COOKIE_NAME,
   checkPassword,
   isAuthEnabled,
+  clearAllFailedLogins,
   isLoginLocked,
   isPasswordFromEnv,
   issueToken,
@@ -42,7 +43,7 @@ import { initializeInstanceSession } from "./terminal";
 import { withSessionLock } from "./sessionLock";
 import { getTunnelStatus, readTunnelLog, startTunnel, stopTunnel } from "./tunnel";
 import { getNamedTunnelStatus, getTunnelMode, startNamedTunnel, stopNamedTunnel } from "./namedTunnel";
-import { isLocalRequest, isLocalRequestHost } from "./requestHost";
+import { clientAddressOf, isLocalRequest, isLocalRequestHost } from "./requestHost";
 import { applyUpdate, checkForUpdate, getUpdateStatus, resetToRemote } from "./updater";
 import type {
   BranchAction,
@@ -314,19 +315,24 @@ apiRouter.post(
     // also lock the owner out at home. Checked before checkPassword so a locked-out caller
     // learns nothing, not even from a correct guess.
     const isPublicRequest: boolean = !isLocalRequest(request);
-    if (isPublicRequest && isLoginLocked()) {
+    const clientKey: string = clientAddressOf(request);
+    if (isPublicRequest && isLoginLocked(clientKey)) {
       response.status(429).json({ error: "Too many attempts, try again later." });
       return;
     }
     const { password } = request.body as { password?: unknown };
     if (typeof password !== "string" || !checkPassword(password)) {
       if (isPublicRequest) {
-        recordFailedLogin();
+        recordFailedLogin(clientKey);
       }
       response.status(401).json({ error: "Incorrect password" });
       return;
     }
-    resetFailedLogins();
+    if (isPublicRequest) {
+      resetFailedLogins(clientKey);
+    } else {
+      clearAllFailedLogins();
+    }
     const { value, maxAgeMs } = await issueToken();
     response.cookie(AUTH_COOKIE_NAME, value, authCookieOptions(request, maxAgeMs));
     response.json({ ok: true });

@@ -72,3 +72,17 @@ export function isLocalRequestHost(hostHeader: string | undefined): boolean {
 export function isLocalRequest(request: { headers: IncomingHttpHeaders }): boolean {
   return isLocalRequestHost(request.headers.host) && request.headers["cf-connecting-ip"] === undefined;
 }
+
+// Identifies the caller for per-client login throttling. Cloudflare sets cf-connecting-ip to the
+// real visitor address; the socket address is only a fallback for requests that skip Cloudflare.
+export function clientAddressOf(request: {
+  headers: IncomingHttpHeaders;
+  socket?: { remoteAddress?: string };
+}): string {
+  const rawHeader: string | string[] | undefined = request.headers["cf-connecting-ip"];
+  const headerValue: string | undefined = Array.isArray(rawHeader) ? rawHeader[0] : rawHeader;
+  if (headerValue !== undefined && headerValue !== "") {
+    return headerValue;
+  }
+  return request.socket?.remoteAddress ?? "unknown";
+}
