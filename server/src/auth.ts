@@ -159,7 +159,9 @@ export function checkPassword(candidate: string): boolean {
   if (stored === null) {
     return false;
   }
-  const candidateHash: Buffer = scryptSync(candidate, Buffer.from(stored.salt, "hex"), SCRYPT_KEY_LENGTH);
+  // set-password trims before hashing, so login must too. Not applied to DASHBOARD_PASSWORD
+  // above: trimming a whitespace-only env value would let an empty candidate match it.
+  const candidateHash: Buffer = scryptSync(candidate.trim(),Buffer.from(stored.salt, "hex"), SCRYPT_KEY_LENGTH);
   const storedHashBuffer: Buffer = Buffer.from(stored.hash, "hex");
   return candidateHash.length === storedHashBuffer.length && timingSafeEqual(candidateHash, storedHashBuffer);
 }
@@ -213,11 +215,20 @@ export function requireAuth(request: Request, response: Response, next: NextFunc
     return;
   }
   const token: string | undefined = readCookie(request.headers.cookie, AUTH_COOKIE_NAME);
-  void verifyToken(token).then((isValid) => {
-    if (isValid) {
-      next();
-      return;
+  // Two-argument then, not .catch: an unreadable secret file rejects here and index.ts exits on
+  // unhandled rejections. The body stays generic because the caller may be an unauthenticated
+  // public visitor and the error message names the secret file's path.
+  void verifyToken(token).then(
+    (isValid) => {
+      if (isValid) {
+        next();
+        return;
+      }
+      response.status(401).json({ error: "Unauthorized" });
+    },
+    (error: unknown) => {
+      console.error("[auth] could not verify the session token:", error);
+      response.status(500).json({ error: "Internal error" });
     }
-    response.status(401).json({ error: "Unauthorized" });
-  });
+  );
 }

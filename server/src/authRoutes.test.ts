@@ -13,6 +13,9 @@ const fakeFiles = vi.hoisted(() => new Map<string, string>());
 // failOnWriteNumber is 1-based and counts store writes since the last reset, so a test can let
 // the password write succeed and fail the secret rotation that follows it.
 const writeFailures = vi.hoisted(() => ({ writeCount: 0, failOnWriteNumber: 0 }));
+// When true, reading the signing secret fails with a permission error (not ENOENT), the way a
+// broken data/ directory would.
+const secretRead = vi.hoisted(() => ({ shouldFailWithPermissionError: false }));
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
@@ -28,6 +31,9 @@ vi.mock("node:fs", async (importOriginal) => {
       readFile: async (filePath: unknown, ...rest: unknown[]) => {
         if (!isFakePath(filePath)) {
           return readFile(filePath, ...rest);
+        }
+        if (secretRead.shouldFailWithPermissionError && filePath.endsWith("auth-secret.txt")) {
+          throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
         }
         const content: string | undefined = fakeFiles.get(filePath);
         if (content === undefined) {
@@ -180,6 +186,7 @@ async function startApp(options: { withPassword: boolean }): Promise<void> {
   }
   writeFailures.writeCount = 0;
   writeFailures.failOnWriteNumber = 0;
+  secretRead.shouldFailWithPermissionError = false;
   const app = express();
   app.use(express.json());
   app.use("/", apiRouter);
@@ -364,6 +371,122 @@ describe("POST /auth/set-password", () => {
     expect(listener).not.toHaveBeenCalled();
     expect(await auth.verifyToken(tokenFromSetCookie(response.setCookie))).toBe(true);
     expect(fakeFiles.has(secretFilePath)).toBe(true);
+  });
+});
+
+describe("session cookie flags", () => {
+  const SECURE_ATTRIBUTE: RegExp = /;\s*Secure(;|$)/;
+
+  it("marks the cookie Secure, HttpOnly and SameSite for a Quick Tunnel visitor (Host rewritten to ai.local)", async () => {
+    const response: AppResponse = await login(CORRECT_PASSWORD, { cloudflare: true });
+
+    expect(response.status).toBe(200);
+    expect(response.setCookie[0]).toMatch(SECURE_ATTRIBUTE);
+    expect(response.setCookie[0]).toContain("HttpOnly");
+    expect(response.setCookie[0]).toContain("SameSite=Lax");
+  });
+
+  it("marks the cookie Secure for the public hostname", async () => {
+    const response: AppResponse = await login(CORRECT_PASSWORD, { host: PUBLIC_HOST });
+
+    expect(response.setCookie[0]).toMatch(SECURE_ATTRIBUTE);
+  });
+
+  it("keeps the cookie non-Secure on ai.local and on a LAN address, which are plain HTTP", async () => {
+    const viaAiLocal: AppResponse = await login(CORRECT_PASSWORD);
+    const viaLanAddress: AppResponse = await login(CORRECT_PASSWORD, { host: "192.168.1.42" });
+
+    expect(viaAiLocal.setCookie[0]).not.toMatch(SECURE_ATTRIBUTE);
+    expect(viaLanAddress.setCookie[0]).not.toMatch(SECURE_ATTRIBUTE);
+  });
+
+  it("marks the cookie from the first-password bootstrap Secure when it arrives through the Quick Tunnel", async () => {
+    server.close();
+    await startApp({ withPassword: false });
+
+    const response: AppResponse = await send("/auth/set-password", {
+      cloudflare: true,
+      body: { password: "first-password" },
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.setCookie[0]).toMatch(SECURE_ATTRIBUTE);
+  });
+});
+
+describe("update routes", () => {
+  let applyUpdate: ReturnType<typeof vi.fn>;
+  let resetToRemote: ReturnType<typeof vi.fn>;
+  let sessionCookie: string;
+
+  beforeEach(async () => {
+    const updater = await import("./updater");
+    applyUpdate = vi.mocked(updater.applyUpdate);
+    resetToRemote = vi.mocked(updater.resetToRemote);
+    applyUpdate.mockClear().mockResolvedValue({});
+    resetToRemote.mockClear().mockResolvedValue({});
+    sessionCookie = cookieFor((await auth.issueToken()).value);
+  });
+
+  it.each(["/update/apply", "/update/reset"])("%s is refused with 403 for a signed-in public visitor", async (route) => {
+    const viaHost: AppResponse = await send(route, { host: PUBLIC_HOST, cookie: sessionCookie });
+    const viaQuickTunnel: AppResponse = await send(route, { cloudflare: true, cookie: sessionCookie });
+
+    expect(viaHost.status).toBe(403);
+    expect(viaQuickTunnel.status).toBe(403);
+    expect(applyUpdate).not.toHaveBeenCalled();
+    expect(resetToRemote).not.toHaveBeenCalled();
+  });
+
+  it("still runs both from the LAN", async () => {
+    expect((await send("/update/apply", { cookie: sessionCookie })).status).toBe(200);
+    expect((await send("/update/reset", { cookie: sessionCookie })).status).toBe(200);
+    expect(applyUpdate).toHaveBeenCalledTimes(1);
+    expect(resetToRemote).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("requireAuth when the signing secret cannot be read", () => {
+  it("answers 500 with a generic body, logs the cause and keeps serving", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      // Well formed and unexpired but never issued here, so verifyToken has to load the secret
+      const unissuedToken = `${Date.now() + 60_000}.x`;
+      secretRead.shouldFailWithPermissionError = true;
+
+      const failed: AppResponse = await send("/update/check", { cookie: cookieFor(unissuedToken) });
+
+      expect(failed.status).toBe(500);
+      expect(JSON.stringify(failed.body)).not.toContain("EACCES");
+      expect(consoleError).toHaveBeenCalled();
+
+      secretRead.shouldFailWithPermissionError = false;
+      const { value: token } = await auth.issueToken();
+      expect((await send("/update/check", { cookie: cookieFor(token) })).status).toBe(200);
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+});
+
+describe("password normalization", () => {
+  it("lets a password set with surrounding spaces log in with or without them", async () => {
+    const { value: token } = await auth.issueToken();
+
+    const setResponse: AppResponse = await send("/auth/set-password", {
+      cookie: cookieFor(token),
+      body: { password: "  spaced-pass-1  " },
+    });
+
+    expect(setResponse.status).toBe(200);
+    expect((await login("spaced-pass-1")).status).toBe(200);
+    expect((await login("  spaced-pass-1  ")).status).toBe(200);
+  });
+
+  it("never lets an empty login match a whitespace-only DASHBOARD_PASSWORD", async () => {
+    vi.stubEnv("DASHBOARD_PASSWORD", "   ");
+
+    expect((await login("")).status).toBe(401);
   });
 });
 

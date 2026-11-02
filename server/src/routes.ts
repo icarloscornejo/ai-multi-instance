@@ -270,7 +270,8 @@ apiRouter.use((request: Request, response: Response, next: NextFunction): void =
 // tunnel, or read the connector log. The UI already hides these off ai.local (SetupScreen.tsx),
 // this is the server-side backstop for that policy. Authentication stays a separate, additional
 // requirement via requireAuth below. Also guards revoke-all, for the same reason: a stolen
-// session must not be able to sign the owner out. It keys off isLocalRequest rather than the
+// session must not be able to sign the owner out, and /update/apply and /update/reset, which can
+// restart the server or discard local commits. It keys off isLocalRequest rather than the
 // Host alone because the Quick Tunnel rewrites Host to ai.local (see requestHost.ts).
 function requireLocalHost(request: Request, response: Response, next: NextFunction): void {
   if (!isLocalRequest(request)) {
@@ -283,14 +284,15 @@ function requireLocalHost(request: Request, response: Response, next: NextFuncti
 // The auth cookie is bearer-equivalent and long-lived (~180 days). Mark it Secure whenever it is
 // issued to the public hostname, so a browser will never send it back over plain HTTP to that
 // host. ai.local and LAN access are plain HTTP by design (see Caddyfile) and must keep getting a
-// non-Secure cookie, so this is conditional on the request host, not unconditional. The decision
-// is keyed to the Host header rather than X-Forwarded-Proto because this app sets no `trust proxy`
-// and should not start trusting arbitrary forwarded headers for a security decision.
+// non-Secure cookie, so this is conditional on the request, not unconditional. The decision uses
+// isLocalRequest (Host plus cf-connecting-ip) because the Quick Tunnel rewrites Host to ai.local.
+// It is not keyed to X-Forwarded-Proto because this app sets no `trust proxy`. A LAN client that
+// forges cf-connecting-ip only gets a Secure cookie its browser will not store, which fails closed.
 function authCookieOptions(request: Request, maxAgeMs: number) {
   return {
     httpOnly: true,
     sameSite: "lax" as const,
-    secure: !isLocalRequestHost(request.headers.host),
+    secure: !isLocalRequest(request),
     maxAge: maxAgeMs,
   };
 }
@@ -646,6 +648,7 @@ apiRouter.post(
 
 apiRouter.post(
   "/update/apply",
+  requireLocalHost,
   wrapAsync(async (_request, response) => {
     response.json(await applyUpdate());
   })
@@ -653,6 +656,7 @@ apiRouter.post(
 
 apiRouter.post(
   "/update/reset",
+  requireLocalHost,
   wrapAsync(async (_request, response) => {
     response.json(await resetToRemote());
   })
