@@ -1,4 +1,5 @@
 import { execSync } from "node:child_process";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildProviderLaunchCommand, PROVIDERS, quoteForShell, sessionKeyFor } from "./providers";
 import type { AgentProvider, InstanceRecord } from "./types";
@@ -19,7 +20,56 @@ function instance(provider: AgentProvider, overrides: Partial<InstanceRecord> = 
   };
 }
 
+const HOOK_EVENTS = [
+  "PermissionRequest",
+  "Notification",
+  "PreToolUse",
+  "UserPromptSubmit",
+  "PostToolUse",
+  "PostToolUseFailure",
+  "Stop",
+  "StopFailure",
+  "SessionStart",
+  "SessionEnd",
+];
+
+// The --settings value as the shell hands it to claude: run through the shell's own un-quoting.
+function injectedSettings(command: string): { hooks: Record<string, { matcher?: string; hooks: Record<string, unknown>[] }[]> } & Record<string, unknown> {
+  const quoted: string | undefined = /--settings ('(?:[^']|'\\'')*')/.exec(command)?.[1];
+  expect(quoted).toBeDefined();
+  return JSON.parse(execSync(`printf %s ${quoted}`, { encoding: "utf8" }));
+}
+
 describe("provider launch commands", () => {
+  it("injects the agent state hooks through --settings for Claude", () => {
+    const settings = injectedSettings(buildProviderLaunchCommand(instance("claude")));
+
+    expect(Object.keys(settings.hooks).sort()).toEqual([...HOOK_EVENTS].sort());
+    const scriptPath: string = (settings.hooks.Stop[0].hooks[0] as { command: string }).command;
+    expect(path.isAbsolute(scriptPath)).toBe(true);
+    expect(path.basename(scriptPath)).toBe("dashboard-agent-state.sh");
+    for (const eventName of HOOK_EVENTS) {
+      const groups = settings.hooks[eventName];
+      expect(groups).toHaveLength(1);
+      expect(groups[0].hooks).toEqual([{ type: "command", command: scriptPath, timeout: 5 }]);
+      // only PreToolUse is narrowed to one tool
+      if (eventName === "PreToolUse") expect(groups[0].matcher).toBe("AskUserQuestion");
+      else expect(groups[0].matcher).toBeUndefined();
+    }
+    expect(settings.statusLine).toBeDefined();
+  });
+
+  it.each(["codex", "cursor"] as const)("injects no hooks for %s", (provider) => {
+    const command = buildProviderLaunchCommand(instance(provider));
+    expect(command).not.toContain("hooks");
+    expect(command).not.toContain("dashboard-agent-state.sh");
+  });
+
+  it("injects no hooks into a custom command", () => {
+    const custom = "my-cli --flag";
+    expect(buildProviderLaunchCommand(instance("custom", { command: custom, model: null }))).not.toContain("dashboard-agent-state.sh");
+  });
+
   it("adds only Claude-specific flags to Claude", () => {
     const command = buildProviderLaunchCommand(instance("claude"), "claude-session");
     expect(command).toContain("'claude' --resume 'claude-session'");

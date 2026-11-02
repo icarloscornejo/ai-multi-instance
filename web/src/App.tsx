@@ -17,6 +17,7 @@ import { TerminalView, type TerminalViewHandle } from "./components/TerminalView
 import { UpdateScreen } from "./components/UpdateScreen";
 import { useIsMobile } from "./hooks/useIsMobile";
 import { useLiveStatus } from "./hooks/useLiveStatus";
+import { useAgentStates } from "./hooks/useAgentStates";
 import { useVisualViewport } from "./hooks/useVisualViewport";
 import { useWakeLock } from "./hooks/useWakeLock";
 import { useWakeRetry } from "./hooks/useWakeRetry";
@@ -151,6 +152,8 @@ export function App() {
     activeInstanceId ?? "",
     !isMobile && activeInstanceId !== null
   );
+
+  const agentStates = useAgentStates(instancesLoaded);
 
   const updateRequired: boolean =
     updateStatus?.requiredUpdate === true && updateStatus.updateAvailable === true;
@@ -710,6 +713,7 @@ export function App() {
           <InstanceRail
             instances={instances}
             activeInstanceId={activeInstanceId}
+            agentStates={agentStates}
             updateStatus={updateStatus}
             updateRequired={updateRequired}
             countdownMs={countdownMs}
@@ -771,6 +775,7 @@ export function App() {
               <div className="absolute inset-0 z-10 bg-app">
                 <MobileHome
                   instances={instances}
+                  agentStates={agentStates}
                   onOpenInstance={enterMobileTerminal}
                   onNewInstance={() => setIsNewInstanceModalOpen(true)}
                   onSettingsClick={() => setSettingsOpen(true)}

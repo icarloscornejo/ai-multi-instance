@@ -100,6 +100,13 @@ vi.mock("./liveStatus", async (importOriginal) => {
   return { ...actual, resolveLiveStatus: vi.fn(actual.resolveLiveStatus) };
 });
 
+// Passthrough by default; the agent-states tests pick which agent the probe finds.
+vi.mock("./paneAgent", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./paneAgent")>();
+  return { ...actual, findPaneAgent: vi.fn(actual.findPaneAgent) };
+});
+
+import { findPaneAgent } from "./paneAgent";
 import { loadState, saveState, updateState } from "./store";
 import { pathExists } from "./paths";
 import { initializeInstanceSession } from "./terminal";
@@ -1100,5 +1107,90 @@ describe("concurrent writers never lose each other's commits", () => {
     const patchResponse = await patchInstanceRequest("ccc333", { label: "too late" });
     expect(patchResponse.status).toBe(404);
     expect(committedState.instances.map((instance) => instance.id)).toEqual(remainingAfterOtherDevice);
+  });
+});
+
+describe("GET /instances/agent-states", () => {
+  let temporaryHomeDirectory: string;
+  let cacheDirectory: string;
+
+  const writeStateFile = (id: string, overrides: Record<string, unknown> = {}): Promise<void> =>
+    fs.writeFile(
+      path.join(cacheDirectory, `${id}.state.json`),
+      JSON.stringify({ state: "waiting", sessionId: "s", paneJobPid: 100, event: "Stop", updatedAt: "2026-11-02T10:00:00Z", ...overrides })
+    );
+  const claudeAgentWithPid = (paneJobPid: number): Awaited<ReturnType<typeof findPaneAgent>> => ({
+    kind: "agent", provider: "claude", paneJobPid, agentPid: paneJobPid + 1, startedAtMs: 0, resumeId: null,
+  });
+
+  beforeEach(async () => {
+    vi.mocked(loadState).mockResolvedValue({
+      ...baseState(),
+      instances: [
+        makeRunningInstance({ id: "aaa111", tmuxSession: "ccdash-aaa111" }),
+        makeRunningInstance({ id: "bbb222", tmuxSession: "ccdash-bbb222" }),
+        makeRunningInstance({ id: "ccc333", tmuxSession: "ccdash-ccc333" }),
+        makeRunningInstance({ id: "ddd444", tmuxSession: "ccdash-ddd444" }),
+      ],
+    } as DashboardState);
+    temporaryHomeDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "ccdash-home-"));
+    vi.spyOn(os, "homedir").mockReturnValue(temporaryHomeDirectory);
+    cacheDirectory = path.join(temporaryHomeDirectory, "Library", "Application Support", "ai-multi-instance");
+    await fs.mkdir(cacheDirectory, { recursive: true });
+    vi.mocked(findPaneAgent).mockReset().mockResolvedValue(claudeAgentWithPid(100));
+  });
+
+  afterEach(async () => {
+    await fs.rm(temporaryHomeDirectory, { recursive: true, force: true });
+  });
+
+  it("returns only instances with a valid state whose recorded agent is the running one", async () => {
+    await writeStateFile("aaa111", { state: "waiting" });
+    await writeStateFile("bbb222", { state: "bogus" });
+    await writeStateFile("ccc333", { paneJobPid: 999 });
+    // ddd444 has no file at all; eee555 is not a registered instance
+    await writeStateFile("eee555", { state: "idle" });
+
+    const response = await fetch(`${baseUrl}/instances/agent-states`);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ aaa111: { state: "waiting", updatedAt: "2026-11-02T10:00:00Z" } });
+  });
+
+  it("probes only the instances that have a valid state file", async () => {
+    await writeStateFile("aaa111");
+
+    await fetch(`${baseUrl}/instances/agent-states`);
+
+    expect(vi.mocked(findPaneAgent)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(findPaneAgent)).toHaveBeenCalledWith("ccdash-aaa111");
+  });
+
+  it("returns an empty map when no agent is running", async () => {
+    await writeStateFile("aaa111");
+    vi.mocked(findPaneAgent).mockResolvedValue({ kind: "none" });
+
+    const response = await fetch(`${baseUrl}/instances/agent-states`);
+
+    expect(await response.json()).toEqual({});
+  });
+
+  it("offers no route that accepts agent state", () => {
+    const routes = (apiRouter.stack as { route?: { path: string; methods: Record<string, boolean> } }[])
+      .filter((layer) => layer.route !== undefined && String(layer.route.path).includes("agent-state"));
+
+    expect(routes.length).toBeGreaterThan(0);
+    expect(routes.filter((layer) => Object.keys(layer.route!.methods).some((method) => method !== "get"))).toEqual([]);
+  });
+
+  it.each(["POST", "PUT", "PATCH", "DELETE"])("answers %s with a non-success status and writes nothing", async (method) => {
+    const response = await fetch(`${baseUrl}/instances/agent-states`, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: method === "DELETE" ? undefined : JSON.stringify({ aaa111: { state: "waiting" } }),
+    });
+
+    expect(response.status).toBeGreaterThanOrEqual(400);
+    expect(await fs.readdir(cacheDirectory)).toEqual([]);
   });
 });

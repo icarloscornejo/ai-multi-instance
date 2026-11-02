@@ -132,6 +132,8 @@ function send(
     // Sent as-is with its own content type, for the routes that take binary bodies
     rawBody?: Buffer;
     contentType?: string;
+    // POST unless a test needs a read route
+    method?: "GET" | "POST";
   } = {}
 ): Promise<AppResponse> {
   const headers: Record<string, string> = {
@@ -145,7 +147,7 @@ function send(
     headers.cookie = options.cookie;
   }
   return new Promise((resolve, reject) => {
-    const clientRequest = http.request({ port, path: requestPath, method: "POST", headers }, (response) => {
+    const clientRequest = http.request({ port, path: requestPath, method: options.method ?? "POST", headers }, (response) => {
       let raw = "";
       response.on("data", (chunk: Buffer) => (raw += chunk.toString()));
       response.on("end", () => {
@@ -159,7 +161,7 @@ function send(
       });
     });
     clientRequest.on("error", reject);
-    clientRequest.end(options.rawBody ?? JSON.stringify(options.body ?? {}));
+    clientRequest.end(options.method === "GET" ? undefined : (options.rawBody ?? JSON.stringify(options.body ?? {})));
   });
 }
 
@@ -520,6 +522,19 @@ describe("requireAuth when the signing secret cannot be read", () => {
     } finally {
       consoleError.mockRestore();
     }
+  });
+});
+
+describe("GET /instances/agent-states", () => {
+  it("rejects a request without a session, locally and through the tunnel", async () => {
+    expect((await send("/instances/agent-states", { method: "GET" })).status).toBe(401);
+    expect((await send("/instances/agent-states", { method: "GET", host: PUBLIC_HOST, cloudflare: true })).status).toBe(401);
+  });
+
+  it("rejects a forged session cookie", async () => {
+    const response: AppResponse = await send("/instances/agent-states", { method: "GET", cookie: cookieFor(`${Date.now() + 60_000}.forged`) });
+
+    expect(response.status).toBe(401);
   });
 });
 

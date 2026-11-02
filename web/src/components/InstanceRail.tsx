@@ -15,7 +15,8 @@ import {
 } from "@dnd-kit/sortable";
 import { restrictToVerticalAxis } from "@dnd-kit/modifiers";
 import { CSS } from "@dnd-kit/utilities";
-import type { Instance, UpdateStatus } from "../types";
+import type { AgentState, Instance, UpdateStatus } from "../types";
+import { agentStateLabel, agentStateTone } from "../agentState";
 import type { Theme } from "../theme";
 import { getHostRailWidth, setHostRailWidth } from "../hostPrefs";
 import { formatCountdown } from "../ui";
@@ -33,6 +34,7 @@ const MAX_RAIL_WIDTH = 440;
 interface InstanceRailProps {
   instances: Instance[];
   activeInstanceId: string | null;
+  agentStates: Record<string, AgentState>;
   updateStatus: UpdateStatus | null;
   updateRequired: boolean;
   countdownMs: number;
@@ -56,6 +58,7 @@ interface InstanceRailProps {
 interface RailRowProps {
   instance: Instance;
   isActive: boolean;
+  agentState: AgentState | undefined;
   isEditing: boolean;
   draftLabel: string;
   editInputRef: RefObject<HTMLInputElement>;
@@ -70,6 +73,7 @@ interface RailRowProps {
 function RailRow({
   instance,
   isActive,
+  agentState,
   isEditing,
   draftLabel,
   editInputRef,
@@ -104,7 +108,7 @@ function RailRow({
       onDoubleClick={startEditing}
       className={`group relative flex h-[38px] w-full shrink-0 items-center gap-[8px] rounded-md px-[10px] text-[13px] ${
         isActive ? "bg-soft font-semibold text-txt-bright" : "text-txt-secondary hover:bg-soft hover:text-txt-body"
-      } ${isDragging ? "z-10 opacity-80" : ""}`}
+      } ${agentState === "waiting" && !isActive ? "bg-status-warn/10" : ""} ${isDragging ? "z-10 opacity-80" : ""}`}
     >
       <span className={`h-[6px] w-[6px] shrink-0 rounded-full ${isActive ? "bg-accent" : "bg-transparent"}`} />
       {isEditing ? (
@@ -132,6 +136,11 @@ function RailRow({
           {instance.label}
         </span>
       )}
+      {!isEditing && agentState !== undefined && (
+        <span className={`shrink-0 text-[10px] font-semibold uppercase tracking-[.04em] ${agentStateTone(agentState)}`}>
+          {agentStateLabel(agentState)}
+        </span>
+      )}
       {!isEditing && (
         <button
           type="button"
@@ -152,6 +161,7 @@ function RailRow({
 export function InstanceRail({
   instances,
   activeInstanceId,
+  agentStates,
   updateStatus,
   updateRequired,
   countdownMs,
@@ -322,6 +332,7 @@ export function InstanceRail({
                 key={instance.id}
                 instance={instance}
                 isActive={instance.id === activeInstanceId}
+                agentState={agentStates[instance.id]}
                 isEditing={editingInstanceId === instance.id}
                 draftLabel={draftLabel}
                 editInputRef={editInputRef}

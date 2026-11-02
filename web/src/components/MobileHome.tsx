@@ -1,11 +1,13 @@
 import { useState } from "react";
-import type { Instance } from "../types";
+import type { AgentState, Instance } from "../types";
+import { sortByWaiting } from "../agentState";
 import { btnPrimary } from "../ui";
 import { ActionSheet } from "./ActionSheet";
 import { InstanceCard } from "./InstanceCard";
 
 interface MobileHomeProps {
   instances: Instance[];
+  agentStates: Record<string, AgentState>;
   onOpenInstance: (instanceId: string) => void;
   onNewInstance: () => void;
   onSettingsClick: () => void;
@@ -14,6 +16,7 @@ interface MobileHomeProps {
 
 export function MobileHome({
   instances,
+  agentStates,
   onOpenInstance,
   onNewInstance,
   onSettingsClick,
@@ -47,11 +50,12 @@ export function MobileHome({
             </button>
           </div>
         ) : (
-          instances.map((instance, index) => (
+          sortByWaiting(instances, agentStates).map((instance) => (
             <InstanceCard
               key={instance.id}
               instance={instance}
-              isFirst={index === 0}
+              agentState={agentStates[instance.id]}
+              isFirst={instance.id === instances[0].id}
               onOpen={() => onOpenInstance(instance.id)}
               onLongPress={() => setLongPressedInstance(instance)}
             />

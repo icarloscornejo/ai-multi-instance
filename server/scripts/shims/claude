@@ -39,7 +39,15 @@ done
 export AI_MULTI_SHIM_ACTIVE=1
 if [ "$inject" = 1 ]; then
   statusline_script="$(cd "$shim_dir/.." && pwd)/dashboard-statusline.sh"
-  # ponytail: the path is spliced into JSON unescaped, fine for an install dir without quotes or backslashes
-  exec "$real_claude" --settings "{\"statusLine\":{\"type\":\"command\",\"command\":\"$statusline_script\"}}" "$@"
+  agent_state_script="$(cd "$shim_dir/.." && pwd)/dashboard-agent-state.sh"
+  hooks_json=""
+  for event_name in PermissionRequest Notification PreToolUse UserPromptSubmit PostToolUse PostToolUseFailure Stop StopFailure SessionStart SessionEnd; do
+    # Only the question tool needs the early signal; every other tool is covered by other events.
+    matcher_json=""
+    [ "$event_name" = "PreToolUse" ] && matcher_json="\"matcher\":\"AskUserQuestion\","
+    hooks_json="${hooks_json:+$hooks_json,}\"$event_name\":[{${matcher_json}\"hooks\":[{\"type\":\"command\",\"command\":\"$agent_state_script\",\"timeout\":5}]}]"
+  done
+  # ponytail: the paths are spliced into JSON unescaped, fine for an install dir without quotes or backslashes
+  exec "$real_claude" --settings "{\"statusLine\":{\"type\":\"command\",\"command\":\"$statusline_script\"},\"hooks\":{$hooks_json}}" "$@"
 fi
 exec "$real_claude" "$@"

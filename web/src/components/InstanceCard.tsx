@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { api } from "../api";
-import type { Instance } from "../types";
+import type { AgentState, Instance } from "../types";
+import { agentStateLabel, agentStateTone } from "../agentState";
 import { worktreeLabel } from "../worktreeLabel";
 
 const PROVIDER_LABELS = {
@@ -19,11 +20,12 @@ interface InstanceCardProps {
   // (11-main-mobile.html): it stands in for "most recently opened" since mobile has no
   // persistent tab selection the way desktop does.
   isFirst: boolean;
+  agentState?: AgentState;
   onOpen: () => void;
   onLongPress: () => void;
 }
 
-export function InstanceCard({ instance, isFirst, onOpen, onLongPress }: InstanceCardProps) {
+export function InstanceCard({ instance, isFirst, agentState, onOpen, onLongPress }: InstanceCardProps) {
   const worktreeInfo = worktreeLabel(instance);
   const [branch, setBranch] = useState<string | null>(null);
   const pressTimerRef = useRef<number | null>(null);
@@ -103,6 +105,9 @@ export function InstanceCard({ instance, isFirst, onOpen, onLongPress }: Instanc
           {worktreeInfo !== null && <span className="text-[11px] text-txt-dim">Worktree of {worktreeInfo.sourceName}</span>}
         </div>
       </div>
+      {agentState !== undefined && (
+        <span className={`shrink-0 text-[11px] font-semibold ${agentStateTone(agentState)}`}>{agentStateLabel(agentState)}</span>
+      )}
       <svg
         width="15"
         height="15"

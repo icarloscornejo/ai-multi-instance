@@ -137,6 +137,10 @@ export type ReviewRequest =
   | { state: "none"; checkedAt: string; stale: boolean }
   | { state: "unknown" };
 
+export type AgentState = "waiting" | "working" | "idle";
+
+export type AgentStatesResponse = Record<string, { state: AgentState; updatedAt: string }>;
+
 export interface LiveStatus {
   available: boolean;
   // Set when available is false and the server knows why: no agent is running in the pane, or

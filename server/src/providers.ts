@@ -43,6 +43,19 @@ export const PROVIDERS: Record<AgentProvider, AgentProviderDefinition> = {
 };
 
 const statuslineScriptPath: string = path.resolve(import.meta.dirname, "../scripts/dashboard-statusline.sh");
+const agentStateScriptPath: string = path.resolve(import.meta.dirname, "../scripts/dashboard-agent-state.sh");
+const AGENT_STATE_HOOK_EVENTS: readonly string[] = [
+  "PermissionRequest",
+  "Notification",
+  "PreToolUse",
+  "UserPromptSubmit",
+  "PostToolUse",
+  "PostToolUseFailure",
+  "Stop",
+  "StopFailure",
+  "SessionStart",
+  "SessionEnd",
+];
 const codexShimPath: string = path.resolve(import.meta.dirname, "../scripts/shims/codex");
 const cursorLauncherPath: string = path.resolve(import.meta.dirname, "../scripts/cursor-session-launcher.mjs");
 
@@ -62,8 +75,18 @@ function buildClaudeCommand(instance: InstanceRecord, sessionId?: string): strin
   if (sessionId) parts.push("--resume", quoteForShell(sessionId));
   if (instance.model) parts.push("--model", quoteForShell(instance.model));
   if (instance.effort) parts.push("--effort", quoteForShell(instance.effort));
+  const hooks: Record<string, unknown[]> = {};
+  for (const eventName of AGENT_STATE_HOOK_EVENTS) {
+    const hookGroup: { matcher?: string; hooks: unknown[] } = {
+      hooks: [{ type: "command", command: agentStateScriptPath, timeout: 5 }],
+    };
+    // Only the question tool needs the early signal; every other tool is covered by other events.
+    if (eventName === "PreToolUse") hookGroup.matcher = "AskUserQuestion";
+    hooks[eventName] = [hookGroup];
+  }
   const settingsOverride: string = JSON.stringify({
     statusLine: { type: "command", command: statuslineScriptPath },
+    hooks,
   });
   parts.push("--settings", quoteForShell(settingsOverride));
   parts.push("-n", quoteForShell(instance.label));

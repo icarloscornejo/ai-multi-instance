@@ -4,6 +4,7 @@ import type {
   DashboardConfig,
   Instance,
   LanAddress,
+  AgentStatesResponse,
   LiveStatus,
   LocationBranches,
   LocationInfo,
@@ -75,6 +76,9 @@ export const api = {
 
   getInstanceGit: (instanceId: string): Promise<{ cwd: string; branch?: string }> =>
     requestJson(`/api/instances/${instanceId}/git`),
+
+  getAgentStates: (signal?: AbortSignal): Promise<AgentStatesResponse> =>
+    requestJson("/api/instances/agent-states", { signal }),
 
   getInstanceLiveStatus: (instanceId: string): Promise<LiveStatus> =>
     requestJson(`/api/instances/${instanceId}/live-status`),

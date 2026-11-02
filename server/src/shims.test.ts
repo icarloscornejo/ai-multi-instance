@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { buildProviderLaunchCommand } from "./providers";
+import type { InstanceRecord } from "./types";
 
 const scriptsDirectory = fileURLToPath(new URL("../scripts", import.meta.url));
 const shimsDirectory = path.join(scriptsDirectory, "shims");
@@ -36,6 +38,75 @@ function runShim(shim: "claude" | "codex", args: string[], fakeDirectory: string
   });
   return { stdout: result.stdout, stderr: result.stderr, status: result.status };
 }
+
+// A fake claude that prints each argument on its own line, so a JSON argument survives intact.
+async function makeArgumentPerLineClaude(): Promise<string> {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "ai-mi-shims-"));
+  temporaryDirectories.push(directory);
+  const file = path.join(directory, "claude");
+  await fs.writeFile(file, `#!/bin/bash\nfor argument in "$@"; do printf '%s\\n' "$argument"; done\n`);
+  await fs.chmod(file, 0o755);
+  return directory;
+}
+
+function injectedSettings(stdout: string): { hooks: Record<string, { matcher?: string; hooks: Record<string, unknown>[] }[]> } & Record<string, unknown> {
+  const lines: string[] = stdout.split("\n");
+  const settingsFlagIndex: number = lines.indexOf("--settings");
+  expect(settingsFlagIndex).toBeGreaterThanOrEqual(0);
+  return JSON.parse(lines[settingsFlagIndex + 1]);
+}
+
+describe("claude shim hooks", () => {
+  const eventNames = [
+    "PermissionRequest", "Notification", "PreToolUse", "UserPromptSubmit", "PostToolUse",
+    "PostToolUseFailure", "Stop", "StopFailure", "SessionStart", "SessionEnd",
+  ];
+
+  it("injects the agent state hooks in the --settings JSON argument", async () => {
+    const fake = await makeArgumentPerLineClaude();
+    const { stdout, status } = runShim("claude", ["--model", "x"], fake);
+
+    expect(status).toBe(0);
+    const settings = injectedSettings(stdout);
+    expect(Object.keys(settings.hooks).sort()).toEqual([...eventNames].sort());
+    const scriptPath: string = path.join(scriptsDirectory, "dashboard-agent-state.sh");
+    for (const eventName of eventNames) {
+      expect(settings.hooks[eventName]).toHaveLength(1);
+      expect(settings.hooks[eventName][0].hooks).toEqual([{ type: "command", command: scriptPath, timeout: 5 }]);
+    }
+    expect(settings.hooks.PreToolUse[0].matcher).toBe("AskUserQuestion");
+    expect(settings.statusLine).toBeDefined();
+    expect(stdout.split("\n")).toContain("--model");
+  });
+
+  it("injects exactly the same hooks as the dashboard launch command", async () => {
+    const fake = await makeArgumentPerLineClaude();
+    const shimHooks = injectedSettings(runShim("claude", [], fake).stdout).hooks;
+    const command: string = buildProviderLaunchCommand({
+      id: "instance-1", label: "x", locationPath: "/tmp", tmuxSession: "ccdash-instance-1", provider: "claude",
+      command: "claude", model: null, effort: null, fontSize: 13, createdAt: "2026-07-17T00:00:00.000Z",
+    } as InstanceRecord);
+    const quoted: string = /--settings ('(?:[^']|'\\'')*')/.exec(command)?.[1] ?? "";
+    const launchHooks = JSON.parse(spawnSync("bash", ["-c", `printf %s ${quoted}`], { encoding: "utf8" }).stdout).hooks;
+
+    expect(shimHooks).toBeDefined();
+    expect(shimHooks).toEqual(launchHooks);
+  });
+
+  it.each([
+    [["-p", "hi"]],
+    [["--print", "hi"]],
+    [["mcp", "list"]],
+    [["--settings", "{}", "--model", "x"]],
+    [["--settings={}"]],
+  ])("adds no hooks to %j", async (args) => {
+    const fake = await makeArgumentPerLineClaude();
+    const { stdout } = runShim("claude", args, fake);
+
+    expect(stdout).not.toContain("dashboard-agent-state.sh");
+    expect(stdout.split("\n").filter((line) => line !== "")).toEqual(args);
+  });
+});
 
 describe("claude shim", () => {
   it("injects the dashboard statusline wrapper and runs the real binary exactly once", async () => {

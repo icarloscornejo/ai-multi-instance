@@ -46,6 +46,7 @@ import {
   type Snapshot,
 } from "./liveStatus";
 import { findPaneAgent, type PaneAgent } from "./paneAgent";
+import { resolveAgentStates } from "./agentState";
 import { LaunchProgress } from "./launchProgress";
 import { initializeInstanceSession } from "./terminal";
 import { withSessionLock } from "./sessionLock";
@@ -781,6 +782,29 @@ apiRouter.get(
   wrapAsync(async (_request, response) => {
     const state: DashboardState = await loadState();
     response.json(state.instances);
+  })
+);
+
+// Read-only and behind requireAuth only: the phone reads it over the tunnel. State is written
+// by the hook script straight to disk, so no route accepts it.
+apiRouter.get(
+  "/instances/agent-states",
+  wrapAsync(async (_request, response) => {
+    const state: DashboardState = await loadState();
+    const stateDirectory: string = snapshotDirectory();
+    response.json(
+      await resolveAgentStates(state.instances, {
+        // A missing file is the normal "no state yet"; anything else is a real fault worth a log line.
+        readState: (instanceId: string) =>
+          fs.readFile(path.join(stateDirectory, `${instanceId}.state.json`), "utf8").catch((error: NodeJS.ErrnoException) => {
+            if (error.code !== "ENOENT") {
+              console.error(`[server] could not read the agent state of ${instanceId}: ${error.message}`);
+            }
+            return null;
+          }),
+        findAgent: probePaneAgent,
+      })
+    );
   })
 );
 
