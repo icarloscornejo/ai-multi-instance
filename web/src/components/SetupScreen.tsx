@@ -20,6 +20,12 @@ import { api, ApiError } from "../api";
 import { useModalEscapeStack } from "./Modal";
 import { copyText } from "./Sidebar";
 import { PROVIDER_OPTIONS } from "../providerOptions";
+import {
+  gitlabTokenEnvFromRows,
+  gitlabTokenEnvRowsFromMap,
+  validateGitlabTokenEnvRows,
+  type GitlabTokenEnvRow,
+} from "../gitlabTokenEnv";
 import type { ThemePreference } from "../theme";
 import { KEY_BAR_CATALOG, reorderById, type KeyBarPref } from "../keyBar";
 import type { AgentProvider, DashboardConfig, TunnelPhase, TunnelStatus } from "../types";
@@ -42,6 +48,8 @@ const THEME_OPTIONS: { value: ThemePreference; label: string }[] = [
 interface SetupScreenProps {
   initialLocations?: string[];
   initialEnabledProviders?: AgentProvider[];
+  // Host to token-variable NAME. Undefined means the stored map was never loaded, so it is not sent.
+  initialGitlabTokenEnv?: Record<string, string>;
   onConfigured: (config: DashboardConfig) => void;
   onClose?: () => void;
   // Only the mobile Settings screen shows this (Decision D): the desktop toggle stays binary
@@ -606,6 +614,7 @@ function SessionsSection() {
 export function SetupScreen({
   initialLocations,
   initialEnabledProviders,
+  initialGitlabTokenEnv,
   onConfigured,
   onClose,
   showThemePicker = false,
@@ -621,6 +630,7 @@ export function SetupScreen({
   const [enabledProviders, setEnabledProviders] = useState<AgentProvider[]>(
     initialEnabledProviders ?? PROVIDER_OPTIONS.map((option) => option.value)
   );
+  const [gitlabRows, setGitlabRows] = useState<GitlabTokenEnvRow[]>(() => gitlabTokenEnvRowsFromMap(initialGitlabTokenEnv));
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [saving, setSaving] = useState<boolean>(false);
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
@@ -721,7 +731,12 @@ export function SetupScreen({
     return null;
   };
   const errorCount: number = locations.filter((row) => rowError(row) !== null).length;
-  const canSave: boolean = locations.some((row) => row.value.trim() !== "") && errorCount === 0;
+  const gitlabValidation = validateGitlabTokenEnvRows(gitlabRows);
+  const canSave: boolean = locations.some((row) => row.value.trim() !== "") && errorCount === 0 && gitlabValidation.valid;
+
+  const updateGitlabRow = (index: number, change: Partial<GitlabTokenEnvRow>): void => {
+    setGitlabRows((previous) => previous.map((row, rowIndex) => (rowIndex === index ? { ...row, ...change } : row)));
+  };
 
   const handleSave = async (): Promise<void> => {
     const trimmedLocations: string[] = locations.map((row) => row.value.trim()).filter((value) => value !== "");
@@ -731,7 +746,12 @@ export function SetupScreen({
     setSaving(true);
     setErrorMessage(null);
     try {
-      const savedConfig: DashboardConfig = await api.saveConfig({ locations: trimmedLocations, enabledProviders });
+      // Only sent when the stored map was loaded, so a screen that never saw it cannot wipe it.
+      const savedConfig: DashboardConfig = await api.saveConfig({
+        locations: trimmedLocations,
+        enabledProviders,
+        ...(initialGitlabTokenEnv !== undefined ? { gitlabTokenEnv: gitlabTokenEnvFromRows(gitlabRows) } : {}),
+      });
       onConfigured(savedConfig);
     } catch (error) {
       setErrorMessage(error instanceof ApiError ? error.message : "Unexpected error saving.");
@@ -924,6 +944,60 @@ export function SetupScreen({
                 );
               })}
             </div>
+
+            {initialGitlabTokenEnv !== undefined && (
+              <>
+                <div className="flex flex-col gap-[4px] border-t border-border pt-[14px]">
+                  <h2 className="text-[12.5px] font-semibold text-txt-bright">GitLab tokens</h2>
+                  <p className="text-[11.5px] leading-[1.5] text-txt-secondary">
+                    For each self-hosted GitLab, the name of the environment variable that holds its token where the server
+                    starts. Only the name is saved, never the token.
+                  </p>
+                </div>
+                <div className="flex flex-col gap-[8px]">
+                  {gitlabRows.map((row, index) => {
+                    const rowErrorText: string | null = gitlabValidation.errors[index];
+                    return (
+                      <div key={index} className="flex flex-col gap-[5px]">
+                        <div className="flex items-center gap-[8px]">
+                          <input
+                            className={rowErrorText !== null ? inputErrorClassName : inputClassName}
+                            value={row.host}
+                            aria-label="GitLab host"
+                            placeholder="gitlab.example.com"
+                            onChange={(event) => updateGitlabRow(index, { host: event.target.value })}
+                          />
+                          <input
+                            className={rowErrorText !== null ? inputErrorClassName : inputClassName}
+                            value={row.envName}
+                            aria-label="Token variable name"
+                            placeholder="GITLAB_CORP_TOKEN"
+                            onChange={(event) => updateGitlabRow(index, { envName: event.target.value })}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setGitlabRows((previous) => previous.filter((_row, rowIndex) => rowIndex !== index))}
+                            title="Remove host"
+                            aria-label={`Remove ${row.host || "host"}`}
+                            className="flex h-[28px] w-[28px] shrink-0 items-center justify-center rounded-sm text-[13px] text-txt-dim hover:bg-diff-removed-dim hover:text-diff-removed"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                        {rowErrorText !== null && <div className={errorTextClassName}>⚠ {rowErrorText}</div>}
+                      </div>
+                    );
+                  })}
+                  <button
+                    type="button"
+                    onClick={() => setGitlabRows((previous) => [...previous, { host: "", envName: "" }])}
+                    className={`${btnOutline} self-start`}
+                  >
+                    Add GitLab host
+                  </button>
+                </div>
+              </>
+            )}
 
           </div>
 

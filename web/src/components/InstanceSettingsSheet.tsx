@@ -10,6 +10,7 @@ import {
 import type { Instance, PrEventsResponse, UpdateInstancePayload } from "../types";
 import { BottomSheet } from "./BottomSheet";
 import { BranchGitLine } from "./BranchGitLine";
+import { prEventsHeading } from "../prEvents";
 import { PrEventsControl } from "./PrEventsControl";
 import { worktreeLabel } from "../worktreeLabel";
 
@@ -98,7 +99,7 @@ export function InstanceSettingsSheet({ instance, onUpdate, onDeleteRequest, onC
           />
         </Field>
 
-        <Field label="GitHub updates">
+        <Field label={prEventsHeading(prEventsInfo?.provider)}>
           <PrEventsControl instance={instance} info={prEventsInfo} onUpdate={onUpdate} sizeClass="text-[12.5px]" />
         </Field>
 

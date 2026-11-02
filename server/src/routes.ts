@@ -48,6 +48,7 @@ import {
 import type { PaneAgent } from "./paneAgent";
 import { probePaneAgent, readAgentStateFile, resolveAgentStates } from "./agentState";
 import { getPrEventsStatus } from "./prEventsPoller";
+import { isValidGitlabHost, isValidTokenEnvName, normalizeGitlabHostKey } from "./prEventsGitlab";
 import { LaunchProgress } from "./launchProgress";
 import { initializeInstanceSession } from "./terminal";
 import { withSessionLock } from "./sessionLock";
@@ -492,6 +493,23 @@ apiRouter.get(
   })
 );
 
+const MAX_GITLAB_TOKEN_ENV_ENTRIES = 20;
+
+// undefined: field absent, keep the stored map. null: invalid. Only variable NAMES are accepted.
+function parseGitlabTokenEnv(value: unknown): Record<string, string> | null | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const entries: Array<[string, unknown]> = Object.entries(value);
+  if (entries.length > MAX_GITLAB_TOKEN_ENV_ENTRIES) return null;
+  const validEntries: Array<[string, string]> = [];
+  for (const [rawHost, envName] of entries) {
+    const host: string | null = normalizeGitlabHostKey(rawHost);
+    if (host === null || typeof envName !== "string" || !isValidTokenEnvName(envName)) return null;
+    validEntries.push([host, envName]);
+  }
+  return new Set(validEntries.map(([host]) => host)).size === validEntries.length ? Object.fromEntries(validEntries) : null;
+}
+
 apiRouter.put(
   "/config",
   wrapAsync(async (request, response) => {
@@ -526,12 +544,21 @@ apiRouter.put(
       response.status(400).json({ error: "Provide at least one valid agent." });
       return;
     }
+    const gitlabTokenEnv: Record<string, string> | null | undefined = parseGitlabTokenEnv(
+      (request.body as { gitlabTokenEnv?: unknown }).gitlabTokenEnv
+    );
+    if (gitlabTokenEnv === null) {
+      response.status(400).json({ error: "Provide GitLab hosts with the name of the variable that holds each token." });
+      return;
+    }
     // Through updateState like every other writer: a bare loadState/saveState here could
     // overwrite a create/delete/rename another device committed in between.
     const savedConfig = await updateState(async (draft) => {
       draft.config = {
+        ...draft.config,
         locations: resolvedLocations,
         enabledProviders: enabledProviders === undefined ? draft.config.enabledProviders : enabledProviders,
+        ...(gitlabTokenEnv !== undefined ? { gitlabTokenEnv } : {}),
       };
       return { result: draft.config, nextState: draft };
     });
@@ -795,13 +822,18 @@ apiRouter.get(
   wrapAsync(async (_request, response) => {
     const state: DashboardState = await loadState();
     const statuses = getPrEventsStatus();
-    const body: Record<string, { enabled: boolean; paused: boolean; pending: number; status: string }> = {};
+    const body: Record<string, { enabled: boolean; paused: boolean; pending: number; status: string; provider?: "gitlab"; host?: string }> = {};
     for (const instance of state.instances) {
+      const entry: { provider?: unknown; host?: unknown } | undefined = statuses[instance.id];
+      const isGitlab: boolean = entry?.provider === "gitlab";
       body[instance.id] = {
         enabled: instance.prEvents?.enabled === true,
         paused: instance.prEvents?.paused === true,
         pending: statuses[instance.id]?.pending ?? 0,
         status: statuses[instance.id]?.status ?? "off",
+        // Explicit keys, never a spread of the status entry, and GitHub instances keep four keys.
+        ...(isGitlab ? { provider: "gitlab" as const } : {}),
+        ...(isGitlab && typeof entry?.host === "string" && isValidGitlabHost(entry.host) ? { host: entry.host } : {}),
       };
     }
     response.json(body);

@@ -58,6 +58,7 @@ export function MobileHome({
               instance={instance}
               agentState={agentStates[instance.id]}
               prEventsPending={prEvents?.[instance.id]?.pending}
+              prEventsProvider={prEvents?.[instance.id]?.provider}
               isFirst={instance.id === instances[0].id}
               onOpen={() => onOpenInstance(instance.id)}
               onLongPress={() => setLongPressedInstance(instance)}

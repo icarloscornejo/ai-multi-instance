@@ -16,7 +16,7 @@ import {
 import { restrictToVerticalAxis } from "@dnd-kit/modifiers";
 import { CSS } from "@dnd-kit/utilities";
 import type { AgentState, Instance, PrEventsResponse, UpdateStatus } from "../types";
-import { prEventsBadgeText } from "../prEvents";
+import { prEventsBadgeText, prEventsBadgeTitle } from "../prEvents";
 import { agentStateLabel, agentStateTone } from "../agentState";
 import type { Theme } from "../theme";
 import { getHostRailWidth, setHostRailWidth } from "../hostPrefs";
@@ -62,6 +62,7 @@ interface RailRowProps {
   isActive: boolean;
   agentState: AgentState | undefined;
   prEventsPending: number | undefined;
+  prEventsProvider?: "gitlab";
   isEditing: boolean;
   draftLabel: string;
   editInputRef: RefObject<HTMLInputElement>;
@@ -78,6 +79,7 @@ function RailRow({
   isActive,
   agentState,
   prEventsPending,
+  prEventsProvider,
   isEditing,
   draftLabel,
   editInputRef,
@@ -141,7 +143,7 @@ function RailRow({
         </span>
       )}
       {!isEditing && prEventsBadgeText(prEventsPending) !== null && (
-        <span title="GitHub updates waiting for the agent" className="shrink-0 rounded-sm border border-accent-border px-[4px] text-[10px] font-semibold text-txt-secondary">
+        <span title={prEventsBadgeTitle(prEventsProvider)} className="shrink-0 rounded-sm border border-accent-border px-[4px] text-[10px] font-semibold text-txt-secondary">
           PR {prEventsBadgeText(prEventsPending)}
         </span>
       )}
@@ -344,6 +346,7 @@ export function InstanceRail({
                 isActive={instance.id === activeInstanceId}
                 agentState={agentStates[instance.id]}
                 prEventsPending={prEvents?.[instance.id]?.pending}
+                prEventsProvider={prEvents?.[instance.id]?.provider}
                 isEditing={editingInstanceId === instance.id}
                 draftLabel={draftLabel}
                 editInputRef={editInputRef}

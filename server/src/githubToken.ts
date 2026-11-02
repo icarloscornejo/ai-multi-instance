@@ -5,6 +5,7 @@ export interface TokenRunOptions {
   input?: string;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
+  cwd?: string;
 }
 
 export interface TokenDeps {
@@ -15,7 +16,7 @@ export interface TokenDeps {
 
 export type TokenResult = { token: string } | { reason: "no-token" };
 
-const TOKEN_SHAPE = /^[A-Za-z0-9_.-]{20,255}$/;
+export const TOKEN_SHAPE = /^[A-Za-z0-9_.-]{20,255}$/;
 const FOUND_TTL_MS = 5 * 60_000;
 const MISS_TTL_MS = 60_000;
 const GH_TIMEOUT_MS = 5_000;
@@ -32,7 +33,7 @@ export function _resetGithubTokenForTests(): void {
   cached = null;
 }
 
-function validShape(candidate: string | undefined): string | null {
+export function validShape(candidate: string | undefined): string | null {
   const trimmed: string = (candidate ?? "").trim();
   return TOKEN_SHAPE.test(trimmed) ? trimmed : null;
 }
@@ -44,7 +45,12 @@ export function realTokenRun(file: string, args: string[], options: TokenRunOpti
     const child = execFile(
       file,
       args,
-      { env: options.env, timeout: options.timeoutMs, maxBuffer: 64 * 1024 },
+      {
+        env: options.env,
+        timeout: options.timeoutMs,
+        maxBuffer: 64 * 1024,
+        ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
+      },
       (error, stdout) => {
         if (error) {
           reject(new Error("token command failed"));

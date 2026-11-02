@@ -1,4 +1,4 @@
-import { prEventsStatusLabel } from "../prEvents";
+import { prEventsCheckboxText, prEventsStatusLabel } from "../prEvents";
 import type { Instance, PrEventsResponse, UpdateInstancePayload } from "../types";
 
 interface PrEventsControlProps {
@@ -16,7 +16,7 @@ export function PrEventsControl({ instance, info, onUpdate, sizeClass }: PrEvent
   }
   const enabled: boolean = instance.prEvents?.enabled === true;
   const paused: boolean = instance.prEvents?.paused === true;
-  const { label, hint } = prEventsStatusLabel(info?.status ?? "off");
+  const { label, hint } = prEventsStatusLabel(info?.status ?? "off", info?.provider, info?.host);
   const pending: number = info?.pending ?? 0;
 
   return (
@@ -28,7 +28,7 @@ export function PrEventsControl({ instance, info, onUpdate, sizeClass }: PrEvent
           checked={enabled}
           onChange={(event) => onUpdate(instance.id, { prEvents: { enabled: event.target.checked } })}
         />
-        Send failed checks and reviews of the pull request to the agent
+        {prEventsCheckboxText(info?.provider)}
       </label>
       {enabled && (
         <label className="flex items-center gap-[8px] text-txt-body">

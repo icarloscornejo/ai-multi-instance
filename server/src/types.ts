@@ -3,6 +3,8 @@ export type AgentProvider = "claude" | "codex" | "cursor" | "custom";
 export interface DashboardConfig {
   locations: string[];
   enabledProviders: AgentProvider[];
+  // GitLab host to the NAME of the environment variable holding its token. Never a token value.
+  gitlabTokenEnv?: Record<string, string>;
 }
 
 export interface InstanceRecord {

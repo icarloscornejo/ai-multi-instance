@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { isAgentProvider } from "./providers";
+import { isValidTokenEnvName, normalizeGitlabHostKey } from "./prEventsGitlab";
 import type { AgentProvider, DashboardState, InstanceRecord } from "./types";
 
 const dataDirectory: string = path.resolve(import.meta.dirname, "../../data");
@@ -36,6 +37,17 @@ function normalizeEnabledProviders(value: unknown): AgentProvider[] {
   return validProviders.length > 0 ? validProviders : ALL_PROVIDERS;
 }
 
+// Drops bad entries one by one: an invalid map must never get the whole registry quarantined.
+function sanitizeGitlabTokenEnv(value: unknown): Record<string, string> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const validEntries: Array<[string, string]> = [];
+  for (const [rawHost, envName] of Object.entries(value)) {
+    const host: string | null = normalizeGitlabHostKey(rawHost);
+    if (host !== null && typeof envName === "string" && isValidTokenEnvName(envName)) validEntries.push([host, envName]);
+  }
+  return Object.fromEntries(validEntries);
+}
+
 let cachedState: DashboardState | null = null;
 let saveQueue: Promise<void> = Promise.resolve();
 
@@ -52,6 +64,7 @@ interface LegacyDashboardState {
     slots?: string[];
     locations?: string[];
     enabledProviders?: string[];
+    gitlabTokenEnv?: unknown;
   };
   instances: Array<
     Record<string, unknown> & {
@@ -74,11 +87,13 @@ export function migrateLegacyState(rawState: LegacyDashboardState): DashboardSta
     : Array.isArray(rawState.config.slots)
       ? rawState.config.slots
       : [];
+  const gitlabTokenEnv: Record<string, string> | undefined = sanitizeGitlabTokenEnv(rawState.config.gitlabTokenEnv);
   return {
     schemaVersion: 2,
     config: {
       locations: migratedLocations,
       enabledProviders: normalizeEnabledProviders(rawState.config.enabledProviders),
+      ...(gitlabTokenEnv !== undefined ? { gitlabTokenEnv } : {}),
     },
     instances: rawState.instances.map((instance) => {
       const { worktreePath, slotPath, branch, command, ...rest } = instance;

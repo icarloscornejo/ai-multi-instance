@@ -25,11 +25,19 @@ export interface PrEventsSetting {
 
 export type PrEventsStatus = "ok" | "off" | "paused" | "no-token" | "no-pr" | "unsupported" | "error";
 
-export type PrEventsResponse = Record<string, { enabled: boolean; paused: boolean; pending: number; status: PrEventsStatus }>;
+export type PrEventsProvider = "github" | "gitlab";
+
+// provider and host are present only for GitLab instances, GitHub ones keep the four base keys.
+export type PrEventsResponse = Record<
+  string,
+  { enabled: boolean; paused: boolean; pending: number; status: PrEventsStatus; provider?: "gitlab"; host?: string }
+>;
 
 export interface DashboardConfig {
   locations: string[];
   enabledProviders: AgentProvider[];
+  // GitLab host to the NAME of the variable holding its token, never a token value.
+  gitlabTokenEnv?: Record<string, string>;
   configured: boolean;
 }
 

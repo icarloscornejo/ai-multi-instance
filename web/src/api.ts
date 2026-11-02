@@ -65,7 +65,11 @@ export const api = {
 
   resetToRemote: (): Promise<UpdateStatus> => requestJson("/api/update/reset", { method: "POST" }),
 
-  saveConfig: (payload: { locations: string[]; enabledProviders: AgentProvider[] }): Promise<DashboardConfig> =>
+  saveConfig: (payload: {
+    locations: string[];
+    enabledProviders: AgentProvider[];
+    gitlabTokenEnv?: Record<string, string>;
+  }): Promise<DashboardConfig> =>
     requestJson("/api/config", { method: "PUT", body: JSON.stringify(payload) }),
 
   listInstances: (signal?: AbortSignal): Promise<Instance[]> => requestJson("/api/instances", { signal }),

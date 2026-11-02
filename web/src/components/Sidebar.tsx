@@ -10,6 +10,7 @@ import {
 } from "../liveStatusFormatting";
 import type { Instance, LiveStatus, PrEventsResponse, UpdateInstancePayload } from "../types";
 import { BranchGitLine } from "./BranchGitLine";
+import { prEventsHeading } from "../prEvents";
 import { PrEventsControl } from "./PrEventsControl";
 import { worktreeLabel } from "../worktreeLabel";
 
@@ -175,7 +176,7 @@ export function Sidebar({ instance, liveStatus, gitBranch, onUpdate, onDeleteReq
       </Section>
 
       <Section>
-        <Eyebrow>GitHub updates</Eyebrow>
+        <Eyebrow>{prEventsHeading(prEventsInfo?.provider)}</Eyebrow>
         <PrEventsControl instance={instance} info={prEventsInfo} onUpdate={onUpdate} sizeClass="text-[11px]" />
       </Section>
 

@@ -310,3 +310,68 @@ describe("saveState", () => {
     expect(testFiles.has(stateFilePath)).toBe(true);
   });
 });
+
+describe("migrateLegacyState with gitlabTokenEnv", () => {
+  function legacyWith(config: Record<string, unknown>): Parameters<typeof migrateLegacyState>[0] {
+    return { config: { locations: ["/repo"], enabledProviders: ["claude"], ...config }, instances: [], sessionsByKey: {} } as never;
+  }
+
+  it("keeps valid entries", () => {
+    const migrated = migrateLegacyState(legacyWith({ gitlabTokenEnv: { "gitlab.example.com": "CORP_GITLAB", "git.other.example.org": "OTHER_GITLAB" } }));
+
+    expect(migrated.config.gitlabTokenEnv).toEqual({ "gitlab.example.com": "CORP_GITLAB", "git.other.example.org": "OTHER_GITLAB" });
+    expect(isValidDashboardState(migrated)).toBe(true);
+  });
+
+  it("drops invalid entries without invalidating the state", () => {
+    const migrated = migrateLegacyState(
+      legacyWith({
+        gitlabTokenEnv: {
+          "gitlab.example.com": "CORP_GITLAB",
+          "Bad Host": "CORP_GITLAB",
+          "user@evil.example.com": "CORP_GITLAB",
+          "evil.example.com:8443": "CORP_GITLAB",
+          "git.other.example.org": "bad name",
+          "git.third.example.org": "DASHBOARD_PASSWORD",
+          "git.fourth.example.org": "GITHUB_TOKEN",
+          "git.fifth.example.org": 7,
+          "git.sixth.example.org": "ANTHROPIC_API_KEY",
+        },
+      })
+    );
+
+    expect(migrated.config.gitlabTokenEnv).toEqual({ "gitlab.example.com": "CORP_GITLAB" });
+    expect(isValidDashboardState(migrated)).toBe(true);
+  });
+
+  it("drops a __proto__ key without polluting the map or the prototype", () => {
+    const migrated = migrateLegacyState(legacyWith({ gitlabTokenEnv: JSON.parse('{"__proto__":"CORP_GITLAB","gitlab.example.com":"CORP_GITLAB"}') }));
+
+    expect(Object.keys(migrated.config.gitlabTokenEnv ?? {})).toEqual(["gitlab.example.com"]);
+    expect(Object.getPrototypeOf(migrated.config.gitlabTokenEnv)).toBe(Object.prototype);
+  });
+
+  it.each([["a string", "x"], ["an array", ["gitlab.example.com"]], ["null", null], ["a number", 3]])("drops a map that is %s without invalidating the state", (_name, value) => {
+    const migrated = migrateLegacyState(legacyWith({ gitlabTokenEnv: value }));
+
+    expect(isValidDashboardState(migrated)).toBe(true);
+    expect(migrated.config.gitlabTokenEnv === undefined || Object.keys(migrated.config.gitlabTokenEnv).length === 0).toBe(true);
+  });
+
+  it("adds no gitlabTokenEnv key when the config has none", () => {
+    const migrated = migrateLegacyState(legacyWith({}));
+
+    expect("gitlabTokenEnv" in migrated.config).toBe(false);
+  });
+
+  it("survives a save and load round trip with the map intact", async () => {
+    const state = makeValidState();
+    state.config = { ...state.config, gitlabTokenEnv: { "gitlab.example.com": "CORP_GITLAB" } };
+
+    await saveState(state);
+    _resetStoreStateForTests();
+    const loaded = await loadState();
+
+    expect(loaded.config.gitlabTokenEnv).toEqual({ "gitlab.example.com": "CORP_GITLAB" });
+  });
+});

@@ -658,6 +658,7 @@ export function App() {
       <SetupScreen
         initialLocations={config.locations}
         initialEnabledProviders={config.enabledProviders}
+        initialGitlabTokenEnv={config.gitlabTokenEnv ?? {}}
         onConfigured={(newConfig) => {
           setConfig(newConfig);
           setSettingsOpen(false);

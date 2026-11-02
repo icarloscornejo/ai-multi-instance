@@ -1356,3 +1356,199 @@ describe("GET /instances/pr-events", () => {
     expect(resolveGithubToken).not.toHaveBeenCalled();
   });
 });
+
+describe("GET /instances/pr-events for GitLab instances", () => {
+  beforeEach(() => {
+    vi.mocked(getPrEventsStatus).mockReset();
+    vi.mocked(loadState).mockResolvedValue({
+      ...baseState(),
+      instances: [
+        makeRunningInstance({ id: "aaa111", tmuxSession: "ccdash-aaa111", prEvents: { enabled: true, paused: false } } as Partial<InstanceRecord>),
+        makeRunningInstance({ id: "bbb222", tmuxSession: "ccdash-bbb222", prEvents: { enabled: true, paused: false } } as Partial<InstanceRecord>),
+      ],
+    } as DashboardState);
+  });
+
+  it("adds provider and host only for the GitLab instance and keeps the four GitHub keys otherwise", async () => {
+    vi.mocked(getPrEventsStatus).mockReturnValue({
+      aaa111: { status: "ok", pending: 2, provider: "gitlab", host: "gitlab.example.com" },
+      bbb222: { status: "ok", pending: 1 },
+    } as never);
+
+    const body = (await (await fetch(`${baseUrl}/instances/pr-events`)).json()) as Record<string, Record<string, unknown>>;
+
+    expect(body.aaa111).toEqual({ enabled: true, paused: false, pending: 2, status: "ok", provider: "gitlab", host: "gitlab.example.com" });
+    expect(Object.keys(body.bbb222).sort()).toEqual(["enabled", "paused", "pending", "status"]);
+  });
+
+  it("keeps provider and host on a no-pr answer", async () => {
+    vi.mocked(getPrEventsStatus).mockReturnValue({
+      aaa111: { status: "no-pr", pending: 0, provider: "gitlab", host: "gitlab.example.com" },
+    } as never);
+
+    const body = (await (await fetch(`${baseUrl}/instances/pr-events`)).json()) as Record<string, Record<string, unknown>>;
+
+    expect(body.aaa111).toMatchObject({ status: "no-pr", provider: "gitlab", host: "gitlab.example.com" });
+  });
+
+  it("answers the provider without a host when the status has none", async () => {
+    vi.mocked(getPrEventsStatus).mockReturnValue({ aaa111: { status: "unsupported", pending: 0, provider: "gitlab" } } as never);
+
+    const body = (await (await fetch(`${baseUrl}/instances/pr-events`)).json()) as Record<string, Record<string, unknown>>;
+
+    expect(body.aaa111.provider).toBe("gitlab");
+    expect("host" in body.aaa111).toBe(false);
+  });
+
+  it("does not copy other fields of the status entry", async () => {
+    vi.mocked(getPrEventsStatus).mockReturnValue({
+      aaa111: { status: "ok", pending: 0, provider: "gitlab", host: "gitlab.example.com", token: "FAKE_SECRET_VALUE", project: "acme/widgets" },
+    } as never);
+
+    const text: string = await (await fetch(`${baseUrl}/instances/pr-events`)).text();
+
+    expect(text).not.toContain("FAKE_SECRET_VALUE");
+    expect(text).not.toContain("acme/widgets");
+  });
+
+  it("ignores a provider value other than gitlab and a host that fails validation", async () => {
+    vi.mocked(getPrEventsStatus).mockReturnValue({
+      aaa111: { status: "ok", pending: 0, provider: "bitbucket", host: "evil.example" },
+      bbb222: { status: "ok", pending: 0, provider: "gitlab", host: "user@evil.example" },
+    } as never);
+
+    const body = (await (await fetch(`${baseUrl}/instances/pr-events`)).json()) as Record<string, Record<string, unknown>>;
+
+    expect(Object.keys(body.aaa111).sort()).toEqual(["enabled", "paused", "pending", "status"]);
+    expect("host" in body.bbb222).toBe(false);
+  });
+});
+
+describe("PUT and GET /config with gitlabTokenEnv", () => {
+  function putConfig(body: Record<string, unknown>): Promise<Response> {
+    return fetch(`${baseUrl}/config`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ locations: ["/work/repo"], ...body }),
+    });
+  }
+
+  function savedConfig(): Record<string, unknown> {
+    const saved = vi.mocked(saveState).mock.calls.at(-1)?.[0] as DashboardState;
+    return saved.config as unknown as Record<string, unknown>;
+  }
+
+  it("stores a map of normalized hosts to variable names and answers with names only", async () => {
+    const response = await putConfig({ gitlabTokenEnv: { "GitLab.Example.com": "CORP_GITLAB", "git.other.example.org": "OTHER_GITLAB" } });
+
+    expect(response.status).toBe(200);
+    expect(savedConfig().gitlabTokenEnv).toEqual({ "gitlab.example.com": "CORP_GITLAB", "git.other.example.org": "OTHER_GITLAB" });
+    expect(((await response.json()) as Record<string, unknown>).gitlabTokenEnv).toEqual({
+      "gitlab.example.com": "CORP_GITLAB",
+      "git.other.example.org": "OTHER_GITLAB",
+    });
+  });
+
+  it("keeps the stored map when the field is absent", async () => {
+    vi.mocked(loadState).mockResolvedValue({
+      ...baseState(),
+      config: { locations: ["/work/repo"], enabledProviders: ["claude"], gitlabTokenEnv: { "gitlab.example.com": "CORP_GITLAB" } },
+    } as unknown as DashboardState);
+
+    const response = await putConfig({ enabledProviders: ["claude"] });
+
+    expect(response.status).toBe(200);
+    expect(savedConfig().gitlabTokenEnv).toEqual({ "gitlab.example.com": "CORP_GITLAB" });
+  });
+
+  it("replaces the stored map with an empty one when an empty object is sent", async () => {
+    vi.mocked(loadState).mockResolvedValue({
+      ...baseState(),
+      config: { locations: ["/work/repo"], enabledProviders: ["claude"], gitlabTokenEnv: { "gitlab.example.com": "CORP_GITLAB" } },
+    } as unknown as DashboardState);
+
+    const response = await putConfig({ gitlabTokenEnv: {} });
+
+    expect(response.status).toBe(200);
+    expect(savedConfig().gitlabTokenEnv).toEqual({});
+  });
+
+  it("adds no gitlabTokenEnv key when none was ever sent or stored", async () => {
+    const response = await putConfig({});
+
+    expect(response.status).toBe(200);
+    expect("gitlabTokenEnv" in savedConfig()).toBe(false);
+  });
+
+  it("returns the stored names from GET /config", async () => {
+    vi.mocked(loadState).mockResolvedValue({
+      ...baseState(),
+      config: { locations: ["/work/repo"], enabledProviders: ["claude"], gitlabTokenEnv: { "gitlab.example.com": "CORP_GITLAB" } },
+    } as unknown as DashboardState);
+
+    const body = (await (await fetch(`${baseUrl}/config`)).json()) as Record<string, unknown>;
+
+    expect(body.gitlabTokenEnv).toEqual({ "gitlab.example.com": "CORP_GITLAB" });
+  });
+
+  it.each([
+    ["a host with a bad label", { "-bad.example.com": "CORP_GITLAB" }],
+    ["a host with userinfo", { "user@evil.example.com": "CORP_GITLAB" }],
+    ["a host with a port", { "evil.example.com:8443": "CORP_GITLAB" }],
+    ["a host with a path", { "evil.example.com/x": "CORP_GITLAB" }],
+    ["a single label host", { localhost: "CORP_GITLAB" }],
+    ["an ip host", { "10.0.0.1": "CORP_GITLAB" }],
+    ["an empty host", { "": "CORP_GITLAB" }],
+    ["upper and lower case duplicates", { "gitlab.example.com": "A_GITLAB", "GITLAB.example.com": "B_GITLAB" }],
+    ["a bad variable name", { "gitlab.example.com": "bad name" }],
+    ["a name starting with a digit", { "gitlab.example.com": "1GL" }],
+    ["the dashboard password variable", { "gitlab.example.com": "DASHBOARD_PASSWORD" }],
+    ["a GITHUB_ variable", { "gitlab.example.com": "GITHUB_TOKEN" }],
+    ["a GH_ variable", { "gitlab.example.com": "GH_TOKEN" }],
+    ["an unrelated secret variable", { "gitlab.example.com": "ANTHROPIC_API_KEY" }],
+    ["an unrelated service variable", { "gitlab.example.com": "CORP_FIGMA_TOKEN" }],
+    ["a non-string name", { "gitlab.example.com": 5 }],
+    ["an array", ["gitlab.example.com"]],
+    ["a string", "gitlab.example.com=CORP_GITLAB"],
+    ["null", null],
+  ])("answers 400 and saves nothing for %s", async (_name, gitlabTokenEnv) => {
+    const response = await putConfig({ gitlabTokenEnv });
+
+    expect(response.status).toBe(400);
+    expect(vi.mocked(saveState)).not.toHaveBeenCalled();
+  });
+
+  it("accepts a variable name that contains GITLAB", async () => {
+    const response = await putConfig({ gitlabTokenEnv: { "gitlab.example.com": "CORP_GITLAB_TOKEN" } });
+
+    expect(response.status).toBe(200);
+    expect(savedConfig().gitlabTokenEnv).toEqual({ "gitlab.example.com": "CORP_GITLAB_TOKEN" });
+  });
+
+  it("answers 400 for a __proto__ key", async () => {
+    const response = await fetch(`${baseUrl}/config`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: '{"locations":["/work/repo"],"gitlabTokenEnv":{"__proto__":"CORP_GITLAB"}}',
+    });
+
+    expect(response.status).toBe(400);
+    expect(vi.mocked(saveState)).not.toHaveBeenCalled();
+  });
+
+  it("accepts 20 entries and rejects 21", async () => {
+    const entries = (count: number): Record<string, string> =>
+      Object.fromEntries(Array.from({ length: count }, (_value, index) => [`gl${index}.example.com`, `GITLAB_VAR_${index}`]));
+
+    expect((await putConfig({ gitlabTokenEnv: entries(20) })).status).toBe(200);
+    vi.mocked(saveState).mockClear();
+    expect((await putConfig({ gitlabTokenEnv: entries(21) })).status).toBe(400);
+    expect(vi.mocked(saveState)).not.toHaveBeenCalled();
+  });
+
+  it("never echoes a token value", async () => {
+    const response = await putConfig({ gitlabTokenEnv: { "gitlab.example.com": "CORP_GITLAB" } });
+
+    expect(JSON.stringify(await response.json())).not.toMatch(/faketoken/);
+  });
+});

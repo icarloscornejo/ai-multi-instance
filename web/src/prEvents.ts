@@ -1,9 +1,11 @@
-import type { PrEventsStatus } from "./types";
+import type { PrEventsProvider, PrEventsStatus } from "./types";
 
 export const NO_TOKEN_HINT =
   "No GitHub token visible to the server: log in with gh or export GITHUB_TOKEN where the server starts";
 
-const LABELS: Record<PrEventsStatus, { label: string; hint: string | null }> = {
+type StatusText = { label: string; hint: string | null };
+
+const LABELS: Record<PrEventsStatus, StatusText> = {
   ok: { label: "Watching the pull request", hint: null },
   off: { label: "Off", hint: null },
   paused: { label: "Paused", hint: null },
@@ -13,8 +15,43 @@ const LABELS: Record<PrEventsStatus, { label: string; hint: string | null }> = {
   error: { label: "Could not reach GitHub", hint: null },
 };
 
-export function prEventsStatusLabel(status: PrEventsStatus): { label: string; hint: string | null } {
-  return LABELS[status];
+function gitlabNoTokenHint(host: string | undefined): string {
+  const forHost: string = host === undefined ? "" : ` for ${host}`;
+  const hostSetting: string = host === undefined ? "GITLAB_HOST" : `GITLAB_HOST=${host}`;
+  return (
+    `No GitLab token visible to the server${forHost}: add ${host === undefined ? "the" : "this"} host in Settings with the name of the variable that holds its token, ` +
+    `set GITLAB_TOKEN together with ${hostSetting}, or log in with glab`
+  );
+}
+
+function gitlabLabels(host: string | undefined): Record<PrEventsStatus, StatusText> {
+  return {
+    ok: { label: "Watching the merge request", hint: null },
+    off: { label: "Off", hint: null },
+    paused: { label: "Paused", hint: null },
+    "no-token": { label: "No GitLab token", hint: gitlabNoTokenHint(host) },
+    "no-pr": { label: "No open merge request", hint: null },
+    unsupported: { label: host === undefined ? "Unsupported GitLab host" : `Unsupported GitLab host ${host}`, hint: null },
+    error: { label: "Could not reach GitLab", hint: null },
+  };
+}
+
+export function prEventsStatusLabel(status: PrEventsStatus, provider?: PrEventsProvider, host?: string): StatusText {
+  return provider === "gitlab" ? gitlabLabels(host)[status] : LABELS[status];
+}
+
+export function prEventsHeading(provider?: PrEventsProvider): string {
+  return provider === "gitlab" ? "GitLab updates" : "GitHub updates";
+}
+
+export function prEventsBadgeTitle(provider?: PrEventsProvider): string {
+  return `${prEventsHeading(provider)} waiting for the agent`;
+}
+
+export function prEventsCheckboxText(provider?: PrEventsProvider): string {
+  return provider === "gitlab"
+    ? "Send failed jobs and approvals of the merge request to the agent"
+    : "Send failed checks and reviews of the pull request to the agent";
 }
 
 // Null hides the badge. Capped so a long queue cannot widen the rail.

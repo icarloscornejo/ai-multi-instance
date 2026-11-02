@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } f
 import { api } from "../api";
 import type { AgentState, Instance } from "../types";
 import { agentStateLabel, agentStateTone } from "../agentState";
-import { prEventsBadgeText } from "../prEvents";
+import { prEventsBadgeText, prEventsBadgeTitle } from "../prEvents";
 import { worktreeLabel } from "../worktreeLabel";
 
 const PROVIDER_LABELS = {
@@ -23,11 +23,12 @@ interface InstanceCardProps {
   isFirst: boolean;
   agentState?: AgentState;
   prEventsPending?: number;
+  prEventsProvider?: "gitlab";
   onOpen: () => void;
   onLongPress: () => void;
 }
 
-export function InstanceCard({ instance, isFirst, agentState, prEventsPending, onOpen, onLongPress }: InstanceCardProps) {
+export function InstanceCard({ instance, isFirst, agentState, prEventsPending, prEventsProvider, onOpen, onLongPress }: InstanceCardProps) {
   const worktreeInfo = worktreeLabel(instance);
   const prBadge: string | null = prEventsBadgeText(prEventsPending);
   const [branch, setBranch] = useState<string | null>(null);
@@ -109,7 +110,7 @@ export function InstanceCard({ instance, isFirst, agentState, prEventsPending, o
         </div>
       </div>
       {prBadge !== null && (
-        <span title="GitHub updates waiting for the agent" className="shrink-0 rounded-sm border border-accent-border px-[5px] py-[1px] text-[10px] font-semibold text-txt-secondary">
+        <span title={prEventsBadgeTitle(prEventsProvider)} className="shrink-0 rounded-sm border border-accent-border px-[5px] py-[1px] text-[10px] font-semibold text-txt-secondary">
           PR {prBadge}
         </span>
       )}

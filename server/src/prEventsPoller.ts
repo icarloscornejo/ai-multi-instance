@@ -3,8 +3,10 @@ import path from "node:path";
 import { parseAgentStateFile, probePaneAgent, readAgentStateFile, type ParsedAgentStateFile } from "./agentState";
 import { branchUpstream } from "./git";
 import { invalidateToken, realTokenRun, resolveGithubToken, type TokenResult } from "./githubToken";
+import { invalidateGitlabToken, resolveGitlabToken } from "./gitlabToken";
 import type { PaneAgent } from "./paneAgent";
 import {
+  asId,
   canDeliver,
   collectEvents,
   dropStaleCiEvents,
@@ -13,6 +15,7 @@ import {
   pruneSeenIds,
   type PrEvent,
 } from "./prEvents";
+import { collectGitlabEvents, isSafeProjectPath, isValidGitlabHost, parseGitlabMr } from "./prEventsGitlab";
 import { reviewRequestFor, type ReviewRequest } from "./reviewRequests";
 import { withSessionLock } from "./sessionLock";
 import { loadState, stateFilePath, writeStateFileAtomic } from "./store";
@@ -26,7 +29,23 @@ export interface PrEventsEntry {
   headSha: string | null;
   seen: string[];
   queue: PrEvent[];
+  // Written only for GitLab entries, so GitHub entries keep their exact shape.
+  provider?: "gitlab";
+  host?: string;
+  project?: string;
 }
+
+interface StatusIdentity {
+  provider: "gitlab";
+  host?: string;
+}
+
+type StatusRecord = {
+  status: PrEventsStatus;
+  pending: number;
+  provider?: "gitlab";
+  host?: string;
+};
 
 export interface PrEventsFile {
   version: 1;
@@ -42,6 +61,9 @@ export interface PrEventsPollerDeps {
   fetchGithub: (url: string, init: RequestInit) => Promise<Response>;
   resolveToken: () => Promise<TokenResult>;
   invalidateToken: () => void;
+  // Optional so a poller built without GitLab support reports such instances as unsupported.
+  resolveGitlabToken?: (host: string, envName: string | undefined, configuredHosts: Record<string, string>) => Promise<TokenResult>;
+  invalidateGitlabToken?: (host: string) => void;
   readAgentState: (instance: InstanceRecord) => Promise<ParsedAgentStateFile | null>;
   probePane: (instance: InstanceRecord) => Promise<PaneAgent>;
   clientActivity: (tmuxSession: string) => Promise<number | null>;
@@ -65,17 +87,21 @@ const API_ORIGIN = "https://api.github.com/";
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
 const REPO_SEGMENT_PATTERN = /^[A-Za-z0-9._-]+$/;
 const PULL_PATH_PATTERN = /^\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)\/pull\/(\d+)$/;
+const GITLAB_API_PATH = "/api/v4/";
 
 // Module state, all in memory. The store is the single source of truth between the poll and the
 // delivery tick: both mutate it synchronously at their commit points, so neither can write back
 // a stale copy of what the other just changed (which would re-deliver a pasted event).
 let memory: PrEventsFile | null = null;
 let persistChain: Promise<void> = Promise.resolve();
-const statuses = new Map<string, { status: PrEventsStatus; pending: number }>();
+const statuses = new Map<string, StatusRecord>();
 let pollRunning = false;
 let deliverRunning = false;
 let backoffUntilMs = 0;
 let userCache: { login: string; at: number } | null = null;
+// GitLab keeps its own per-host state so one host's limits or rejected token never touch GitHub.
+const gitlabBackoffUntilMs = new Map<string, number>();
+const gitlabUserCache = new Map<string, { userId: number; at: number }>();
 const lastLoggedAt = new Map<string, number>();
 
 export function _resetPrEventsForTests(): void {
@@ -86,12 +112,21 @@ export function _resetPrEventsForTests(): void {
   deliverRunning = false;
   backoffUntilMs = 0;
   userCache = null;
+  gitlabBackoffUntilMs.clear();
+  gitlabUserCache.clear();
   lastLoggedAt.clear();
 }
 
-export function getPrEventsStatus(): Record<string, { status: PrEventsStatus; pending: number }> {
-  const snapshot: Record<string, { status: PrEventsStatus; pending: number }> = {};
-  for (const [instanceId, entry] of statuses) snapshot[instanceId] = { status: entry.status, pending: entry.pending };
+export function getPrEventsStatus(): Record<string, StatusRecord> {
+  const snapshot: Record<string, StatusRecord> = {};
+  for (const [instanceId, entry] of statuses) {
+    snapshot[instanceId] = {
+      status: entry.status,
+      pending: entry.pending,
+      ...(entry.provider === "gitlab" ? { provider: "gitlab" as const } : {}),
+      ...(entry.provider === "gitlab" && entry.host !== undefined ? { host: entry.host } : {}),
+    };
+  }
   return snapshot;
 }
 
@@ -127,7 +162,12 @@ function parseEntry(value: unknown): PrEventsEntry | null {
   if (headSha !== null && typeof headSha !== "string") return null;
   if (!Array.isArray(seen) || !seen.every((id) => typeof id === "string")) return null;
   if (!Array.isArray(queue)) return null;
-  return { prNumber, headSha, seen: seen as string[], queue: queue.filter(isQueuedEvent) };
+  const base: PrEventsEntry = { prNumber, headSha, seen: seen as string[], queue: queue.filter(isQueuedEvent) };
+  if (value.provider === undefined) return base;
+  const { provider, host, project } = value;
+  const isValidGitlabIdentity: boolean =
+    provider === "gitlab" && typeof host === "string" && isValidGitlabHost(host) && typeof project === "string" && isSafeProjectPath(project);
+  return isValidGitlabIdentity ? { ...base, provider: "gitlab", host: host as string, project: project as string } : null;
 }
 
 function parseStore(raw: unknown): PrEventsFile {
@@ -157,8 +197,15 @@ function persistMemory(deps: PrEventsPollerDeps): Promise<void> {
   return persistChain;
 }
 
-function setStatus(instanceId: string, status: PrEventsStatus, pending: number): void {
-  statuses.set(instanceId, { status, pending });
+// identity: undefined keeps what the instance showed before, null clears it (a GitHub round).
+function setStatus(instanceId: string, status: PrEventsStatus, pending: number, identity?: StatusIdentity | null): void {
+  const shown: { provider?: "gitlab"; host?: string } | undefined | null = identity === undefined ? statuses.get(instanceId) : identity;
+  statuses.set(instanceId, {
+    status,
+    pending,
+    ...(shown?.provider === "gitlab" ? { provider: "gitlab" as const } : {}),
+    ...(shown?.provider === "gitlab" && shown.host !== undefined ? { host: shown.host } : {}),
+  });
 }
 
 class GithubFailure extends Error {
@@ -299,8 +346,220 @@ function botLoginsOf(instance: InstanceRecord): string[] {
   return Array.isArray(configured) ? configured.filter((login): login is string => typeof login === "string") : [];
 }
 
+interface EntryIdentity {
+  provider?: "gitlab";
+  host?: string;
+  project?: string;
+}
+
+// A different number, provider, host or project means a different review: its events are history.
+function needsSeed(existing: PrEventsEntry | undefined, prNumber: number, identity: EntryIdentity): boolean {
+  return (
+    existing === undefined ||
+    existing.prNumber !== prNumber ||
+    existing.provider !== identity.provider ||
+    existing.host !== identity.host ||
+    existing.project !== identity.project
+  );
+}
+
+interface RoundCommit {
+  prNumber: number;
+  headSha: string;
+  identity: EntryIdentity;
+  statusIdentity: StatusIdentity | null;
+  reviewsUsable: boolean;
+  collect: (includeReviews: boolean) => PrEvent[];
+}
+
+// Everything the round fetched is already in hand: from here on it is synchronous commits.
+function commitRound(file: PrEventsFile, instanceId: string, existing: PrEventsEntry | undefined, round: RoundCommit): boolean {
+  const { prNumber, headSha } = round;
+  if (existing === undefined || needsSeed(existing, prNumber, round.identity)) {
+    // An unusable review list still records every review id at seed time: over-recording is safe.
+    const seedEvents: PrEvent[] = round.collect(true);
+    file.instances[instanceId] = { prNumber, headSha, seen: seedEvents.map((event) => event.id), queue: [], ...round.identity };
+    setStatus(instanceId, "ok", 0, round.statusIdentity);
+    return true;
+  }
+  const events: PrEvent[] = round.collect(round.reviewsUsable);
+  const seenIds = new Set<string>(existing.seen);
+  const freshEvents: PrEvent[] = events.filter((event) => !seenIds.has(event.id));
+  const heldBackReviewIds: string[] = round.reviewsUsable ? [] : existing.seen.filter((id) => id.startsWith("review:"));
+  existing.seen = pruneSeenIds([...existing.seen, ...freshEvents.map((event) => event.id)], [
+    ...events.map((event) => event.id),
+    ...heldBackReviewIds,
+  ]);
+  existing.queue = mergeQueue(dropStaleCiEvents(existing.queue, headSha), freshEvents);
+  existing.headSha = headSha;
+  setStatus(instanceId, "ok", existing.queue.length, round.statusIdentity);
+  return true;
+}
+
+class GitlabFailure extends Error {
+  constructor() {
+    super("GitLab request failed");
+    this.name = "GitlabFailure";
+  }
+}
+
+// A rejected token is a different problem from a flaky endpoint, so it is never swallowed.
+class GitlabAuthFailure extends GitlabFailure {}
+
+function applyGitlabRateLimit(host: string, response: Response, nowMs: number): void {
+  const retryAfterSeconds: number = Number(response.headers.get("retry-after"));
+  const resetEpochSeconds: number = Number(response.headers.get("ratelimit-reset"));
+  let waitMs: number = DEFAULT_BACKOFF_MS;
+  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) waitMs = retryAfterSeconds * 1000;
+  else if (Number.isFinite(resetEpochSeconds) && resetEpochSeconds > 0) waitMs = resetEpochSeconds * 1000 - nowMs;
+  gitlabBackoffUntilMs.set(host, nowMs + Math.min(Math.max(waitMs, DEFAULT_BACKOFF_MS), MAX_BACKOFF_MS));
+}
+
+// Separate from githubGet on purpose: the bearer token goes only to https://<host>/api/v4/, one
+// request per call, with no pagination and no URL ever taken from a response body or header.
+async function gitlabGet(deps: PrEventsPollerDeps, host: string, token: string, relativePath: string): Promise<unknown> {
+  const url = `https://${host}${GITLAB_API_PATH}${relativePath}`;
+  const parsed = new URL(url);
+  if (parsed.origin !== `https://${host}` || !parsed.pathname.startsWith(GITLAB_API_PATH)) throw new GitlabFailure();
+  let response: Response;
+  try {
+    response = await deps.fetchGithub(url, {
+      method: "GET",
+      redirect: "error",
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+        "User-Agent": "ai-multi-instance-dashboard",
+      },
+    });
+  } catch {
+    throw new GitlabFailure();
+  }
+  if (response.status === 401) {
+    deps.invalidateGitlabToken?.(host);
+    gitlabUserCache.delete(host);
+    throw new GitlabAuthFailure();
+  }
+  if (response.status === 429 || (response.status === 403 && response.headers.get("retry-after") !== null)) {
+    applyGitlabRateLimit(host, response, deps.now());
+    throw new GitlabFailure();
+  }
+  if (!response.ok) throw new GitlabFailure();
+  try {
+    return JSON.parse(await readCappedText(response)) as unknown;
+  } catch {
+    throw new GitlabFailure();
+  }
+}
+
+// Null on failure: approvals are then held back for this round instead of risking an echo.
+async function gitlabTokenOwnerId(deps: PrEventsPollerDeps, host: string, token: string): Promise<number | null> {
+  const nowMs: number = deps.now();
+  const cached = gitlabUserCache.get(host);
+  if (cached !== undefined && nowMs - cached.at < USER_CACHE_MS) return cached.userId;
+  try {
+    const body: unknown = await gitlabGet(deps, host, token, "user");
+    const userId: number | null = asId(isRecord(body) ? body.id : undefined);
+    if (userId === null) return null;
+    gitlabUserCache.set(host, { userId, at: nowMs });
+    return userId;
+  } catch (error) {
+    if (error instanceof GitlabAuthFailure) throw error;
+    return null;
+  }
+}
+
+async function pollGitlab(
+  deps: PrEventsPollerDeps,
+  file: PrEventsFile,
+  instance: InstanceRecord,
+  existing: PrEventsEntry | undefined,
+  review: Extract<ReviewRequest, { state: "found" }>,
+  configuredHosts: Record<string, string>
+): Promise<boolean> {
+  const queuedCount: number = existing?.queue.length ?? 0;
+  const merge = parseGitlabMr(review);
+  // The host is shown as soon as it is known and valid, even when nothing can be polled.
+  const statusIdentity: StatusIdentity = merge === null ? { provider: "gitlab" } : { provider: "gitlab", host: merge.host };
+  // A provisional status carries the identity into any early exit or failure of this round.
+  const previous: StatusRecord = statuses.get(instance.id) ?? { status: "error", pending: queuedCount };
+  setStatus(instance.id, previous.status, previous.pending, statusIdentity);
+  if (merge === null || deps.resolveGitlabToken === undefined) {
+    setStatus(instance.id, "unsupported", queuedCount, statusIdentity);
+    return false;
+  }
+  const { host, projectPath, iid } = merge;
+  // Checked before any token lookup so a limited host never spawns glab or git.
+  if (deps.now() < (gitlabBackoffUntilMs.get(host) ?? 0)) return false;
+  const envName: string | undefined = Object.hasOwn(configuredHosts, host) ? configuredHosts[host] : undefined;
+  const tokenResult: TokenResult = await deps.resolveGitlabToken(host, envName, configuredHosts);
+  if (!("token" in tokenResult)) {
+    setStatus(instance.id, "no-token", queuedCount, statusIdentity);
+    return false;
+  }
+  const { token } = tokenResult;
+  const projectRef = `projects/${encodeURIComponent(projectPath)}`;
+
+  const mergeRequest: unknown = await gitlabGet(deps, host, token, `${projectRef}/merge_requests/${iid}`);
+  if (!isRecord(mergeRequest)) throw new GitlabFailure();
+  if (mergeRequest.state !== "opened") {
+    setStatus(instance.id, "no-pr", 0, statusIdentity);
+    if (existing !== undefined && existing.queue.length > 0) {
+      existing.queue = [];
+      return true;
+    }
+    return false;
+  }
+  const headSha: unknown = mergeRequest.sha;
+  if (typeof headSha !== "string" || !SHA_PATTERN.test(headSha)) throw new GitlabFailure();
+
+  // No head pipeline means no CI events this round: listing pipelines could pick one of an older head.
+  let jobs: unknown[] = [];
+  if (mergeRequest.head_pipeline !== null && mergeRequest.head_pipeline !== undefined) {
+    const pipelineId: number | null = asId(isRecord(mergeRequest.head_pipeline) ? mergeRequest.head_pipeline.id : undefined);
+    if (pipelineId === null) throw new GitlabFailure();
+    const jobsBody: unknown = await gitlabGet(deps, host, token, `${projectRef}/pipelines/${pipelineId}/jobs?scope%5B%5D=failed&per_page=100`);
+    if (!Array.isArray(jobsBody)) throw new GitlabFailure();
+    jobs = jobsBody;
+  }
+
+  let approvals: unknown[] = [];
+  let ownUserId: number | null = null;
+  let approvalsUsable = false;
+  try {
+    const approvalsBody: unknown = await gitlabGet(deps, host, token, `${projectRef}/merge_requests/${iid}/approvals`);
+    const approvedBy: unknown = isRecord(approvalsBody) ? approvalsBody.approved_by : undefined;
+    ownUserId = await gitlabTokenOwnerId(deps, host, token);
+    if (Array.isArray(approvedBy) && ownUserId !== null) {
+      approvals = approvedBy;
+      approvalsUsable = true;
+    }
+  } catch (error) {
+    if (error instanceof GitlabAuthFailure) throw error;
+  }
+  const identity: EntryIdentity = { provider: "gitlab", host, project: projectPath };
+  // Seeding without the approvals would queue every existing approval as new on the next round.
+  if (!approvalsUsable && needsSeed(existing, iid, identity)) throw new GitlabFailure();
+
+  const rules = { host, projectPath, iid, headSha, ownUserId, botLogins: botLoginsOf(instance) };
+  return commitRound(file, instance.id, existing, {
+    prNumber: iid,
+    headSha,
+    identity,
+    statusIdentity,
+    reviewsUsable: approvalsUsable,
+    collect: (includeReviews) => collectGitlabEvents({ jobs, approvals: includeReviews ? approvals : [] }, rules),
+  });
+}
+
 // Returns true when the persisted file changed.
-async function pollInstance(deps: PrEventsPollerDeps, file: PrEventsFile, instance: InstanceRecord): Promise<boolean> {
+async function pollInstance(
+  deps: PrEventsPollerDeps,
+  file: PrEventsFile,
+  instance: InstanceRecord,
+  configuredHosts: Record<string, string>
+): Promise<boolean> {
   const existing: PrEventsEntry | undefined = file.instances[instance.id];
   const queuedCount: number = existing?.queue.length ?? 0;
   if (!isPollable(instance)) {
@@ -313,8 +572,6 @@ async function pollInstance(deps: PrEventsPollerDeps, file: PrEventsFile, instan
     }
     return false;
   }
-  if (deps.now() < backoffUntilMs) return false;
-
   let review: ReviewRequest | null;
   try {
     review = await deps.resolveReviewRequest(instance);
@@ -327,9 +584,12 @@ async function pollInstance(deps: PrEventsPollerDeps, file: PrEventsFile, instan
     setStatus(instance.id, "no-pr", queuedCount);
     return false;
   }
+  if (review.kind === "gitlab") return pollGitlab(deps, file, instance, existing, review, configuredHosts);
+  // The GitHub rate limit pauses GitHub only, so it is checked here and not before the review kind is known.
+  if (deps.now() < backoffUntilMs) return false;
   const repository = parseGithubPull(review);
   if (repository === null) {
-    setStatus(instance.id, "unsupported", queuedCount);
+    setStatus(instance.id, "unsupported", queuedCount, null);
     return false;
   }
   const { owner, repo } = repository;
@@ -337,7 +597,7 @@ async function pollInstance(deps: PrEventsPollerDeps, file: PrEventsFile, instan
 
   const tokenResult: TokenResult = await deps.resolveToken();
   if (!("token" in tokenResult)) {
-    setStatus(instance.id, "no-token", queuedCount);
+    setStatus(instance.id, "no-token", queuedCount, null);
     return false;
   }
   const { token } = tokenResult;
@@ -345,7 +605,7 @@ async function pollInstance(deps: PrEventsPollerDeps, file: PrEventsFile, instan
   const pull = (await githubGet(deps, token, `${API_ORIGIN}repos/${owner}/${repo}/pulls/${prNumber}`)).body;
   if (!isRecord(pull)) throw new GithubFailure();
   if (pull.state !== "open") {
-    setStatus(instance.id, "no-pr", 0);
+    setStatus(instance.id, "no-pr", 0, null);
     if (existing !== undefined && existing.queue.length > 0) {
       existing.queue = [];
       return true;
@@ -371,27 +631,14 @@ async function pollInstance(deps: PrEventsPollerDeps, file: PrEventsFile, instan
   const reviewsUsable: boolean = ownLogin !== null;
   const rules = { owner, repo, prNumber, headSha, ownLogin, botLogins: botLoginsOf(instance) };
 
-  // Everything above can fail without touching state; from here on it is synchronous commits.
-  const isSeed: boolean = existing === undefined || existing.prNumber !== prNumber;
-  if (isSeed) {
-    // Without the owner login the seed still records every review id: over-recording is safe.
-    const seedEvents: PrEvent[] = collectEvents({ checkRuns, reviews }, rules);
-    file.instances[instance.id] = { prNumber, headSha, seen: seedEvents.map((event) => event.id), queue: [] };
-    setStatus(instance.id, "ok", 0);
-    return true;
-  }
-  const events: PrEvent[] = collectEvents({ checkRuns, reviews: reviewsUsable ? reviews : [] }, rules);
-  const seenIds = new Set<string>(existing.seen);
-  const freshEvents: PrEvent[] = events.filter((event) => !seenIds.has(event.id));
-  const heldBackReviewIds: string[] = reviewsUsable ? [] : existing.seen.filter((id) => id.startsWith("review:"));
-  existing.seen = pruneSeenIds([...existing.seen, ...freshEvents.map((event) => event.id)], [
-    ...events.map((event) => event.id),
-    ...heldBackReviewIds,
-  ]);
-  existing.queue = mergeQueue(dropStaleCiEvents(existing.queue, headSha), freshEvents);
-  existing.headSha = headSha;
-  setStatus(instance.id, "ok", existing.queue.length);
-  return true;
+  return commitRound(file, instance.id, existing, {
+    prNumber,
+    headSha,
+    identity: {},
+    statusIdentity: null,
+    reviewsUsable,
+    collect: (includeReviews) => collectEvents({ checkRuns, reviews: includeReviews ? reviews : [] }, rules),
+  });
 }
 
 export async function pollSweep(deps: PrEventsPollerDeps): Promise<void> {
@@ -411,9 +658,10 @@ export async function pollSweep(deps: PrEventsPollerDeps): Promise<void> {
     for (const instanceId of statuses.keys()) {
       if (!knownIds.has(instanceId)) statuses.delete(instanceId);
     }
+    const configuredHosts: Record<string, string> = state.config?.gitlabTokenEnv ?? {};
     for (const instance of state.instances) {
       try {
-        if (await pollInstance(deps, file, instance)) changed = true;
+        if (await pollInstance(deps, file, instance, configuredHosts)) changed = true;
       } catch {
         setStatus(instance.id, "error", file.instances[instance.id]?.queue.length ?? 0);
       }
@@ -452,7 +700,7 @@ async function deliverOne(deps: PrEventsPollerDeps, instanceId: string, tmuxSess
     if (!allowed) return;
     const batch: PrEvent[] = [...entry.queue];
     try {
-      await deps.paste(fresh.tmuxSession, formatMessage(entry.prNumber, batch));
+      await deps.paste(fresh.tmuxSession, formatMessage(entry.prNumber, batch, entry.provider ?? "github"));
     } catch {
       logFixed("paste", "could not type into a session, will retry", deps.now());
       return;
@@ -520,6 +768,9 @@ function realDeps(): PrEventsPollerDeps {
     fetchGithub: (url, init) => fetch(url, init),
     resolveToken: () => resolveGithubToken({ env: process.env, run: realTokenRun, now: () => Date.now() }),
     invalidateToken,
+    resolveGitlabToken: (host, envName, configuredHosts) =>
+      resolveGitlabToken(host, envName, configuredHosts, { env: process.env, run: realTokenRun, now: () => Date.now() }),
+    invalidateGitlabToken,
     readAgentState: async (instance) => {
       const raw: string | null = await readAgentStateFile(instance.id);
       return raw === null ? null : parseAgentStateFile(raw);
