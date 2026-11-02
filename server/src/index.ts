@@ -24,6 +24,7 @@ import {
 } from "./attachErrors";
 import { createAttachBuffer } from "./attachBuffer";
 import { registerHeartbeat, startHeartbeat } from "./heartbeat";
+import { startPrEventsPoller } from "./prEventsPoller";
 import { countSystemDynamicPtys, getPtmxMax } from "./ptyCapacity";
 import { apiRouter } from "./routes";
 import { getTunnelMode } from "./namedTunnel";
@@ -335,4 +336,5 @@ httpServer.listen(serverPort, serverHost, () => {
   // also what makes a transaction interrupted by a `tsx` restart self-heal with no user action:
   // see updateTransaction.ts's header comment and updater.ts's reconcileFrontendPublishOnStartup.
   void reconcileFrontendPublishOnStartup();
+  startPrEventsPoller();
 });

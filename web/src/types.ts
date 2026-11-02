@@ -14,7 +14,18 @@ export interface Instance {
   createdAt: string;
   shellOnly?: boolean;
   worktree?: { sourcePath: string; branch: string; created: boolean };
+  prEvents?: PrEventsSetting;
 }
+
+export interface PrEventsSetting {
+  enabled: boolean;
+  paused: boolean;
+  botLogins?: string[];
+}
+
+export type PrEventsStatus = "ok" | "off" | "paused" | "no-token" | "no-pr" | "unsupported" | "error";
+
+export type PrEventsResponse = Record<string, { enabled: boolean; paused: boolean; pending: number; status: PrEventsStatus }>;
 
 export interface DashboardConfig {
   locations: string[];
@@ -120,6 +131,7 @@ export interface UpdateInstancePayload {
   command?: string;
   model?: string | null;
   effort?: string | null;
+  prEvents?: Partial<PrEventsSetting>;
 }
 
 // Mirrors BranchUpstream in server/src/git.ts

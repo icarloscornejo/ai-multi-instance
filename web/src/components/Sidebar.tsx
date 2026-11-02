@@ -8,8 +8,9 @@ import {
   formatShortResetTime,
   usagePctColorClass,
 } from "../liveStatusFormatting";
-import type { Instance, LiveStatus, UpdateInstancePayload } from "../types";
+import type { Instance, LiveStatus, PrEventsResponse, UpdateInstancePayload } from "../types";
 import { BranchGitLine } from "./BranchGitLine";
+import { PrEventsControl } from "./PrEventsControl";
 import { worktreeLabel } from "../worktreeLabel";
 
 // Splits an absolute path into indented tree lines so long paths read top-to-bottom
@@ -32,6 +33,7 @@ interface SidebarProps {
   gitBranch: string | null;
   onUpdate: (instanceId: string, payload: UpdateInstancePayload) => void;
   onDeleteRequest: (instance: Instance) => void;
+  prEventsInfo?: PrEventsResponse[string];
 }
 
 // Each field sits below a top border except the very first one, matching the approved
@@ -114,7 +116,7 @@ function CopyButton({ value, title }: { value: string; title: string }) {
   );
 }
 
-export function Sidebar({ instance, liveStatus, gitBranch, onUpdate, onDeleteRequest }: SidebarProps) {
+export function Sidebar({ instance, liveStatus, gitBranch, onUpdate, onDeleteRequest, prEventsInfo }: SidebarProps) {
   const [commandDraft, setCommandDraft] = useState<string>(instance.command);
 
   // When switching tabs the sidebar shows a different instance: resync the draft
@@ -170,6 +172,11 @@ export function Sidebar({ instance, liveStatus, gitBranch, onUpdate, onDeleteReq
             })
           }
         />
+      </Section>
+
+      <Section>
+        <Eyebrow>GitHub updates</Eyebrow>
+        <PrEventsControl instance={instance} info={prEventsInfo} onUpdate={onUpdate} sizeClass="text-[11px]" />
       </Section>
 
       {view.kind === "loading" && (

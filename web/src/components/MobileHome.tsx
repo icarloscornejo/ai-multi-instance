@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { AgentState, Instance } from "../types";
+import type { AgentState, Instance, PrEventsResponse } from "../types";
 import { sortByWaiting } from "../agentState";
 import { btnPrimary } from "../ui";
 import { ActionSheet } from "./ActionSheet";
@@ -8,6 +8,7 @@ import { InstanceCard } from "./InstanceCard";
 interface MobileHomeProps {
   instances: Instance[];
   agentStates: Record<string, AgentState>;
+  prEvents?: PrEventsResponse;
   onOpenInstance: (instanceId: string) => void;
   onNewInstance: () => void;
   onSettingsClick: () => void;
@@ -17,6 +18,7 @@ interface MobileHomeProps {
 export function MobileHome({
   instances,
   agentStates,
+  prEvents,
   onOpenInstance,
   onNewInstance,
   onSettingsClick,
@@ -55,6 +57,7 @@ export function MobileHome({
               key={instance.id}
               instance={instance}
               agentState={agentStates[instance.id]}
+              prEventsPending={prEvents?.[instance.id]?.pending}
               isFirst={instance.id === instances[0].id}
               onOpen={() => onOpenInstance(instance.id)}
               onLongPress={() => setLongPressedInstance(instance)}

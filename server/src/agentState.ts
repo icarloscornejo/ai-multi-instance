@@ -1,4 +1,7 @@
-import type { PaneAgent } from "./paneAgent";
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import { snapshotDirectory } from "./liveStatus";
+import { findPaneAgent, type PaneAgent } from "./paneAgent";
 import type { InstanceRecord } from "./types";
 
 export type AgentState = "waiting" | "working" | "idle";
@@ -36,6 +39,24 @@ export function parseAgentStateFile(raw: string): ParsedAgentStateFile | null {
   if (typeof paneJobPid !== "number" || !Number.isFinite(paneJobPid)) return null;
   if (typeof updatedAt !== "string" || Number.isNaN(Date.parse(updatedAt))) return null;
   return { state: state as AgentState, paneJobPid, updatedAt };
+}
+
+// A missing file is the normal "no state yet"; anything else is a real fault worth a log line.
+export function readAgentStateFile(instanceId: string): Promise<string | null> {
+  return fs.readFile(path.join(snapshotDirectory(), `${instanceId}.state.json`), "utf8").catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "ENOENT") {
+      console.error(`[server] could not read the agent state of ${instanceId}: ${error.message}`);
+    }
+    return null;
+  });
+}
+
+// What the instance's pane is running right now. A custom command is whatever the user typed:
+// "no known agent" says nothing about it, so unless a known agent is actually found there it is
+// served from its snapshot like before instead of being reported as not running.
+export async function probePaneAgent(instance: InstanceRecord): Promise<PaneAgent> {
+  const found: PaneAgent = await findPaneAgent(instance.tmuxSession);
+  return instance.provider === "custom" && found.kind !== "agent" ? { kind: "unknown" } : found;
 }
 
 // Reads the file first and probes the pane only when it is valid, since the probe costs a

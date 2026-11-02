@@ -5,6 +5,7 @@ import type {
   Instance,
   LanAddress,
   AgentStatesResponse,
+  PrEventsResponse,
   LiveStatus,
   LocationBranches,
   LocationInfo,
@@ -79,6 +80,9 @@ export const api = {
 
   getAgentStates: (signal?: AbortSignal): Promise<AgentStatesResponse> =>
     requestJson("/api/instances/agent-states", { signal }),
+
+  getPrEvents: (signal?: AbortSignal): Promise<PrEventsResponse> =>
+    requestJson("/api/instances/pr-events", { signal }),
 
   getInstanceLiveStatus: (instanceId: string): Promise<LiveStatus> =>
     requestJson(`/api/instances/${instanceId}/live-status`),

@@ -13,6 +13,7 @@ import { execFile } from "node:child_process";
 import {
   branchUpstream,
   GitError,
+  hardenedGitEnv,
   isRemoteUnreachableError,
   LOCAL_GIT_TIMEOUT_MS,
   parseBranchUpstream,
@@ -285,5 +286,19 @@ describe("worktreeDirFor", () => {
   it("throws an Error when nothing is left after sanitizing", () => {
     expect(() => worktreeDirFor("/work/repo", "///")).toThrow(/branch/i);
     expect(() => worktreeDirFor("/work/repo", "..")).toThrow(/branch/i);
+  });
+});
+
+describe("hardenedGitEnv", () => {
+  it("disables terminal prompts and supplies a batch-mode ssh command", () => {
+    const env = hardenedGitEnv({ PATH: "/usr/bin" });
+
+    expect(env.GIT_TERMINAL_PROMPT).toBe("0");
+    expect(env.GIT_SSH_COMMAND).toBe("ssh -o BatchMode=yes -o ConnectTimeout=10");
+    expect(env.PATH).toBe("/usr/bin");
+  });
+
+  it("keeps an ssh command the user already configured", () => {
+    expect(hardenedGitEnv({ GIT_SSH_COMMAND: "ssh -J jump" }).GIT_SSH_COMMAND).toBe("ssh -J jump");
   });
 });

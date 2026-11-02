@@ -1,0 +1,549 @@
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import { parseAgentStateFile, probePaneAgent, readAgentStateFile, type ParsedAgentStateFile } from "./agentState";
+import { branchUpstream } from "./git";
+import { invalidateToken, realTokenRun, resolveGithubToken, type TokenResult } from "./githubToken";
+import type { PaneAgent } from "./paneAgent";
+import {
+  canDeliver,
+  collectEvents,
+  dropStaleCiEvents,
+  formatMessage,
+  mergeQueue,
+  pruneSeenIds,
+  type PrEvent,
+} from "./prEvents";
+import { reviewRequestFor, type ReviewRequest } from "./reviewRequests";
+import { withSessionLock } from "./sessionLock";
+import { loadState, stateFilePath, writeStateFileAtomic } from "./store";
+import { clientActivitySeconds, getPaneCurrentPath, pasteToSession } from "./tmux";
+import type { DashboardState, InstanceRecord } from "./types";
+
+export type PrEventsStatus = "ok" | "off" | "paused" | "no-token" | "no-pr" | "unsupported" | "error";
+
+export interface PrEventsEntry {
+  prNumber: number;
+  headSha: string | null;
+  seen: string[];
+  queue: PrEvent[];
+}
+
+export interface PrEventsFile {
+  version: 1;
+  instances: Record<string, PrEventsEntry>;
+}
+
+export interface PrEventsPollerDeps {
+  now: () => number;
+  loadState: () => Promise<DashboardState>;
+  loadStore: () => Promise<unknown>;
+  persist: (file: PrEventsFile) => Promise<void>;
+  resolveReviewRequest: (instance: InstanceRecord) => Promise<ReviewRequest | null>;
+  fetchGithub: (url: string, init: RequestInit) => Promise<Response>;
+  resolveToken: () => Promise<TokenResult>;
+  invalidateToken: () => void;
+  readAgentState: (instance: InstanceRecord) => Promise<ParsedAgentStateFile | null>;
+  probePane: (instance: InstanceRecord) => Promise<PaneAgent>;
+  clientActivity: (tmuxSession: string) => Promise<number | null>;
+  paste: (tmuxSession: string, text: string) => Promise<{ submitted: boolean }>;
+  withLock: <T>(tmuxSession: string, run: () => Promise<T>) => Promise<T>;
+  settleMs?: number;
+}
+
+const POLL_INTERVAL_MS = 60_000;
+const DELIVER_INTERVAL_MS = 5_000;
+const FIRST_POLL_DELAY_MS = 5_000;
+const DEFAULT_SETTLE_MS = 20_000;
+const REQUEST_TIMEOUT_MS = 10_000;
+const MAX_BODY_BYTES = 8 * 1024 * 1024;
+const MAX_PAGES = 5;
+const USER_CACHE_MS = 10 * 60_000;
+const DEFAULT_BACKOFF_MS = 60_000;
+const MAX_BACKOFF_MS = 60 * 60_000;
+const LOG_THROTTLE_MS = 5 * 60_000;
+const API_ORIGIN = "https://api.github.com/";
+const SHA_PATTERN = /^[0-9a-f]{40}$/;
+const REPO_SEGMENT_PATTERN = /^[A-Za-z0-9._-]+$/;
+const PULL_PATH_PATTERN = /^\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)\/pull\/(\d+)$/;
+
+// Module state, all in memory. The store is the single source of truth between the poll and the
+// delivery tick: both mutate it synchronously at their commit points, so neither can write back
+// a stale copy of what the other just changed (which would re-deliver a pasted event).
+let memory: PrEventsFile | null = null;
+let persistChain: Promise<void> = Promise.resolve();
+const statuses = new Map<string, { status: PrEventsStatus; pending: number }>();
+let pollRunning = false;
+let deliverRunning = false;
+let backoffUntilMs = 0;
+let userCache: { login: string; at: number } | null = null;
+const lastLoggedAt = new Map<string, number>();
+
+export function _resetPrEventsForTests(): void {
+  memory = null;
+  persistChain = Promise.resolve();
+  statuses.clear();
+  pollRunning = false;
+  deliverRunning = false;
+  backoffUntilMs = 0;
+  userCache = null;
+  lastLoggedAt.clear();
+}
+
+export function getPrEventsStatus(): Record<string, { status: PrEventsStatus; pending: number }> {
+  const snapshot: Record<string, { status: PrEventsStatus; pending: number }> = {};
+  for (const [instanceId, entry] of statuses) snapshot[instanceId] = { status: entry.status, pending: entry.pending };
+  return snapshot;
+}
+
+// Fixed strings only: an error object from fetch or execFile can carry headers, argv or output.
+function logFixed(key: string, message: string, nowMs: number): void {
+  const previous: number | undefined = lastLoggedAt.get(key);
+  if (previous !== undefined && nowMs - previous < LOG_THROTTLE_MS) return;
+  lastLoggedAt.set(key, nowMs);
+  console.warn(`[server] PR events: ${message}`);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isQueuedEvent(value: unknown): value is PrEvent {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    (value.kind === "ci" || value.kind === "review") &&
+    typeof value.author === "string" &&
+    typeof value.link === "string" &&
+    typeof value.label === "string" &&
+    (value.sha === undefined || typeof value.sha === "string")
+  );
+}
+
+// A corrupt entry counts as missing, so the next poll seeds it instead of queueing old events.
+function parseEntry(value: unknown): PrEventsEntry | null {
+  if (!isRecord(value)) return null;
+  const { prNumber, headSha, seen, queue } = value;
+  if (typeof prNumber !== "number" || !Number.isSafeInteger(prNumber) || prNumber <= 0) return null;
+  if (headSha !== null && typeof headSha !== "string") return null;
+  if (!Array.isArray(seen) || !seen.every((id) => typeof id === "string")) return null;
+  if (!Array.isArray(queue)) return null;
+  return { prNumber, headSha, seen: seen as string[], queue: queue.filter(isQueuedEvent) };
+}
+
+function parseStore(raw: unknown): PrEventsFile {
+  const file: PrEventsFile = { version: 1, instances: {} };
+  if (!isRecord(raw) || raw.version !== 1 || !isRecord(raw.instances)) return file;
+  for (const [instanceId, value] of Object.entries(raw.instances)) {
+    const entry: PrEventsEntry | null = parseEntry(value);
+    if (entry !== null) file.instances[instanceId] = entry;
+  }
+  return file;
+}
+
+async function getFile(deps: PrEventsPollerDeps): Promise<PrEventsFile> {
+  if (memory === null) {
+    const loaded: PrEventsFile = parseStore(await deps.loadStore());
+    memory ??= loaded;
+  }
+  return memory;
+}
+
+function persistMemory(deps: PrEventsPollerDeps): Promise<void> {
+  if (memory === null) return persistChain;
+  const snapshot: PrEventsFile = structuredClone(memory);
+  persistChain = persistChain
+    .then(() => deps.persist(snapshot))
+    .catch(() => logFixed("persist", "could not save the event queue", deps.now()));
+  return persistChain;
+}
+
+function setStatus(instanceId: string, status: PrEventsStatus, pending: number): void {
+  statuses.set(instanceId, { status, pending });
+}
+
+class GithubFailure extends Error {
+  constructor() {
+    super("GitHub request failed");
+    this.name = "GithubFailure";
+  }
+}
+
+async function readCappedText(response: Response): Promise<string> {
+  const declaredLength: number = Number(response.headers.get("content-length") ?? "0");
+  if (declaredLength > MAX_BODY_BYTES || response.body === null) throw new GithubFailure();
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    totalBytes += value.byteLength;
+    if (totalBytes > MAX_BODY_BYTES) {
+      await reader.cancel().catch(() => undefined);
+      throw new GithubFailure();
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function nextLink(linkHeader: string | null): string | null {
+  if (linkHeader === null) return null;
+  for (const part of linkHeader.split(",")) {
+    if (!/rel="next"/.test(part)) continue;
+    const target: string | undefined = /<([^>]+)>/.exec(part)?.[1];
+    // Only ever follow links that stay on the API host: the bearer token rides on every request.
+    if (target !== undefined && target.startsWith(API_ORIGIN)) return target;
+  }
+  return null;
+}
+
+function applyRateLimit(response: Response, nowMs: number): void {
+  const resetSeconds: number = Number(response.headers.get("x-ratelimit-reset"));
+  const waitMs: number = Number.isFinite(resetSeconds) && resetSeconds > 0 ? resetSeconds * 1000 - nowMs : DEFAULT_BACKOFF_MS;
+  backoffUntilMs = nowMs + Math.min(Math.max(waitMs, DEFAULT_BACKOFF_MS), MAX_BACKOFF_MS);
+}
+
+async function githubGet(deps: PrEventsPollerDeps, token: string, url: string): Promise<{ body: unknown; next: string | null }> {
+  let response: Response;
+  try {
+    response = await deps.fetchGithub(url, {
+      method: "GET",
+      redirect: "error",
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "ai-multi-instance-dashboard",
+      },
+    });
+  } catch {
+    throw new GithubFailure();
+  }
+  if (response.status === 401) {
+    deps.invalidateToken();
+    userCache = null;
+    throw new GithubFailure();
+  }
+  const rateLimited: boolean =
+    response.status === 429 || (response.status === 403 && response.headers.get("x-ratelimit-remaining") === "0");
+  if (rateLimited) {
+    applyRateLimit(response, deps.now());
+    throw new GithubFailure();
+  }
+  if (!response.ok) throw new GithubFailure();
+  try {
+    return { body: JSON.parse(await readCappedText(response)) as unknown, next: nextLink(response.headers.get("link")) };
+  } catch {
+    throw new GithubFailure();
+  }
+}
+
+async function listAll(
+  deps: PrEventsPollerDeps,
+  token: string,
+  firstUrl: string,
+  pickItems: (body: unknown) => unknown
+): Promise<unknown[]> {
+  const items: unknown[] = [];
+  let url: string | null = firstUrl;
+  for (let page = 0; page < MAX_PAGES && url !== null; page += 1) {
+    const { body, next } = await githubGet(deps, token, url);
+    const pageItems: unknown = pickItems(body);
+    if (!Array.isArray(pageItems)) throw new GithubFailure();
+    items.push(...pageItems);
+    url = next;
+  }
+  return items;
+}
+
+// The token owner's login, so their own reviews are not reported back to them. Null on failure:
+// reviews are then held back for this round instead of risking an echo.
+async function tokenOwnerLogin(deps: PrEventsPollerDeps, token: string): Promise<string | null> {
+  const nowMs: number = deps.now();
+  if (userCache !== null && nowMs - userCache.at < USER_CACHE_MS) return userCache.login;
+  try {
+    const { body } = await githubGet(deps, token, `${API_ORIGIN}user`);
+    const login: unknown = isRecord(body) ? body.login : undefined;
+    if (typeof login !== "string" || login === "" || login.length > 100) return null;
+    userCache = { login, at: nowMs };
+    return login;
+  } catch {
+    return null;
+  }
+}
+
+function parseGithubPull(review: Extract<ReviewRequest, { state: "found" }>): { owner: string; repo: string } | null {
+  if (review.kind !== "github" || review.url === null) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(review.url);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:" || parsed.hostname !== "github.com" || parsed.port !== "") return null;
+  const match: RegExpExecArray | null = PULL_PATH_PATTERN.exec(parsed.pathname);
+  if (match === null || Number(match[3]) !== review.number) return null;
+  const [, owner, repo] = match;
+  if (owner === "." || owner === ".." || repo === "." || repo === "..") return null;
+  return { owner, repo };
+}
+
+function isPollable(instance: InstanceRecord): boolean {
+  return instance.prEvents?.enabled === true && instance.prEvents.paused !== true && instance.shellOnly !== true && instance.provider === "claude";
+}
+
+function botLoginsOf(instance: InstanceRecord): string[] {
+  const configured: unknown = instance.prEvents?.botLogins;
+  return Array.isArray(configured) ? configured.filter((login): login is string => typeof login === "string") : [];
+}
+
+// Returns true when the persisted file changed.
+async function pollInstance(deps: PrEventsPollerDeps, file: PrEventsFile, instance: InstanceRecord): Promise<boolean> {
+  const existing: PrEventsEntry | undefined = file.instances[instance.id];
+  const queuedCount: number = existing?.queue.length ?? 0;
+  if (!isPollable(instance)) {
+    const paused: boolean = instance.prEvents?.enabled === true && instance.prEvents.paused === true;
+    setStatus(instance.id, paused ? "paused" : "off", queuedCount);
+    // A disabled instance with nothing queued forgets its baseline, so enabling it again seeds.
+    if (!paused && existing !== undefined && queuedCount === 0) {
+      delete file.instances[instance.id];
+      return true;
+    }
+    return false;
+  }
+  if (deps.now() < backoffUntilMs) return false;
+
+  let review: ReviewRequest | null;
+  try {
+    review = await deps.resolveReviewRequest(instance);
+  } catch {
+    review = null;
+  }
+  // An unknown, stale or missing answer says nothing about the pull request: keep what we had.
+  if (review === null || review.state === "unknown" || review.stale) return false;
+  if (review.state === "none") {
+    setStatus(instance.id, "no-pr", queuedCount);
+    return false;
+  }
+  const repository = parseGithubPull(review);
+  if (repository === null) {
+    setStatus(instance.id, "unsupported", queuedCount);
+    return false;
+  }
+  const { owner, repo } = repository;
+  const prNumber: number = review.number;
+
+  const tokenResult: TokenResult = await deps.resolveToken();
+  if (!("token" in tokenResult)) {
+    setStatus(instance.id, "no-token", queuedCount);
+    return false;
+  }
+  const { token } = tokenResult;
+
+  const pull = (await githubGet(deps, token, `${API_ORIGIN}repos/${owner}/${repo}/pulls/${prNumber}`)).body;
+  if (!isRecord(pull)) throw new GithubFailure();
+  if (pull.state !== "open") {
+    setStatus(instance.id, "no-pr", 0);
+    if (existing !== undefined && existing.queue.length > 0) {
+      existing.queue = [];
+      return true;
+    }
+    return false;
+  }
+  const headSha: unknown = isRecord(pull.head) ? pull.head.sha : undefined;
+  if (typeof headSha !== "string" || !SHA_PATTERN.test(headSha)) throw new GithubFailure();
+
+  const checkRuns: unknown[] = await listAll(
+    deps,
+    token,
+    `${API_ORIGIN}repos/${owner}/${repo}/commits/${headSha}/check-runs?per_page=100`,
+    (body) => (isRecord(body) ? body.check_runs : undefined)
+  );
+  const reviews: unknown[] = await listAll(
+    deps,
+    token,
+    `${API_ORIGIN}repos/${owner}/${repo}/pulls/${prNumber}/reviews?per_page=100`,
+    (body) => body
+  );
+  const ownLogin: string | null = await tokenOwnerLogin(deps, token);
+  const reviewsUsable: boolean = ownLogin !== null;
+  const rules = { owner, repo, prNumber, headSha, ownLogin, botLogins: botLoginsOf(instance) };
+
+  // Everything above can fail without touching state; from here on it is synchronous commits.
+  const isSeed: boolean = existing === undefined || existing.prNumber !== prNumber;
+  if (isSeed) {
+    // Without the owner login the seed still records every review id: over-recording is safe.
+    const seedEvents: PrEvent[] = collectEvents({ checkRuns, reviews }, rules);
+    file.instances[instance.id] = { prNumber, headSha, seen: seedEvents.map((event) => event.id), queue: [] };
+    setStatus(instance.id, "ok", 0);
+    return true;
+  }
+  const events: PrEvent[] = collectEvents({ checkRuns, reviews: reviewsUsable ? reviews : [] }, rules);
+  const seenIds = new Set<string>(existing.seen);
+  const freshEvents: PrEvent[] = events.filter((event) => !seenIds.has(event.id));
+  const heldBackReviewIds: string[] = reviewsUsable ? [] : existing.seen.filter((id) => id.startsWith("review:"));
+  existing.seen = pruneSeenIds([...existing.seen, ...freshEvents.map((event) => event.id)], [
+    ...events.map((event) => event.id),
+    ...heldBackReviewIds,
+  ]);
+  existing.queue = mergeQueue(dropStaleCiEvents(existing.queue, headSha), freshEvents);
+  existing.headSha = headSha;
+  setStatus(instance.id, "ok", existing.queue.length);
+  return true;
+}
+
+export async function pollSweep(deps: PrEventsPollerDeps): Promise<void> {
+  if (pollRunning) return;
+  pollRunning = true;
+  try {
+    const state: DashboardState = await deps.loadState();
+    const file: PrEventsFile = await getFile(deps);
+    let changed = false;
+    const knownIds = new Set<string>(state.instances.map((instance) => instance.id));
+    for (const instanceId of Object.keys(file.instances)) {
+      if (!knownIds.has(instanceId)) {
+        delete file.instances[instanceId];
+        changed = true;
+      }
+    }
+    for (const instanceId of statuses.keys()) {
+      if (!knownIds.has(instanceId)) statuses.delete(instanceId);
+    }
+    for (const instance of state.instances) {
+      try {
+        if (await pollInstance(deps, file, instance)) changed = true;
+      } catch {
+        setStatus(instance.id, "error", file.instances[instance.id]?.queue.length ?? 0);
+      }
+    }
+    if (changed) await persistMemory(deps);
+  } catch {
+    logFixed("poll", "a poll round failed", deps.now());
+  } finally {
+    pollRunning = false;
+  }
+}
+
+async function deliverOne(deps: PrEventsPollerDeps, instanceId: string, tmuxSession: string): Promise<void> {
+  const settleMs: number = deps.settleMs ?? DEFAULT_SETTLE_MS;
+  // Every condition is checked again inside the session lock, right before typing: the state the
+  // sweep started from can be seconds old, and a paste into the wrong moment is not undoable.
+  await deps.withLock(tmuxSession, async () => {
+    const fresh: InstanceRecord | undefined = (await deps.loadState()).instances.find((candidate) => candidate.id === instanceId);
+    if (fresh === undefined || !isPollable(fresh)) return;
+    const entry: PrEventsEntry | undefined = memory?.instances[instanceId];
+    if (entry === undefined || entry.queue.length === 0) return;
+    const agentState: ParsedAgentStateFile | null = await deps.readAgentState(fresh);
+    if (agentState === null) return;
+    const agent: PaneAgent = await deps.probePane(fresh);
+    const clientIdleSeconds: number | null = await deps.clientActivity(fresh.tmuxSession);
+    const allowed: boolean = canDeliver({
+      state: agentState.state,
+      updatedAt: agentState.updatedAt,
+      now: deps.now(),
+      settleMs,
+      shellOnly: fresh.shellOnly === true,
+      provider: fresh.provider,
+      paneMatches: agent.kind === "agent" && agent.provider === "claude" && agent.paneJobPid === agentState.paneJobPid,
+      recentClientActivity: clientIdleSeconds !== null && clientIdleSeconds * 1000 < settleMs,
+    });
+    if (!allowed) return;
+    const batch: PrEvent[] = [...entry.queue];
+    try {
+      await deps.paste(fresh.tmuxSession, formatMessage(entry.prNumber, batch));
+    } catch {
+      logFixed("paste", "could not type into a session, will retry", deps.now());
+      return;
+    }
+    // At most once: a landed paste is final even if Enter failed, and later events stay queued.
+    const deliveredIds = new Set<string>(batch.map((event) => event.id));
+    entry.queue = entry.queue.filter((event) => !deliveredIds.has(event.id));
+    setStatus(instanceId, statuses.get(instanceId)?.status ?? "ok", entry.queue.length);
+    await persistMemory(deps);
+  });
+}
+
+export async function deliverSweep(deps: PrEventsPollerDeps): Promise<void> {
+  if (deliverRunning) return;
+  deliverRunning = true;
+  try {
+    const file: PrEventsFile = await getFile(deps);
+    if (!Object.values(file.instances).some((entry) => entry.queue.length > 0)) return;
+    const state: DashboardState = await deps.loadState();
+    for (const instance of state.instances) {
+      if ((file.instances[instance.id]?.queue.length ?? 0) === 0 || !isPollable(instance)) continue;
+      try {
+        await deliverOne(deps, instance.id, instance.tmuxSession);
+      } catch {
+        logFixed("deliver", "a delivery round failed", deps.now());
+      }
+    }
+  } catch {
+    logFixed("deliver", "a delivery round failed", deps.now());
+  } finally {
+    deliverRunning = false;
+  }
+}
+
+function storeFilePath(): string {
+  return path.join(path.dirname(stateFilePath), "pr-events.json");
+}
+
+async function readStoreFile(): Promise<unknown> {
+  let text: string;
+  try {
+    text = await fs.readFile(storeFilePath(), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function realDeps(): PrEventsPollerDeps {
+  return {
+    now: () => Date.now(),
+    loadState: () => loadState(),
+    loadStore: readStoreFile,
+    persist: (file) => writeStateFileAtomic(storeFilePath(), JSON.stringify(file)),
+    resolveReviewRequest: async (instance) => {
+      const cwd: string = await getPaneCurrentPath(instance.tmuxSession).catch(() => instance.locationPath);
+      const upstream = await branchUpstream(cwd);
+      return upstream === null ? null : reviewRequestFor(cwd, upstream);
+    },
+    fetchGithub: (url, init) => fetch(url, init),
+    resolveToken: () => resolveGithubToken({ env: process.env, run: realTokenRun, now: () => Date.now() }),
+    invalidateToken,
+    readAgentState: async (instance) => {
+      const raw: string | null = await readAgentStateFile(instance.id);
+      return raw === null ? null : parseAgentStateFile(raw);
+    },
+    probePane: probePaneAgent,
+    clientActivity: clientActivitySeconds,
+    paste: pasteToSession,
+    withLock: withSessionLock,
+  };
+}
+
+// index.ts exits the whole process on an unhandled rejection, so the sweeps never reject and the
+// timers are unref'd so they cannot keep the process alive.
+export function startPrEventsPoller(): () => void {
+  const deps: PrEventsPollerDeps = realDeps();
+  const firstPoll = setTimeout(() => void pollSweep(deps), FIRST_POLL_DELAY_MS);
+  const pollTimer = setInterval(() => void pollSweep(deps), POLL_INTERVAL_MS);
+  const deliverTimer = setInterval(() => void deliverSweep(deps), DELIVER_INTERVAL_MS);
+  firstPoll.unref();
+  pollTimer.unref();
+  deliverTimer.unref();
+  return () => {
+    clearTimeout(firstPoll);
+    clearInterval(pollTimer);
+    clearInterval(deliverTimer);
+  };
+}

@@ -106,7 +106,13 @@ vi.mock("./paneAgent", async (importOriginal) => {
   return { ...actual, findPaneAgent: vi.fn(actual.findPaneAgent) };
 });
 
+// The status endpoint must read this in-memory map and nothing else (no token, no network).
+vi.mock("./prEventsPoller", () => ({ getPrEventsStatus: vi.fn(() => ({})) }));
+vi.mock("./githubToken", () => ({ resolveGithubToken: vi.fn(), invalidateToken: vi.fn() }));
+
 import { findPaneAgent } from "./paneAgent";
+import { getPrEventsStatus } from "./prEventsPoller";
+import { resolveGithubToken } from "./githubToken";
 import { loadState, saveState, updateState } from "./store";
 import { pathExists } from "./paths";
 import { initializeInstanceSession } from "./terminal";
@@ -1192,5 +1198,161 @@ describe("GET /instances/agent-states", () => {
 
     expect(response.status).toBeGreaterThanOrEqual(400);
     expect(await fs.readdir(cacheDirectory)).toEqual([]);
+  });
+});
+
+describe("PATCH /instances/:id - prEvents", () => {
+  let committedState: DashboardState;
+
+  const patchPrEvents = (id: string, prEvents: unknown): Promise<Response> =>
+    fetch(`${baseUrl}/instances/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prEvents }),
+    });
+
+  beforeEach(() => {
+    committedState = {
+      ...baseState(),
+      instances: [
+        makeRunningInstance({ id: "aaa111", tmuxSession: "ccdash-aaa111" }),
+        makeRunningInstance({
+          id: "bbb222",
+          label: "second",
+          tmuxSession: "ccdash-bbb222",
+          prEvents: { enabled: true, paused: false },
+        } as Partial<InstanceRecord>),
+      ],
+    } as DashboardState;
+    vi.mocked(loadState).mockImplementation(async () => committedState);
+    vi.mocked(saveState).mockImplementation(async (nextState: DashboardState) => {
+      committedState = nextState;
+    });
+  });
+
+  it("turns delivery on and returns the stored setting", async () => {
+    const response = await patchPrEvents("aaa111", { enabled: true });
+
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as InstanceRecord & { prEvents: { enabled: boolean } }).prEvents.enabled).toBe(true);
+    expect((committedState.instances[0] as InstanceRecord & { prEvents: { enabled: boolean } }).prEvents.enabled).toBe(true);
+  });
+
+  it("merges a partial update and keeps the fields it did not mention", async () => {
+    const response = await patchPrEvents("bbb222", { paused: true });
+
+    expect(response.status).toBe(200);
+    expect((committedState.instances[1] as InstanceRecord & { prEvents: unknown }).prEvents).toMatchObject({
+      enabled: true,
+      paused: true,
+    });
+  });
+
+  it("stores a valid bot list", async () => {
+    const response = await patchPrEvents("aaa111", { enabled: true, botLogins: ["renovate-helper", "ci-bot[bot]"] });
+
+    expect(response.status).toBe(200);
+    expect((committedState.instances[0] as InstanceRecord & { prEvents: { botLogins: string[] } }).prEvents.botLogins).toEqual([
+      "renovate-helper",
+      "ci-bot[bot]",
+    ]);
+  });
+
+  it.each([
+    ["a non-boolean enabled", { enabled: "yes" }],
+    ["a numeric enabled", { enabled: 1 }],
+    ["a non-boolean paused", { paused: "true" }],
+    ["a null paused", { paused: null }],
+    ["botLogins that is not an array", { botLogins: "renovate" }],
+    ["a bot login that is not a string", { botLogins: [5] }],
+    ["a bot login with a space", { botLogins: ["bad name"] }],
+    ["a bot login with a newline", { botLogins: ["bad\nname"] }],
+    ["a bot login that starts with a dash", { botLogins: ["-flag"] }],
+    ["a bot login over 100 characters", { botLogins: ["a".repeat(101)] }],
+    ["more than 20 bot logins", { botLogins: Array.from({ length: 21 }, (_value, index) => `bot${index}`) }],
+  ])("answers 400 and writes nothing for %s", async (_name, prEvents) => {
+    const response = await patchPrEvents("aaa111", prEvents);
+
+    expect(response.status).toBe(400);
+    expect(vi.mocked(updateState)).not.toHaveBeenCalled();
+    expect(vi.mocked(saveState)).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["null", null],
+    ["a string", "on"],
+    ["an array", [true]],
+    ["a number", 1],
+  ])("answers 400 when prEvents is %s", async (_name, prEvents) => {
+    const response = await patchPrEvents("aaa111", prEvents);
+
+    expect(response.status).toBe(400);
+    expect(vi.mocked(saveState)).not.toHaveBeenCalled();
+  });
+
+  it("answers 404 for an unknown instance id", async () => {
+    const response = await patchPrEvents("nope99", { enabled: true });
+
+    expect(response.status).toBe(404);
+    expect(vi.mocked(saveState)).not.toHaveBeenCalled();
+  });
+});
+
+describe("GET /instances/pr-events", () => {
+  beforeEach(() => {
+    vi.mocked(resolveGithubToken).mockReset();
+    vi.mocked(getPrEventsStatus).mockReset();
+    vi.mocked(loadState).mockResolvedValue({
+      ...baseState(),
+      instances: [
+        makeRunningInstance({ id: "aaa111", tmuxSession: "ccdash-aaa111", prEvents: { enabled: true, paused: false } } as Partial<InstanceRecord>),
+        makeRunningInstance({ id: "bbb222", tmuxSession: "ccdash-bbb222", prEvents: { enabled: true, paused: true } } as Partial<InstanceRecord>),
+        makeRunningInstance({ id: "ccc333", tmuxSession: "ccdash-ccc333" }),
+      ],
+    } as DashboardState);
+  });
+
+  it("answers the flags, the pending count and the status per instance", async () => {
+    vi.mocked(getPrEventsStatus).mockReturnValue({
+      aaa111: { status: "ok", pending: 2 },
+      bbb222: { status: "paused", pending: 1 },
+    });
+
+    const response = await fetch(`${baseUrl}/instances/pr-events`);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      aaa111: { enabled: true, paused: false, pending: 2, status: "ok" },
+      bbb222: { enabled: true, paused: true, pending: 1, status: "paused" },
+      ccc333: { enabled: false, paused: false, pending: 0, status: "off" },
+    });
+  });
+
+  it.each(["ok", "off", "paused", "no-token", "no-pr", "unsupported", "error"] as const)("passes the %s status through", async (status) => {
+    vi.mocked(getPrEventsStatus).mockReturnValue({ aaa111: { status, pending: 0 } });
+
+    const body = (await (await fetch(`${baseUrl}/instances/pr-events`)).json()) as Record<string, { status: string }>;
+
+    expect(body.aaa111.status).toBe(status);
+  });
+
+  it("exposes counts and status only: no urls, no events, no token", async () => {
+    vi.mocked(getPrEventsStatus).mockReturnValue({
+      aaa111: { status: "ok", pending: 2, queue: [{ link: "https://github.com/acme/widgets/runs/1" }], token: "ghp_FAKE" } as never,
+    });
+
+    const text: string = await (await fetch(`${baseUrl}/instances/pr-events`)).text();
+
+    expect(text).not.toContain("github.com");
+    expect(text).not.toContain("ghp_");
+    expect(Object.keys((JSON.parse(text) as Record<string, object>).aaa111).sort()).toEqual(["enabled", "paused", "pending", "status"]);
+  });
+
+  it("does no token resolution", async () => {
+    vi.mocked(getPrEventsStatus).mockReturnValue({});
+
+    await fetch(`${baseUrl}/instances/pr-events`);
+
+    expect(resolveGithubToken).not.toHaveBeenCalled();
   });
 });

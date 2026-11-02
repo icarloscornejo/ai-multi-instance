@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -296,6 +297,46 @@ export async function sendCommandToSession(sessionName: string, command: string)
   // "-l" sends the text literally (without interpreting key names); Enter is sent separately
   await runTmux(["send-keys", "-t", sessionName, "-l", command]);
   await runTmux(["send-keys", "-t", sessionName, "Enter"]);
+}
+
+const MAX_PASTE_BYTES = 4000;
+const ENTER_DELAY_MS = 200;
+
+// Bracketed paste through a named buffer, so the text is data and never keystrokes or shell.
+// A failed tmux call is replaced by a fixed message: tmux echoes the argv, which holds the text.
+// Once the paste landed it counts as delivered even if Enter fails, so callers never repeat it.
+export async function pasteToSession(sessionName: string, text: string): Promise<{ submitted: boolean }> {
+  if (text.includes("\u001b")) throw new TmuxError("Refusing to paste text with an escape character");
+  if (Buffer.byteLength(text, "utf8") > MAX_PASTE_BYTES) throw new TmuxError("Refusing to paste text over the size limit");
+  // tmux treats an argv element ending in a semicolon as a command separator.
+  if (text.trimEnd().endsWith(";")) throw new TmuxError("Refusing to paste text ending in a semicolon");
+  const bufferName = `ccdash-pr-${randomBytes(8).toString("hex")}`;
+  try {
+    await runTmux(["set-buffer", "-b", bufferName, "--", text]);
+    await runTmux(["paste-buffer", "-p", "-d", "-b", bufferName, "-t", sessionName]);
+  } catch {
+    await runTmux(["delete-buffer", "-b", bufferName]).catch(() => undefined);
+    throw new TmuxError("Could not paste into the tmux session");
+  }
+  await new Promise<void>((resolve) => setTimeout(resolve, ENTER_DELAY_MS));
+  try {
+    await runTmux(["send-keys", "-t", sessionName, "Enter"]);
+    return { submitted: true };
+  } catch {
+    return { submitted: false };
+  }
+}
+
+// Seconds since the newest keystroke of any client attached to the session, null when none.
+export async function clientActivitySeconds(sessionName: string): Promise<number | null> {
+  const output: string = await runTmux(["list-clients", "-t", sessionName, "-F", "#{client_activity}"]);
+  const activityEpochs: number[] = output
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /^\d+$/.test(line))
+    .map(Number);
+  if (activityEpochs.length === 0) return null;
+  return Math.max(0, Math.floor(Date.now() / 1000) - Math.max(...activityEpochs));
 }
 
 // Hands a value to the session through tmux's own environment instead of typing it into the

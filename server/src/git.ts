@@ -43,7 +43,7 @@ export const NETWORK_GIT_TIMEOUT_MS = 120_000;
 // An existing GIT_SSH_COMMAND in the environment wins: the user may have configured a specific
 // ssh wrapper (a jump host, a custom identity) and we must not silently override that. We only
 // supply the default when nothing is set.
-function hardenedGitEnv(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+export function hardenedGitEnv(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   return {
     ...baseEnv,
     GIT_TERMINAL_PROMPT: "0",

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } f
 import { api } from "../api";
 import type { AgentState, Instance } from "../types";
 import { agentStateLabel, agentStateTone } from "../agentState";
+import { prEventsBadgeText } from "../prEvents";
 import { worktreeLabel } from "../worktreeLabel";
 
 const PROVIDER_LABELS = {
@@ -21,12 +22,14 @@ interface InstanceCardProps {
   // persistent tab selection the way desktop does.
   isFirst: boolean;
   agentState?: AgentState;
+  prEventsPending?: number;
   onOpen: () => void;
   onLongPress: () => void;
 }
 
-export function InstanceCard({ instance, isFirst, agentState, onOpen, onLongPress }: InstanceCardProps) {
+export function InstanceCard({ instance, isFirst, agentState, prEventsPending, onOpen, onLongPress }: InstanceCardProps) {
   const worktreeInfo = worktreeLabel(instance);
+  const prBadge: string | null = prEventsBadgeText(prEventsPending);
   const [branch, setBranch] = useState<string | null>(null);
   const pressTimerRef = useRef<number | null>(null);
   const pressStartRef = useRef<{ x: number; y: number } | null>(null);
@@ -105,6 +108,11 @@ export function InstanceCard({ instance, isFirst, agentState, onOpen, onLongPres
           {worktreeInfo !== null && <span className="text-[11px] text-txt-dim">Worktree of {worktreeInfo.sourceName}</span>}
         </div>
       </div>
+      {prBadge !== null && (
+        <span title="GitHub updates waiting for the agent" className="shrink-0 rounded-sm border border-accent-border px-[5px] py-[1px] text-[10px] font-semibold text-txt-secondary">
+          PR {prBadge}
+        </span>
+      )}
       {agentState !== undefined && (
         <span className={`shrink-0 text-[11px] font-semibold ${agentStateTone(agentState)}`}>{agentStateLabel(agentState)}</span>
       )}

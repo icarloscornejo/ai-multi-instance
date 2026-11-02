@@ -15,7 +15,8 @@ import {
 } from "@dnd-kit/sortable";
 import { restrictToVerticalAxis } from "@dnd-kit/modifiers";
 import { CSS } from "@dnd-kit/utilities";
-import type { AgentState, Instance, UpdateStatus } from "../types";
+import type { AgentState, Instance, PrEventsResponse, UpdateStatus } from "../types";
+import { prEventsBadgeText } from "../prEvents";
 import { agentStateLabel, agentStateTone } from "../agentState";
 import type { Theme } from "../theme";
 import { getHostRailWidth, setHostRailWidth } from "../hostPrefs";
@@ -35,6 +36,7 @@ interface InstanceRailProps {
   instances: Instance[];
   activeInstanceId: string | null;
   agentStates: Record<string, AgentState>;
+  prEvents?: PrEventsResponse;
   updateStatus: UpdateStatus | null;
   updateRequired: boolean;
   countdownMs: number;
@@ -59,6 +61,7 @@ interface RailRowProps {
   instance: Instance;
   isActive: boolean;
   agentState: AgentState | undefined;
+  prEventsPending: number | undefined;
   isEditing: boolean;
   draftLabel: string;
   editInputRef: RefObject<HTMLInputElement>;
@@ -74,6 +77,7 @@ function RailRow({
   instance,
   isActive,
   agentState,
+  prEventsPending,
   isEditing,
   draftLabel,
   editInputRef,
@@ -136,6 +140,11 @@ function RailRow({
           {instance.label}
         </span>
       )}
+      {!isEditing && prEventsBadgeText(prEventsPending) !== null && (
+        <span title="GitHub updates waiting for the agent" className="shrink-0 rounded-sm border border-accent-border px-[4px] text-[10px] font-semibold text-txt-secondary">
+          PR {prEventsBadgeText(prEventsPending)}
+        </span>
+      )}
       {!isEditing && agentState !== undefined && (
         <span className={`shrink-0 text-[10px] font-semibold uppercase tracking-[.04em] ${agentStateTone(agentState)}`}>
           {agentStateLabel(agentState)}
@@ -162,6 +171,7 @@ export function InstanceRail({
   instances,
   activeInstanceId,
   agentStates,
+  prEvents,
   updateStatus,
   updateRequired,
   countdownMs,
@@ -333,6 +343,7 @@ export function InstanceRail({
                 instance={instance}
                 isActive={instance.id === activeInstanceId}
                 agentState={agentStates[instance.id]}
+                prEventsPending={prEvents?.[instance.id]?.pending}
                 isEditing={editingInstanceId === instance.id}
                 draftLabel={draftLabel}
                 editInputRef={editInputRef}

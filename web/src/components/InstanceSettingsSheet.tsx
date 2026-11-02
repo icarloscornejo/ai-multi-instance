@@ -7,9 +7,10 @@ import {
   formatCompactNumber,
   usagePctColorClass,
 } from "../liveStatusFormatting";
-import type { Instance, UpdateInstancePayload } from "../types";
+import type { Instance, PrEventsResponse, UpdateInstancePayload } from "../types";
 import { BottomSheet } from "./BottomSheet";
 import { BranchGitLine } from "./BranchGitLine";
+import { PrEventsControl } from "./PrEventsControl";
 import { worktreeLabel } from "../worktreeLabel";
 
 interface InstanceSettingsSheetProps {
@@ -17,6 +18,7 @@ interface InstanceSettingsSheetProps {
   onUpdate: (instanceId: string, payload: UpdateInstancePayload) => void;
   onDeleteRequest: (instance: Instance) => void;
   onClose: () => void;
+  prEventsInfo?: PrEventsResponse[string];
 }
 
 function Field({ label, children }: { label: string; children: ReactNode }) {
@@ -28,7 +30,7 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
-export function InstanceSettingsSheet({ instance, onUpdate, onDeleteRequest, onClose }: InstanceSettingsSheetProps) {
+export function InstanceSettingsSheet({ instance, onUpdate, onDeleteRequest, onClose, prEventsInfo }: InstanceSettingsSheetProps) {
   const worktreeInfo = worktreeLabel(instance);
   const [labelDraft, setLabelDraft] = useState<string>(instance.label);
   const [commandDraft, setCommandDraft] = useState<string>(instance.command);
@@ -94,6 +96,10 @@ export function InstanceSettingsSheet({ instance, onUpdate, onDeleteRequest, onC
               })
             }
           />
+        </Field>
+
+        <Field label="GitHub updates">
+          <PrEventsControl instance={instance} info={prEventsInfo} onUpdate={onUpdate} sizeClass="text-[12.5px]" />
         </Field>
 
         {branch !== undefined && (

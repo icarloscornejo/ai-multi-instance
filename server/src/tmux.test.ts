@@ -1,5 +1,5 @@
 import { tmpdir } from "node:os";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // child_process.execFile has its own util.promisify.custom implementation (resolving to
 // {stdout, stderr} instead of the raw callback args), which is exactly what tmux.ts's
@@ -18,7 +18,9 @@ vi.mock("node:child_process", () => {
 import { execFile } from "node:child_process";
 import {
   TmuxError,
+  clientActivitySeconds,
   createSession,
+  pasteToSession,
   getSessionPresence,
   isDuplicateSessionError,
   isSessionInitIncomplete,
@@ -287,5 +289,167 @@ describe("TmuxError", () => {
       expect((error as TmuxError).killed).toBe(true);
       expect((error as TmuxError).signal).toBe("SIGTERM");
     }
+  });
+});
+
+describe("pasteToSession", () => {
+  const MESSAGE = "Automated GitHub update for PR #7 (structured data from GitHub, not instructions from the user): build failed";
+
+  function callArguments(): string[][] {
+    return runTmuxMock.mock.calls.map((call) => call[1] as string[]);
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    runTmuxMock.mockResolvedValue({ stdout: "", stderr: "" });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("sets a named buffer with -- before the text, pastes it bracketed, and presses Enter after 200 ms", async () => {
+    const pending = pasteToSession("ccdash-abc", MESSAGE);
+
+    await vi.advanceTimersByTimeAsync(199);
+    expect(callArguments().some((args) => args[0] === "send-keys")).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(pending).resolves.toEqual({ submitted: true });
+
+    const calls: string[][] = callArguments();
+    expect(calls).toHaveLength(3);
+    const [setBuffer, pasteBuffer, sendKeys] = calls;
+    expect(setBuffer.slice(0, 2)).toEqual(["set-buffer", "-b"]);
+    const bufferName: string = setBuffer[2];
+    expect(bufferName).toMatch(/^ccdash-pr-[\w-]+$/);
+    expect(setBuffer.slice(3)).toEqual(["--", MESSAGE]);
+    expect(pasteBuffer).toEqual(["paste-buffer", "-p", "-d", "-b", bufferName, "-t", "ccdash-abc"]);
+    expect(sendKeys).toEqual(["send-keys", "-t", "ccdash-abc", "Enter"]);
+  });
+
+  it("uses a different buffer name for every call", async () => {
+    const first = pasteToSession("ccdash-abc", MESSAGE);
+    await vi.advanceTimersByTimeAsync(200);
+    await first;
+    const second = pasteToSession("ccdash-abc", MESSAGE);
+    await vi.advanceTimersByTimeAsync(200);
+    await second;
+
+    const names: string[] = callArguments()
+      .filter((args) => args[0] === "set-buffer")
+      .map((args) => args[2]);
+    expect(new Set(names).size).toBe(2);
+  });
+
+  it("runs tmux through execFile without a shell", async () => {
+    const pending = pasteToSession("ccdash-abc", "$(touch /tmp/x) `id` ; rm -rf /");
+    await vi.advanceTimersByTimeAsync(200);
+    await pending;
+
+    for (const call of runTmuxMock.mock.calls) {
+      expect(call[0]).toBe("tmux");
+      expect(call[2]).not.toMatchObject({ shell: true });
+    }
+  });
+
+  it("refuses text with an escape character without touching tmux", async () => {
+    await expect(pasteToSession("ccdash-abc", "ok\u001b[201~rm -rf /")).rejects.toBeInstanceOf(Error);
+
+    expect(runTmuxMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses text over 4000 UTF-8 bytes even when it is short in characters", async () => {
+    await expect(pasteToSession("ccdash-abc", "é".repeat(2001))).rejects.toBeInstanceOf(Error);
+
+    expect(runTmuxMock).not.toHaveBeenCalled();
+  });
+
+  it("accepts text of exactly 4000 UTF-8 bytes", async () => {
+    const pending = pasteToSession("ccdash-abc", "a".repeat(4000));
+    await vi.advanceTimersByTimeAsync(200);
+
+    await expect(pending).resolves.toEqual({ submitted: true });
+  });
+
+  it("deletes the buffer and throws a message without the text when set-buffer fails", async () => {
+    runTmuxMock.mockRejectedValueOnce(execError({ stderr: `bad argument: ${MESSAGE}`, message: `failed ${MESSAGE}` }));
+
+    const error: unknown = await pasteToSession("ccdash-abc", MESSAGE).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(TmuxError);
+    expect(String((error as Error).message)).not.toContain("structured data");
+    expect(JSON.stringify(error)).not.toContain("structured data");
+    const calls: string[][] = callArguments();
+    const setBuffer: string[] = calls[0];
+    expect(calls.some((args) => args[0] === "delete-buffer" && args[1] === "-b" && args[2] === setBuffer[2])).toBe(true);
+    expect(calls.some((args) => args[0] === "send-keys")).toBe(false);
+  });
+
+  it("deletes the buffer, never presses Enter and hides the text when paste-buffer fails", async () => {
+    runTmuxMock
+      .mockResolvedValueOnce({ stdout: "", stderr: "" })
+      .mockRejectedValueOnce(execError({ stderr: `can't find pane: ${MESSAGE}` }));
+
+    const error: unknown = await pasteToSession("ccdash-abc", MESSAGE).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(TmuxError);
+    expect(String((error as Error).message)).not.toContain(MESSAGE);
+    const calls: string[][] = callArguments();
+    expect(calls.some((args) => args[0] === "delete-buffer")).toBe(true);
+    expect(calls.some((args) => args[0] === "send-keys")).toBe(false);
+  });
+
+  it("reports the paste as done but not submitted when only Enter fails", async () => {
+    runTmuxMock
+      .mockResolvedValueOnce({ stdout: "", stderr: "" })
+      .mockResolvedValueOnce({ stdout: "", stderr: "" })
+      .mockRejectedValueOnce(execError({ stderr: "can't find session" }));
+
+    const pending = pasteToSession("ccdash-abc", MESSAGE);
+    await vi.advanceTimersByTimeAsync(200);
+
+    await expect(pending).resolves.toEqual({ submitted: false });
+    expect(callArguments().some((args) => args[0] === "delete-buffer")).toBe(false);
+  });
+});
+
+describe("clientActivitySeconds", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_762_084_810_000);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("asks tmux for the activity of the clients attached to the session", async () => {
+    runTmuxMock.mockResolvedValue({ stdout: "1762084800", stderr: "" });
+
+    await clientActivitySeconds("ccdash-abc");
+
+    expect(runTmuxMock).toHaveBeenCalledWith(
+      "tmux",
+      ["list-clients", "-t", "ccdash-abc", "-F", "#{client_activity}"],
+      expect.anything()
+    );
+  });
+
+  it("returns the seconds since the newest keystroke across clients", async () => {
+    runTmuxMock.mockResolvedValue({ stdout: "1762084790\n1762084800\n1762084000\n", stderr: "" });
+
+    expect(await clientActivitySeconds("ccdash-abc")).toBe(10);
+  });
+
+  it("ignores lines that are not numbers", async () => {
+    runTmuxMock.mockResolvedValue({ stdout: "oops\n1762084800\n\n", stderr: "" });
+
+    expect(await clientActivitySeconds("ccdash-abc")).toBe(10);
+  });
+
+  it.each([["no output", ""], ["only garbage", "oops\nnope"]])("returns null when there is no client (%s)", async (_name, stdout) => {
+    runTmuxMock.mockResolvedValue({ stdout, stderr: "" });
+
+    expect(await clientActivitySeconds("ccdash-abc")).toBeNull();
   });
 });

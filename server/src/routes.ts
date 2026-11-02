@@ -45,8 +45,9 @@ import {
   type PersistableSession,
   type Snapshot,
 } from "./liveStatus";
-import { findPaneAgent, type PaneAgent } from "./paneAgent";
-import { resolveAgentStates } from "./agentState";
+import type { PaneAgent } from "./paneAgent";
+import { probePaneAgent, readAgentStateFile, resolveAgentStates } from "./agentState";
+import { getPrEventsStatus } from "./prEventsPoller";
 import { LaunchProgress } from "./launchProgress";
 import { initializeInstanceSession } from "./terminal";
 import { withSessionLock } from "./sessionLock";
@@ -274,14 +275,6 @@ async function readInstanceSnapshot(instance: InstanceRecord): Promise<Snapshot 
     // hasn't redrawn its statusline here since this dashboard instance was launched)
     return null;
   }
-}
-
-// What the instance's pane is running right now. A custom command is whatever the user typed:
-// "no known agent" says nothing about it, so unless a known agent is actually found there it is
-// served from its snapshot like before instead of being reported as not running.
-async function probePaneAgent(instance: InstanceRecord): Promise<PaneAgent> {
-  const found: PaneAgent = await findPaneAgent(instance.tmuxSession);
-  return instance.provider === "custom" && found.kind !== "agent" ? { kind: "unknown" } : found;
 }
 
 async function readLiveSession(instance: InstanceRecord): Promise<PersistableSession | null> {
@@ -791,20 +784,27 @@ apiRouter.get(
   "/instances/agent-states",
   wrapAsync(async (_request, response) => {
     const state: DashboardState = await loadState();
-    const stateDirectory: string = snapshotDirectory();
-    response.json(
-      await resolveAgentStates(state.instances, {
-        // A missing file is the normal "no state yet"; anything else is a real fault worth a log line.
-        readState: (instanceId: string) =>
-          fs.readFile(path.join(stateDirectory, `${instanceId}.state.json`), "utf8").catch((error: NodeJS.ErrnoException) => {
-            if (error.code !== "ENOENT") {
-              console.error(`[server] could not read the agent state of ${instanceId}: ${error.message}`);
-            }
-            return null;
-          }),
-        findAgent: probePaneAgent,
-      })
-    );
+    response.json(await resolveAgentStates(state.instances, { readState: readAgentStateFile, findAgent: probePaneAgent }));
+  })
+);
+
+// Reads only the in-memory status the poller keeps: no token lookup and no network here, so the
+// phone polling this can never cost a GitHub call.
+apiRouter.get(
+  "/instances/pr-events",
+  wrapAsync(async (_request, response) => {
+    const state: DashboardState = await loadState();
+    const statuses = getPrEventsStatus();
+    const body: Record<string, { enabled: boolean; paused: boolean; pending: number; status: string }> = {};
+    for (const instance of state.instances) {
+      body[instance.id] = {
+        enabled: instance.prEvents?.enabled === true,
+        paused: instance.prEvents?.paused === true,
+        pending: statuses[instance.id]?.pending ?? 0,
+        status: statuses[instance.id]?.status ?? "off",
+      };
+    }
+    response.json(body);
   })
 );
 
@@ -1206,10 +1206,38 @@ apiRouter.put(
   })
 );
 
+const BOT_LOGIN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9\-_.[\]]{0,99}$/;
+
+function parsePrEventsUpdate(raw: unknown): Partial<NonNullable<InstanceRecord["prEvents"]>> | null {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const { enabled, paused, botLogins } = raw as Record<string, unknown>;
+  const update: Partial<NonNullable<InstanceRecord["prEvents"]>> = {};
+  if (enabled !== undefined) {
+    if (typeof enabled !== "boolean") return null;
+    update.enabled = enabled;
+  }
+  if (paused !== undefined) {
+    if (typeof paused !== "boolean") return null;
+    update.paused = paused;
+  }
+  if (botLogins !== undefined) {
+    if (!Array.isArray(botLogins) || botLogins.length > 20) return null;
+    if (!botLogins.every((login) => typeof login === "string" && BOT_LOGIN_PATTERN.test(login))) return null;
+    update.botLogins = botLogins as string[];
+  }
+  return update;
+}
+
 apiRouter.patch(
   "/instances/:id",
   wrapAsync(async (request, response) => {
     const payload = request.body as UpdateInstancePayload;
+    // Validated before any write: the bot list later decides whose reviews are ignored.
+    const prEventsUpdate = payload.prEvents === undefined ? null : parsePrEventsUpdate(payload.prEvents);
+    if (payload.prEvents !== undefined && prEventsUpdate === null) {
+      response.status(400).json({ error: "prEvents must be {enabled?, paused?, botLogins?} with booleans and up to 20 valid logins." });
+      return;
+    }
     // Lookup, name-collision check and mutation all run inside updateState so they see the
     // latest committed instances (a concurrent delete/rename from another device included).
     const outcome = await updateState<
@@ -1244,6 +1272,9 @@ apiRouter.patch(
       if (payload.effort !== undefined) {
         instance.effort =
           typeof payload.effort === "string" && payload.effort.trim() !== "" ? payload.effort.trim() : null;
+      }
+      if (prEventsUpdate !== null) {
+        instance.prEvents = { enabled: false, paused: false, ...instance.prEvents, ...prEventsUpdate };
       }
       return { result: { instance }, nextState: draft };
     });

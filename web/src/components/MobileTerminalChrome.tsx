@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { Instance, UpdateInstancePayload } from "../types";
+import type { Instance, PrEventsResponse, UpdateInstancePayload } from "../types";
 import { ActionSheet } from "./ActionSheet";
 import { BottomSheet } from "./BottomSheet";
 import { InstanceSettingsSheet } from "./InstanceSettingsSheet";
@@ -12,6 +12,7 @@ interface MobileTerminalChromeProps {
   onNewInstance: () => void;
   onUpdate: (instanceId: string, payload: UpdateInstancePayload) => void;
   onCloseRequest: (instance: Instance) => void;
+  prEventsInfo?: PrEventsResponse[string];
 }
 
 export function MobileTerminalChrome({
@@ -22,6 +23,7 @@ export function MobileTerminalChrome({
   onNewInstance,
   onUpdate,
   onCloseRequest,
+  prEventsInfo,
 }: MobileTerminalChromeProps) {
   const [switcherOpen, setSwitcherOpen] = useState<boolean>(false);
   const [overflowOpen, setOverflowOpen] = useState<boolean>(false);
@@ -119,6 +121,7 @@ export function MobileTerminalChrome({
           onUpdate={onUpdate}
           onDeleteRequest={onCloseRequest}
           onClose={() => setSettingsOpen(false)}
+          prEventsInfo={prEventsInfo}
         />
       )}
     </>

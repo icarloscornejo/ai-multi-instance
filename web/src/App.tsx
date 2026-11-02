@@ -18,6 +18,7 @@ import { UpdateScreen } from "./components/UpdateScreen";
 import { useIsMobile } from "./hooks/useIsMobile";
 import { useLiveStatus } from "./hooks/useLiveStatus";
 import { useAgentStates } from "./hooks/useAgentStates";
+import { usePrEvents } from "./hooks/usePrEvents";
 import { useVisualViewport } from "./hooks/useVisualViewport";
 import { useWakeLock } from "./hooks/useWakeLock";
 import { useWakeRetry } from "./hooks/useWakeRetry";
@@ -154,6 +155,7 @@ export function App() {
   );
 
   const agentStates = useAgentStates(instancesLoaded);
+  const prEvents = usePrEvents(instancesLoaded);
 
   const updateRequired: boolean =
     updateStatus?.requiredUpdate === true && updateStatus.updateAvailable === true;
@@ -702,6 +704,7 @@ export function App() {
           onNewInstance={() => setIsNewInstanceModalOpen(true)}
           onUpdate={updateInstance}
           onCloseRequest={setDeleteRequest}
+          prEventsInfo={prEvents[activeInstance.id]}
         />
       )}
 
@@ -714,6 +717,7 @@ export function App() {
             instances={instances}
             activeInstanceId={activeInstanceId}
             agentStates={agentStates}
+            prEvents={prEvents}
             updateStatus={updateStatus}
             updateRequired={updateRequired}
             countdownMs={countdownMs}
@@ -776,6 +780,7 @@ export function App() {
                 <MobileHome
                   instances={instances}
                   agentStates={agentStates}
+                  prEvents={prEvents}
                   onOpenInstance={enterMobileTerminal}
                   onNewInstance={() => setIsNewInstanceModalOpen(true)}
                   onSettingsClick={() => setSettingsOpen(true)}
@@ -793,6 +798,7 @@ export function App() {
             gitBranch={activeGitBranch}
             onUpdate={updateInstance}
             onDeleteRequest={setDeleteRequest}
+            prEventsInfo={prEvents[activeInstance.id]}
           />
         )}
       </div>
@@ -845,5 +851,8 @@ function normalizePayload(instance: Instance, payload: UpdateInstancePayload): P
   if (payload.command !== undefined) normalized.command = payload.command;
   if (payload.model !== undefined) normalized.model = payload.model;
   if (payload.effort !== undefined) normalized.effort = payload.effort;
+  if (payload.prEvents !== undefined) {
+    normalized.prEvents = { enabled: false, paused: false, ...instance.prEvents, ...payload.prEvents };
+  }
   return normalized;
 }

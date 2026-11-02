@@ -25,6 +25,14 @@ export interface InstanceRecord {
   // Set when locationPath is a sibling git worktree made because the source folder already had a
   // live session. `created` is false for a worktree that already existed: it is never auto-removed.
   worktree?: { sourcePath: string; branch: string; created: boolean };
+  // Opt-in delivery of GitHub PR updates into the agent session. Absent means off.
+  prEvents?: PrEventsSetting;
+}
+
+export interface PrEventsSetting {
+  enabled: boolean;
+  paused: boolean;
+  botLogins?: string[];
 }
 
 export interface DashboardState {
@@ -73,4 +81,5 @@ export interface UpdateInstancePayload {
   command?: string;
   model?: string | null;
   effort?: string | null;
+  prEvents?: Partial<PrEventsSetting>;
 }
