@@ -2,6 +2,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
+import { api } from "../api";
 import { useIsMobile } from "../hooks/useIsMobile";
 import { useWakeRetry } from "../hooks/useWakeRetry";
 import { FONT_SIZE_CHANGE_EVENT, getHostFontSize, setHostFontSize } from "../hostPrefs";
@@ -15,8 +16,11 @@ import {
   releaseWebglContexts,
   shouldHoldWebgl,
 } from "../terminalPaint";
+import { decodeOsc52Payload } from "../osc52";
+import { pickPastedImage } from "../pastedImage";
 import { btnGhost } from "../ui";
 import { RetryRing } from "./RetryRing";
+import { copyText } from "./Sidebar";
 import type { Instance } from "../types";
 import type { Theme } from "../theme";
 
@@ -564,7 +568,9 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       // tmux itself no longer claims the mouse (see disableTmuxMouseAndAltScreen in
       // server/src/tmux.ts), but an app running inside the pane still can (Claude Code's own
       // fullscreen TUI, vim, ...) and normal click-drag is then captured by that app; holding
-      // Option forces xterm's native selection for copying regardless.
+      // Option forces xterm's native selection for copying regardless. Option is no longer
+      // needed just to get Claude Code's own selection onto this browser's clipboard: that
+      // arrives as OSC 52 and is handled below.
       macOptionClickForcesSelection: true,
       // Option+click by default "moves the cursor" by sending arrow keys to the pty;
       // Claude Code interprets up-arrows as history and fills the input with
@@ -574,6 +580,83 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     const fitAddon = new FitAddon();
     terminal.loadAddon(fitAddon);
     terminal.open(container);
+
+    // Claude Code copies its own selection with `tmux load-buffer -w`, which tmux forwards to
+    // the outer terminal (this one) as OSC 52; without a handler xterm drops it, and the
+    // alternative (pbcopy) writes to the clipboard of the machine the pane runs on, not the
+    // one this browser is on. terminal.dispose() below releases the handler.
+    //
+    // Over plain http:// the only copy path is execCommand, which Chrome allows for ~5 s after
+    // the last mousedown/keydown (counted from the press, not the release). A long drag-select
+    // can outlive that, so a refused copy is kept and retried on the next mousedown/keydown,
+    // which reopens the window.
+    let pendingClipboardText: string | null = null;
+    terminal.parser.registerOscHandler(52, (payload: string): boolean => {
+      // Every instance stays mounted; a hidden session must not overwrite the clipboard or
+      // pull focus away from the visible one.
+      if (!visibleRef.current) {
+        return true;
+      }
+      const textToCopy: string | null = decodeOsc52Payload(payload);
+      if (textToCopy === null) {
+        return true;
+      }
+      copyText(textToCopy).then(
+        (copied: boolean) => {
+          pendingClipboardText = copied ? null : textToCopy;
+        },
+        (error: unknown) => {
+          console.error("Copying the terminal selection failed", error);
+        }
+      );
+      return true;
+    });
+    const retryPendingClipboardCopy = (): void => {
+      const textToCopy: string | null = pendingClipboardText;
+      if (textToCopy === null) {
+        return;
+      }
+      // Cleared before retrying so a copy that is refused again is dropped, not retried forever
+      pendingClipboardText = null;
+      copyText(textToCopy).catch((error: unknown) => {
+        console.error("Retrying the terminal selection copy failed", error);
+      });
+    };
+    container.addEventListener("mousedown", retryPendingClipboardCopy, true);
+    container.addEventListener("keydown", retryPendingClipboardCopy, true);
+
+    // The agent reads a pasted image from the clipboard of the machine it runs on, which is not
+    // this browser's when the dashboard is opened from another machine; xterm only forwards text
+    // and drops the image. Upload it and paste the saved file's path instead: the agent turns a
+    // pasted image path into an attachment, same as dragging a file onto the terminal.
+    let tornDown = false;
+    const handlePaste = (event: ClipboardEvent): void => {
+      const clipboardData: DataTransfer | null = event.clipboardData;
+      if (clipboardData === null) {
+        return;
+      }
+      const pastedImage: File | null = pickPastedImage(
+        Array.from(clipboardData.files),
+        clipboardData.getData("text/plain")
+      );
+      if (pastedImage === null) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      api.uploadPastedImage(pastedImage).then(
+        ({ path: savedPath }: { path: string }) => {
+          if (!tornDown) {
+            terminal.paste(`${savedPath} `);
+          }
+        },
+        (error: unknown) => {
+          console.error("Uploading the pasted image failed", error);
+        }
+      );
+    };
+    container.addEventListener("paste", handlePaste, true);
+
     terminalRef.current = terminal;
     fitAddonRef.current = fitAddon;
     liveTerminals.add(terminal);
@@ -981,6 +1064,10 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
 
     return () => {
       resizeObserver.disconnect();
+      container.removeEventListener("mousedown", retryPendingClipboardCopy, true);
+      container.removeEventListener("keydown", retryPendingClipboardCopy, true);
+      container.removeEventListener("paste", handlePaste, true);
+      tornDown = true;
       viewportElement?.removeEventListener("scroll", handleViewportScroll);
       container.removeEventListener("touchstart", handleTouchStart);
       container.removeEventListener("touchmove", handleTouchMove);

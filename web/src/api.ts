@@ -68,6 +68,11 @@ export const api = {
 
   listInstances: (signal?: AbortSignal): Promise<Instance[]> => requestJson("/api/instances", { signal }),
 
+  // Raw bytes with the image's own content type (not JSON): requestJson's default header is
+  // replaced because options.headers wins over it
+  uploadPastedImage: (image: Blob): Promise<{ path: string }> =>
+    requestJson("/api/pasted-images", { method: "POST", headers: { "Content-Type": image.type }, body: image }),
+
   getInstanceGit: (instanceId: string): Promise<{ cwd: string; branch?: string }> =>
     requestJson(`/api/instances/${instanceId}/git`),
 

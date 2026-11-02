@@ -46,15 +46,21 @@ function Eyebrow({ children }: { children: string }) {
 // navigator.clipboard requires a secure context (https, or the special-cased
 // "localhost"/127.0.0.1 hosts): it silently throws on plain http://ai.local even
 // though that resolves to loopback, so fall back to the legacy execCommand copy there.
-export async function copyText(value: string): Promise<void> {
+// Resolves to whether the copy actually happened: execCommand returns false (instead of
+// throwing) when the browser refuses it for lack of a recent user gesture, and callers that
+// copy on behalf of a program (the terminal's OSC 52 handler) need to know so they can retry.
+export async function copyText(value: string): Promise<boolean> {
   if (window.isSecureContext) {
     try {
       await navigator.clipboard.writeText(value);
-      return;
+      return true;
     } catch {
       // fall through to the legacy fallback below
     }
   }
+  // The temporary textarea takes focus; give it back afterwards so copying on behalf of the
+  // terminal does not leave the user typing into <body>.
+  const previouslyFocusedElement: Element | null = document.activeElement;
   const textarea = document.createElement("textarea");
   textarea.value = value;
   textarea.style.position = "fixed";
@@ -63,9 +69,12 @@ export async function copyText(value: string): Promise<void> {
   textarea.focus();
   textarea.select();
   try {
-    document.execCommand("copy");
+    return document.execCommand("copy");
   } finally {
     document.body.removeChild(textarea);
+    if (previouslyFocusedElement instanceof HTMLElement) {
+      previouslyFocusedElement.focus();
+    }
   }
 }
 

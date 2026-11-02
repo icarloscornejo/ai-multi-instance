@@ -21,6 +21,7 @@ import {
 import { clearAgentReadiness, getReadyChannel } from "./agentReadiness";
 import { isAgentProvider, PROVIDERS, sessionKeyFor } from "./providers";
 import { pathExists } from "./paths";
+import { PASTED_IMAGE_EXTENSIONS, savePastedImage } from "./pastedImages";
 import { loadState, updateState } from "./store";
 import { getPaneCurrentPath, getSessionPresence, killSession, signalChannel } from "./tmux";
 import { branchUpstream, currentBranch, isRemoteUnreachableError, NETWORK_GIT_TIMEOUT_MS, runGit, type BranchUpstream } from "./git";
@@ -54,6 +55,10 @@ import type {
 
 const DEFAULT_FONT_SIZE = 13;
 
+const PASTED_IMAGE_TYPES: string[] = Object.keys(PASTED_IMAGE_EXTENSIONS);
+const PASTED_IMAGE_DIRECTORY: string = path.resolve(import.meta.dirname, "../../data/pasted-images");
+const parsePastedImageBytes = express.raw({ type: PASTED_IMAGE_TYPES, limit: "20mb" });
+
 type AsyncHandler = (request: Request, response: Response) => Promise<void>;
 
 // Express 4 no propaga errores de handlers async al middleware de errores
@@ -61,6 +66,24 @@ function wrapAsync(handler: AsyncHandler) {
   return (request: Request, response: Response, next: NextFunction): void => {
     handler(request, response).catch(next);
   };
+}
+
+// body-parser reports an oversized (413) or cut-off (400) upload as an error carrying a status,
+// but the app-wide error handler in index.ts answers every error with 500. Answer with the
+// parser's own status here instead, and leave that handler alone.
+function readPastedImageBody(request: Request, response: Response, next: NextFunction): void {
+  parsePastedImageBytes(request, response, (error?: unknown): void => {
+    if (error === undefined) {
+      next();
+      return;
+    }
+    const status: unknown = typeof error === "object" && error !== null && "status" in error ? error.status : undefined;
+    if (typeof status === "number" && status >= 400 && status < 500) {
+      response.status(status).json({ error: error instanceof Error ? error.message : "Invalid image upload." });
+      return;
+    }
+    next(error);
+  });
 }
 
 // Thrown from inside a POST /instances updateState mutator when the commit-time revalidation
@@ -372,6 +395,28 @@ apiRouter.post(
     const { value, maxAgeMs } = await issueToken();
     response.cookie(AUTH_COOKIE_NAME, value, authCookieOptions(request, maxAgeMs));
     response.json({ ok: true });
+  })
+);
+
+// A browser on another machine cannot hand its clipboard image to the agent running here (the
+// agent reads the clipboard of THIS machine), so the page uploads it and pastes the saved
+// file's path instead: the agent turns a pasted image path into an attachment. This writes to
+// disk, hence behind requireAuth, with a size cap and only the image types the agent accepts.
+apiRouter.post(
+  "/pasted-images",
+  readPastedImageBody,
+  wrapAsync(async (request, response) => {
+    const contentType: string | false | null = request.is(PASTED_IMAGE_TYPES);
+    if (typeof contentType !== "string") {
+      response.status(415).json({ error: "Only png, jpeg, gif and webp images can be uploaded." });
+      return;
+    }
+    if (!Buffer.isBuffer(request.body) || request.body.length === 0) {
+      response.status(400).json({ error: "The image is empty." });
+      return;
+    }
+    const savedPath: string = await savePastedImage(request.body, contentType, PASTED_IMAGE_DIRECTORY);
+    response.json({ path: savedPath });
   })
 );
 

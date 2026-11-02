@@ -90,6 +90,11 @@ vi.mock("./updater", () => ({
   resetToRemote: vi.fn(),
 }));
 vi.mock("./reviewRequests", () => ({ reviewRequestFor: vi.fn() }));
+// Keeps the real type allowlist but never writes an image into the real data/ directory
+vi.mock("./pastedImages", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./pastedImages")>()),
+  savePastedImage: vi.fn(async () => "/fake/pasted-images/saved.png"),
+}));
 
 const PUBLIC_HOST = "protom4-mi.example.com";
 const LOCAL_HOST = "ai.local";
@@ -111,11 +116,19 @@ let auth: AuthModule;
 // Host header is exactly what these tests are about.
 function send(
   requestPath: string,
-  options: { host?: string; cloudflare?: boolean; cookie?: string; body?: unknown } = {}
+  options: {
+    host?: string;
+    cloudflare?: boolean;
+    cookie?: string;
+    body?: unknown;
+    // Sent as-is with its own content type, for the routes that take binary bodies
+    rawBody?: Buffer;
+    contentType?: string;
+  } = {}
 ): Promise<AppResponse> {
   const headers: Record<string, string> = {
     host: options.host ?? LOCAL_HOST,
-    "content-type": "application/json",
+    "content-type": options.contentType ?? "application/json",
   };
   if (options.cloudflare === true) {
     headers["cf-connecting-ip"] = "203.0.113.7";
@@ -138,7 +151,7 @@ function send(
       });
     });
     clientRequest.on("error", reject);
-    clientRequest.end(JSON.stringify(options.body ?? {}));
+    clientRequest.end(options.rawBody ?? JSON.stringify(options.body ?? {}));
   });
 }
 
@@ -351,5 +364,43 @@ describe("POST /auth/set-password", () => {
     expect(listener).not.toHaveBeenCalled();
     expect(await auth.verifyToken(tokenFromSetCookie(response.setCookie))).toBe(true);
     expect(fakeFiles.has(secretFilePath)).toBe(true);
+  });
+});
+
+describe("POST /pasted-images", () => {
+  const PNG_BYTES: Buffer = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+
+  async function uploadAsSignedIn(contentType: string, rawBody: Buffer): Promise<AppResponse> {
+    const { value: token } = await auth.issueToken();
+    return send("/pasted-images", { cookie: cookieFor(token), contentType, rawBody });
+  }
+
+  it("rejects a request without a session", async () => {
+    const response: AppResponse = await send("/pasted-images", { contentType: "image/png", rawBody: PNG_BYTES });
+
+    expect(response.status).toBe(401);
+  });
+
+  it("saves a PNG and answers with its path", async () => {
+    const response: AppResponse = await uploadAsSignedIn("image/png", PNG_BYTES);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ path: "/fake/pasted-images/saved.png" });
+  });
+
+  it("answers 415 for types that are not images the agent accepts", async () => {
+    expect((await uploadAsSignedIn("text/plain", Buffer.from("hola"))).status).toBe(415);
+    expect((await uploadAsSignedIn("application/json", Buffer.from("{}"))).status).toBe(415);
+    expect((await uploadAsSignedIn("image/tiff", PNG_BYTES)).status).toBe(415);
+  });
+
+  it("answers 400 for an empty image", async () => {
+    expect((await uploadAsSignedIn("image/png", Buffer.alloc(0))).status).toBe(400);
+  });
+
+  it("answers 413, not 500, for a body over the limit", async () => {
+    const response: AppResponse = await uploadAsSignedIn("image/png", Buffer.alloc(21 * 1024 * 1024));
+
+    expect(response.status).toBe(413);
   });
 });
