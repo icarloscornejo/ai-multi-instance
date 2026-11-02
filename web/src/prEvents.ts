@@ -40,6 +40,22 @@ export function prEventsStatusLabel(status: PrEventsStatus, provider?: PrEventsP
   return provider === "gitlab" ? gitlabLabels(host)[status] : LABELS[status];
 }
 
+// Traffic light for the status line: green watching, yellow nothing to watch yet or paused,
+// red needs the user (no token, unreachable), grey off or not applicable.
+const STATUS_DOT: Record<PrEventsStatus, string> = {
+  ok: "bg-diff-added",
+  paused: "bg-status-warn",
+  "no-pr": "bg-status-warn",
+  "no-token": "bg-diff-removed",
+  error: "bg-diff-removed",
+  off: "bg-txt-dim",
+  unsupported: "bg-txt-dim",
+};
+
+export function prEventsStatusDot(status: PrEventsStatus): string {
+  return STATUS_DOT[status];
+}
+
 export function prEventsHeading(provider?: PrEventsProvider): string {
   return provider === "gitlab" ? "GitLab updates" : "GitHub updates";
 }

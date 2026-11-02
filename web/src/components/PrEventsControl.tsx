@@ -1,4 +1,4 @@
-import { prEventsCheckboxText, prEventsStatusLabel } from "../prEvents";
+import { prEventsCheckboxText, prEventsStatusDot, prEventsStatusLabel } from "../prEvents";
 import type { Instance, PrEventsResponse, UpdateInstancePayload } from "../types";
 
 interface PrEventsControlProps {
@@ -41,7 +41,8 @@ export function PrEventsControl({ instance, info, onUpdate, sizeClass }: PrEvent
           Pause delivery
         </label>
       )}
-      <div className="text-txt-secondary">
+      <div className="flex items-center gap-[6px] text-txt-secondary">
+        <span aria-hidden="true" className={`h-[8px] w-[8px] shrink-0 rounded-full ${prEventsStatusDot(info?.status ?? "off")}`} />
         Status: {label}
         {pending > 0 && ` (${pending} pending)`}
       </div>

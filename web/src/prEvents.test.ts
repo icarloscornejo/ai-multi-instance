@@ -1,5 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { prEventsBadgeText, prEventsStatusLabel } from "./prEvents";
+import { prEventsBadgeText, prEventsStatusDot, prEventsStatusLabel } from "./prEvents";
+
+describe("prEventsStatusDot", () => {
+  it("colors the status like a traffic light", () => {
+    expect(prEventsStatusDot("ok")).toBe("bg-diff-added");
+    expect(prEventsStatusDot("no-pr")).toBe("bg-status-warn");
+    expect(prEventsStatusDot("paused")).toBe("bg-status-warn");
+    expect(prEventsStatusDot("no-token")).toBe("bg-diff-removed");
+    expect(prEventsStatusDot("error")).toBe("bg-diff-removed");
+    expect(prEventsStatusDot("off")).toBe("bg-txt-dim");
+    expect(prEventsStatusDot("unsupported")).toBe("bg-txt-dim");
+  });
+});
 
 const STATUSES = ["ok", "off", "paused", "no-token", "no-pr", "unsupported", "error"] as const;
 
