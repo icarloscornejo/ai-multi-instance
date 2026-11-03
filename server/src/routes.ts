@@ -11,13 +11,16 @@ import {
   isLoginLocked,
   isPasswordFromEnv,
   issueToken,
+  issueTrustedDeviceToken,
   readCookie,
   recordFailedLogin,
   requireAuth,
   resetFailedLogins,
   rotateSecret,
   setStoredPassword,
+  TRUSTED_DEVICE_COOKIE_NAME,
   verifyToken,
+  verifyTrustedDeviceToken,
 } from "./auth";
 import { clearAgentReadiness, getReadyChannel } from "./agentReadiness";
 import { isAgentProvider, PROVIDERS, sessionKeyFor } from "./providers";
@@ -673,7 +676,21 @@ apiRouter.post(
     // learns nothing, not even from a correct guess.
     const isPublicRequest: boolean = !isLocalRequest(request);
     const clientKey: string = clientAddressOf(request);
-    if (isPublicRequest && isLoginLocked(clientKey)) {
+    // A device that logged in before is exempt from the GLOBAL ceiling only (its own five
+    // failures still lock it, and the password is still required). Resolved here, before the
+    // lock check, so nothing async sits between that check and recordFailedLogin below: parallel
+    // guesses from one address cannot all pass before the first failure is counted. Any error
+    // (a malformed cookie, an unreadable secret) just means "not trusted"; it is logged with a
+    // fixed string because the error message names the secret file.
+    let isTrustedDevice = false;
+    if (isPublicRequest) {
+      try {
+        isTrustedDevice = await verifyTrustedDeviceToken(readCookie(request.headers.cookie, TRUSTED_DEVICE_COOKIE_NAME));
+      } catch {
+        console.error("[auth] could not verify the trusted-device cookie, treating the device as untrusted");
+      }
+    }
+    if (isPublicRequest && isLoginLocked(clientKey, Date.now(), isTrustedDevice)) {
       response.status(429).json({ error: "Too many attempts, try again later." });
       return;
     }
@@ -691,7 +708,11 @@ apiRouter.post(
       clearAllFailedLogins();
     }
     const { value, maxAgeMs } = await issueToken();
+    // Session cookie first (callers and tests read the first Set-Cookie), then the marker that
+    // keeps this browser able to log in while strangers have the global ceiling reached.
+    const trustedDevice = await issueTrustedDeviceToken();
     response.cookie(AUTH_COOKIE_NAME, value, authCookieOptions(request, maxAgeMs));
+    response.cookie(TRUSTED_DEVICE_COOKIE_NAME, trustedDevice.value, authCookieOptions(request, trustedDevice.maxAgeMs));
     response.json({ ok: true });
   })
 );

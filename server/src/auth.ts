@@ -15,9 +15,10 @@ const TOKEN_TTL_MS: number = 180 * 24 * 60 * 60 * 1000; // ~180 days
 const SCRYPT_KEY_LENGTH = 64;
 const SECRET_BYTE_LENGTH = 32;
 
-// Per-client keyed by cf-connecting-ip so one stranger cannot lock the owner out alone; the global
-// ceiling still lets about 20 distinct addresses lock the public login, recovery is a successful
-// local login. In memory only.
+// Per-client keyed by cf-connecting-ip so one stranger cannot lock the owner out alone. The global
+// ceiling slows a distributed guess: about 20 distinct addresses reach it and then every UNKNOWN
+// client is refused, but a trusted device (see issueTrustedDeviceToken) is exempt from it and
+// still faces its own per-client limit. In memory only.
 const LOGIN_FAILURE_LIMIT = 5;
 const LOGIN_FAILURE_GLOBAL_LIMIT = 100;
 const LOGIN_FAILURE_WINDOW_MS: number = 15 * 60 * 1000;
@@ -133,7 +134,8 @@ export function revokeLiveSockets(clients: Iterable<{ terminate(): void }>): voi
   }
 }
 
-export function isLoginLocked(clientKey: string, now: number = Date.now()): boolean {
+// trustedDevice lifts the global ceiling only; the caller's own five-failure limit always applies.
+export function isLoginLocked(clientKey: string, now: number = Date.now(), trustedDevice: boolean = false): boolean {
   const isFresh = (failedAt: number): boolean => now - failedAt < LOGIN_FAILURE_WINDOW_MS;
   globalFailedLoginTimestamps = globalFailedLoginTimestamps.filter(isFresh);
   // Sweep every client, not just the caller, so addresses that never return do not leak memory.
@@ -147,7 +149,7 @@ export function isLoginLocked(clientKey: string, now: number = Date.now()): bool
   }
   return (
     (failedLoginTimestampsByClient.get(clientKey)?.length ?? 0) >= LOGIN_FAILURE_LIMIT ||
-    globalFailedLoginTimestamps.length >= LOGIN_FAILURE_GLOBAL_LIMIT
+    (!trustedDevice && globalFailedLoginTimestamps.length >= LOGIN_FAILURE_GLOBAL_LIMIT)
   );
 }
 
@@ -167,8 +169,8 @@ export function clearAllFailedLogins(): void {
   globalFailedLoginTimestamps = [];
 }
 
-function sign(secret: Buffer, expiresAt: number): string {
-  return createHmac("sha256", secret).update(String(expiresAt)).digest("hex");
+function sign(secret: Buffer, expiresAt: number, purpose: string = ""): string {
+  return createHmac("sha256", secret).update(`${purpose}${expiresAt}`).digest("hex");
 }
 
 export function checkPassword(candidate: string): boolean {
@@ -196,7 +198,9 @@ export async function issueToken(): Promise<{ value: string; maxAgeMs: number }>
   return { value: `${expiresAt}.${sign(secret, expiresAt)}`, maxAgeMs: TOKEN_TTL_MS };
 }
 
-export async function verifyToken(token: string | undefined): Promise<boolean> {
+// Shared by the session token and the trusted-device marker; `purpose` is mixed into the signed
+// text so a value minted for one never verifies as the other.
+async function verifySignedExpiry(token: string | undefined, purpose: string): Promise<boolean> {
   if (typeof token !== "string") {
     return false;
   }
@@ -211,10 +215,33 @@ export async function verifyToken(token: string | undefined): Promise<boolean> {
     return false;
   }
   const secret: Buffer = await getOrCreateSecret();
-  const expectedSignature: string = sign(secret, expiresAt);
+  const expectedSignature: string = sign(secret, expiresAt, purpose);
   const signatureBuffer: Buffer = Buffer.from(signature);
   const expectedBuffer: Buffer = Buffer.from(expectedSignature);
   return signatureBuffer.length === expectedBuffer.length && timingSafeEqual(signatureBuffer, expectedBuffer);
+}
+
+export function verifyToken(token: string | undefined): Promise<boolean> {
+  return verifySignedExpiry(token, "");
+}
+
+// A browser that already logged in with the right password. It lifts only the global failure
+// ceiling (see isLoginLocked); the password and the per-client limit still apply. Whoever holds a
+// copy skips the global ceiling (5 guesses per address, no overall cap), but getting one means
+// having the owner's HttpOnly cookies, which already include the session. Signed with the same secret as sessions, so rotating the
+// secret (revoke-all, password change) revokes every marker too.
+export const TRUSTED_DEVICE_COOKIE_NAME = "ccdash_trusted";
+const TRUSTED_DEVICE_TTL_MS: number = 365 * 24 * 60 * 60 * 1000;
+const TRUSTED_DEVICE_PURPOSE = "trusted-device:";
+
+export async function issueTrustedDeviceToken(): Promise<{ value: string; maxAgeMs: number }> {
+  const secret: Buffer = await getOrCreateSecret();
+  const expiresAt: number = Date.now() + TRUSTED_DEVICE_TTL_MS;
+  return { value: `${expiresAt}.${sign(secret, expiresAt, TRUSTED_DEVICE_PURPOSE)}`, maxAgeMs: TRUSTED_DEVICE_TTL_MS };
+}
+
+export function verifyTrustedDeviceToken(token: string | undefined): Promise<boolean> {
+  return verifySignedExpiry(token, TRUSTED_DEVICE_PURPOSE);
 }
 
 export function readCookie(cookieHeader: string | undefined, name: string): string | undefined {
