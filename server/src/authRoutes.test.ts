@@ -167,9 +167,26 @@ function send(
 
 function login(
   password: string,
-  options: { host?: string; cloudflare?: boolean; clientIp?: string } = {}
+  options: { host?: string; cloudflare?: boolean; clientIp?: string; cookie?: string } = {}
 ): Promise<AppResponse> {
   return send("/auth/login", { ...options, body: { password } });
+}
+
+const TRUSTED_COOKIE_NAME = "ccdash_trusted";
+
+// "ccdash_trusted=<value>" ready to send back as a Cookie header, or undefined when none was set.
+function trustedCookieFrom(setCookie: string[]): string | undefined {
+  const raw: string | undefined = setCookie.find((cookie) => cookie.startsWith(`${TRUSTED_COOKIE_NAME}=`));
+  return raw === undefined ? undefined : raw.split(";")[0];
+}
+
+// About 20 stranger addresses failing 5 times each: the global ceiling of 100 is reached.
+async function reachGlobalFailureCeiling(): Promise<void> {
+  for (let address = 1; address <= 20; address += 1) {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await login("wrong-password", { cloudflare: true, clientIp: `198.51.100.${address}` });
+    }
+  }
 }
 
 function cookieFor(token: string): string {
@@ -594,5 +611,185 @@ describe("POST /pasted-images", () => {
     const response: AppResponse = await uploadAsSignedIn("image/png", Buffer.alloc(21 * 1024 * 1024));
 
     expect(response.status).toBe(413);
+  });
+});
+
+describe("global failure ceiling and the trusted device", () => {
+  const ownerPhone = { cloudflare: true, clientIp: "203.0.113.99" };
+  const ownerOnNewNetwork = { cloudflare: true, clientIp: "203.0.113.150" };
+  const stranger = { cloudflare: true, clientIp: "192.0.2.77" };
+
+  async function ownerLogsInOnce(): Promise<string> {
+    const first: AppResponse = await login(CORRECT_PASSWORD, ownerPhone);
+    expect(first.status).toBe(200);
+    const trusted: string | undefined = trustedCookieFrom(first.setCookie);
+    expect(trusted).toBeDefined();
+    return trusted as string;
+  }
+
+  it("20 stranger addresses lock out an unknown client but not the owner's trusted device", async () => {
+    const trusted: string = await ownerLogsInOnce();
+    await reachGlobalFailureCeiling();
+
+    expect((await login(CORRECT_PASSWORD, stranger)).status).toBe(429);
+    const ownerAgain: AppResponse = await login(CORRECT_PASSWORD, { ...ownerOnNewNetwork, cookie: trusted });
+
+    expect(ownerAgain.status).toBe(200);
+    expect(trustedCookieFrom(ownerAgain.setCookie)).toBeDefined();
+  });
+
+  it("still asks for the right password: a trusted device with a wrong one gets 401, not a pass", async () => {
+    const trusted: string = await ownerLogsInOnce();
+    await reachGlobalFailureCeiling();
+
+    expect((await login("wrong-password", { ...ownerOnNewNetwork, cookie: trusted })).status).toBe(401);
+  });
+
+  it("does not bypass the per-client limit: five failures lock even a trusted device", async () => {
+    const trusted: string = await ownerLogsInOnce();
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      expect((await login("wrong-password", { ...ownerOnNewNetwork, cookie: trusted })).status).toBe(401);
+    }
+
+    expect((await login(CORRECT_PASSWORD, { ...ownerOnNewNetwork, cookie: trusted })).status).toBe(429);
+  });
+
+  it("clears the trusted client's failures on success, as for any client", async () => {
+    const trusted: string = await ownerLogsInOnce();
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await login("wrong-password", { ...ownerOnNewNetwork, cookie: trusted });
+    }
+    expect((await login(CORRECT_PASSWORD, { ...ownerOnNewNetwork, cookie: trusted })).status).toBe(200);
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      expect((await login("wrong-password", { ...ownerOnNewNetwork, cookie: trusted })).status).toBe(401);
+    }
+  });
+
+  it("a forged marker, a marker for another expiry and a session token do not lift the ceiling", async () => {
+    const trusted: string = await ownerLogsInOnce();
+    const trustedValue: string = trusted.slice(TRUSTED_COOKIE_NAME.length + 1);
+    const [expiresAt, signature] = trustedValue.split(".");
+    const { value: sessionToken } = await auth.issueToken();
+    await reachGlobalFailureCeiling();
+
+    const impostors: string[] = [
+      `${TRUSTED_COOKIE_NAME}=${Date.now() + 86_400_000}.${"0".repeat(64)}`,
+      `${TRUSTED_COOKIE_NAME}=${Number(expiresAt) + 1}.${signature}`,
+      `${TRUSTED_COOKIE_NAME}=${sessionToken}`,
+      `${TRUSTED_COOKIE_NAME}=garbage`,
+    ];
+    for (const cookie of impostors) {
+      expect((await login(CORRECT_PASSWORD, { ...stranger, cookie })).status).toBe(429);
+    }
+  });
+
+  it("a trusted marker does not work as a session cookie", async () => {
+    const trusted: string = await ownerLogsInOnce();
+    const trustedValue: string = trusted.slice(TRUSTED_COOKIE_NAME.length + 1);
+
+    expect(await auth.verifyToken(trustedValue)).toBe(false);
+    expect((await send("/auth/revoke-all", { cookie: `${auth.AUTH_COOKIE_NAME}=${trustedValue}` })).status).toBe(401);
+  });
+
+  it("revoking every session also revokes the trust of every device", async () => {
+    const trusted: string = await ownerLogsInOnce();
+    const { value: sessionToken } = await auth.issueToken();
+    await reachGlobalFailureCeiling();
+    expect((await login(CORRECT_PASSWORD, { ...ownerOnNewNetwork, cookie: trusted })).status).toBe(200);
+
+    const revoked: AppResponse = await send("/auth/revoke-all", { cookie: cookieFor(sessionToken) });
+
+    expect(revoked.status).toBe(200);
+    expect((await login(CORRECT_PASSWORD, { ...ownerOnNewNetwork, clientIp: "203.0.113.151", cookie: trusted })).status).toBe(429);
+  });
+
+  it("a malformed cookie value is just an untrusted device, not a 500", async () => {
+    await reachGlobalFailureCeiling();
+
+    const response: AppResponse = await login(CORRECT_PASSWORD, { ...stranger, cookie: `${TRUSTED_COOKIE_NAME}=%E0%A4%A` });
+
+    expect(response.status).toBe(429);
+  });
+
+  it("an unreadable signing secret is an untrusted device: 429, no 500, no secret path in the body", async () => {
+    const trusted: string = await ownerLogsInOnce();
+    secretRead.shouldFailWithPermissionError = true;
+    // Forget the cached key so verifying has to read the broken secret file.
+    vi.resetModules();
+    auth = await import("./auth");
+    const { apiRouter } = await import("./routes");
+    server.close();
+    const app = express();
+    app.use(express.json());
+    app.use("/", apiRouter);
+    server = app.listen(0);
+    await new Promise((resolve) => server.once("listening", resolve));
+    port = (server.address() as AddressInfo).port;
+    await auth.setStoredPassword(CORRECT_PASSWORD);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    for (let address = 1; address <= 20; address += 1) {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        await login("wrong-password", { cloudflare: true, clientIp: `198.51.100.${address}` });
+      }
+    }
+
+    const response: AppResponse = await login(CORRECT_PASSWORD, { ...ownerOnNewNetwork, cookie: trusted });
+
+    expect(response.status).toBe(429);
+    expect(JSON.stringify(response.body)).not.toMatch(/EACCES|auth-secret/);
+  });
+
+  it("never hands out the marker on a failed or throttled login", async () => {
+    const wrongPassword: AppResponse = await login("wrong-password", ownerPhone);
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await login("wrong-password", ownerPhone);
+    }
+    const throttled: AppResponse = await login(CORRECT_PASSWORD, ownerPhone);
+
+    expect(wrongPassword.status).toBe(401);
+    expect(throttled.status).toBe(429);
+    expect(trustedCookieFrom(wrongPassword.setCookie)).toBeUndefined();
+    expect(trustedCookieFrom(throttled.setCookie)).toBeUndefined();
+  });
+
+  it("parallel wrong attempts from one trusted address are cut at five at the ceiling", async () => {
+    const trusted: string = await ownerLogsInOnce();
+    await reachGlobalFailureCeiling();
+
+    const statuses: number[] = (
+      await Promise.all(
+        Array.from({ length: 10 }, () => login("wrong-password", { ...ownerOnNewNetwork, cookie: trusted }))
+      )
+    ).map((response) => response.status);
+
+    expect(statuses.filter((status) => status === 401)).toHaveLength(5);
+    expect(statuses.filter((status) => status === 429)).toHaveLength(5);
+  });
+
+  describe("cookie flags", () => {
+    const SECURE_ATTRIBUTE: RegExp = /;\s*Secure(;|$)/;
+
+    it("is HttpOnly, SameSite=Lax and Secure on a public login, with a long max age", async () => {
+      const response: AppResponse = await login(CORRECT_PASSWORD, ownerPhone);
+      const raw: string | undefined = response.setCookie.find((cookie) => cookie.startsWith(`${TRUSTED_COOKIE_NAME}=`));
+
+      expect(raw).toBeDefined();
+      expect(raw).toContain("HttpOnly");
+      expect(raw).toContain("SameSite=Lax");
+      expect(raw).toMatch(SECURE_ATTRIBUTE);
+      expect(raw).toContain("Path=/");
+      expect(raw).toContain("Max-Age=31536000");
+    });
+
+    it("is HttpOnly and not Secure on the plain-HTTP local login, and the session cookie stays first", async () => {
+      const response: AppResponse = await login(CORRECT_PASSWORD);
+      const raw: string | undefined = response.setCookie.find((cookie) => cookie.startsWith(`${TRUSTED_COOKIE_NAME}=`));
+
+      expect(response.setCookie[0]).toMatch(/^ccdash_auth=/);
+      expect(raw).toContain("HttpOnly");
+      expect(raw).not.toMatch(SECURE_ATTRIBUTE);
+    });
   });
 });

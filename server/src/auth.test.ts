@@ -150,6 +150,33 @@ describe("revokeLiveSockets", () => {
   });
 });
 
+describe("trusted device token", () => {
+  it("verifies, and fails when tampered, expired, or swapped with a session token", async () => {
+    const auth = await loadAuth();
+    const trusted = await auth.issueTrustedDeviceToken();
+    const session = await auth.issueToken();
+    const [expiresAt, signature] = trusted.value.split(".");
+
+    expect(await auth.verifyTrustedDeviceToken(trusted.value)).toBe(true);
+    expect(await auth.verifyTrustedDeviceToken(`${Number(expiresAt) + 1}.${signature}`)).toBe(false);
+    expect(await auth.verifyTrustedDeviceToken(`${expiresAt}.${"0".repeat(64)}`)).toBe(false);
+    expect(await auth.verifyTrustedDeviceToken(`${Date.now() - 1000}.${signature}`)).toBe(false);
+    expect(await auth.verifyTrustedDeviceToken(undefined)).toBe(false);
+    expect(await auth.verifyTrustedDeviceToken(session.value)).toBe(false);
+    expect(await auth.verifyToken(trusted.value)).toBe(false);
+  });
+
+  it("lasts longer than a session and stops verifying after the secret rotates", async () => {
+    const auth = await loadAuth();
+    const trusted = await auth.issueTrustedDeviceToken();
+    const session = await auth.issueToken();
+
+    expect(trusted.maxAgeMs).toBeGreaterThan(session.maxAgeMs);
+    await auth.rotateSecret();
+    expect(await auth.verifyTrustedDeviceToken(trusted.value)).toBe(false);
+  });
+});
+
 describe("login throttle", () => {
   const windowMs: number = 15 * 60 * 1000;
 
@@ -203,6 +230,21 @@ describe("login throttle", () => {
     expect(auth.isLoginLocked("fresh-client", start)).toBe(true);
     expect(auth.isLoginLocked("fresh-client", start + windowMs)).toBe(false);
     expect(auth.isLoginLocked("client-0", start + windowMs)).toBe(false);
+  });
+
+  it("a trusted device is exempt from the global ceiling only, never from its own five failures", async () => {
+    const auth = await loadAuth();
+    const start = 5_000_000;
+    for (let keyIndex = 0; keyIndex < 25; keyIndex += 1) {
+      failTimes(auth, `client-${keyIndex}`, 4, start);
+    }
+
+    expect(auth.isLoginLocked("fresh-client", start)).toBe(true);
+    expect(auth.isLoginLocked("fresh-client", start, true)).toBe(false);
+    expect(auth.isLoginLocked("client-0", start, true)).toBe(false);
+
+    auth.recordFailedLogin("client-0", start);
+    expect(auth.isLoginLocked("client-0", start, true)).toBe(true);
   });
 
   it("scoped reset leaves other clients counted and keeps the reset client in the global total", async () => {
