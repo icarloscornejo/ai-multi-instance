@@ -29,6 +29,7 @@ import {
   branchUpstream,
   currentBranch,
   isRemoteUnreachableError,
+  LOCAL_GIT_TIMEOUT_MS,
   NETWORK_GIT_TIMEOUT_MS,
   runGit,
   worktreeDirFor,
@@ -168,7 +169,14 @@ async function resolvedPath(target: string): Promise<string> {
   try {
     return await fs.realpath(target);
   } catch {
-    return path.resolve(target);
+    // A folder that no longer exists still sits under a real parent, which may itself be
+    // reached through a symlink (macOS /var), so resolve the parent and keep the name.
+    const absoluteTarget: string = path.resolve(target);
+    try {
+      return path.join(await fs.realpath(path.dirname(absoluteTarget)), path.basename(absoluteTarget));
+    } catch {
+      return absoluteTarget;
+    }
   }
 }
 
@@ -176,6 +184,301 @@ async function resolvedPath(target: string): Promise<string> {
 function isSameOrInside(outer: string, inner: string): boolean {
   const relativePath: string = path.relative(outer, inner);
   return relativePath === "" || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath));
+}
+
+// One lock for every operation that creates, switches or removes worktrees and branches
+// (instance creation, stale-branch delete, instance-close cleanup), so none of them can run
+// while another is between "decided" and "done". FIFO, built on the session lock. The holder
+// gets a release function because a creation lets go as soon as the instance is persisted
+// (agent boot stays parallel), not when its whole handler ends. Never take it inside an
+// updateState mutator: creation waits on that queue while holding it.
+// ponytail: one global lock serializes all worktree operations, fine for their low frequency; key it per repo if that ever hurts.
+const WORKTREE_OPS_LOCK_KEY = "worktree-ops";
+
+function acquireWorktreeOpsLock(): Promise<() => void> {
+  return new Promise((resolve) => {
+    void withSessionLock(
+      WORKTREE_OPS_LOCK_KEY,
+      () =>
+        new Promise<void>((release) => {
+          let released = false;
+          resolve(() => {
+            if (!released) {
+              released = true;
+              release();
+            }
+          });
+        })
+    );
+  });
+}
+
+// `ls-files` and `status` on a big repo outgrow Node's 1 MiB default and the child is killed,
+// which would read as "could not be checked" and keep every clean worktree forever.
+const WORKTREE_CHECK_MAX_BUFFER_BYTES: number = 256 * 1024 * 1024;
+const WORKTREE_LIST_CAP = 10;
+
+function capList(items: string[]): string {
+  const shown: string = items.slice(0, WORKTREE_LIST_CAP).join(", ");
+  return items.length > WORKTREE_LIST_CAP ? `${shown} and ${items.length - WORKTREE_LIST_CAP} more` : shown;
+}
+
+function isFileSystemError(error: unknown, ...codes: string[]): boolean {
+  return codes.includes((error as NodeJS.ErrnoException | undefined)?.code ?? "");
+}
+
+interface WorktreeEntry {
+  path: string;
+  branch: string | null;
+  locked: boolean;
+  // The first porcelain entry is always the main working tree of the repository.
+  isMain: boolean;
+}
+
+async function listWorktrees(cwd: string): Promise<WorktreeEntry[]> {
+  const stdout: string = await runGit(cwd, ["worktree", "list", "--porcelain"]);
+  const entries: WorktreeEntry[] = [];
+  for (const line of stdout.split("\n")) {
+    const worktreeMatch: RegExpMatchArray | null = line.match(/^worktree (.+)$/);
+    if (worktreeMatch) {
+      entries.push({ path: worktreeMatch[1], branch: null, locked: false, isMain: entries.length === 0 });
+      continue;
+    }
+    const latest: WorktreeEntry | undefined = entries[entries.length - 1];
+    if (latest === undefined) continue;
+    const branchMatch: RegExpMatchArray | null = line.match(/^branch refs\/heads\/(.+)$/);
+    if (branchMatch) latest.branch = branchMatch[1];
+    if (line === "locked" || line.startsWith("locked ")) latest.locked = true;
+  }
+  return entries;
+}
+
+// Removes a linked worktree without ever deleting anything git does not track. `git worktree
+// remove` is not used on a live folder: it also deletes ignored files (.env, local config).
+// Instead only tracked files are unlinked, empty parents are rmdir'ed, and the final rmdir
+// fails by itself if anything else is there, so ignored and untracked files survive by
+// construction. The registration is dropped only once the folder is gone. Returns null when
+// the worktree is gone, else why it was kept. Never throws.
+// ponytail: a tracked file edited, or a symlink swapped in, in the milliseconds between the
+// checks and the unlink is lost (the committed version stays in git); a folder that reappears
+// right after the missing check gets a plain `worktree remove`. Park the folder by rename and
+// re-check if that ever matters.
+async function removeWorktreeSafely(sourcePath: string, worktreeDir: string): Promise<string | null> {
+  const keep = (reason: string): string => `The worktree ${worktreeDir} ${reason}, so it was kept.`;
+  let deleting = false;
+  let savedGitFile: string | null = null;
+  try {
+    // Only a registered, linked, unlocked worktree of this repository is ever touched.
+    const canonicalDir: string = await resolvedPath(worktreeDir);
+    const entries: WorktreeEntry[] = await listWorktrees(sourcePath);
+    let entry: WorktreeEntry | undefined;
+    for (const candidate of entries) {
+      if ((await resolvedPath(candidate.path)) === canonicalDir) {
+        entry = candidate;
+        break;
+      }
+    }
+    if (entry === undefined) return keep("is not a worktree of this repository");
+    if (entry.isMain) return keep("is the main checkout");
+    if (entry.locked) return keep("is locked");
+    const registeredPath: string = entry.path;
+
+    let folderPresent = true;
+    try {
+      await fs.lstat(worktreeDir);
+    } catch (error) {
+      if (!isFileSystemError(error, "ENOENT")) throw error;
+      folderPresent = false;
+    }
+    if (!folderPresent) {
+      // Dropping the registration also drops a detached HEAD's only reference to its commits.
+      if (entry.branch === null) return keep("is missing and was on a detached HEAD, where commits would be lost");
+      await runGit(sourcePath, ["worktree", "remove", "--", worktreeDir]);
+      return null;
+    }
+
+    // The folder must still be this repository's worktree, not something put in its place.
+    const identity: string[] = (
+      await runGit(worktreeDir, ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"])
+    ).split("\n");
+    const sourceCommonDir: string = await runGit(sourcePath, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    if (
+      (await resolvedPath(identity[0] ?? "")) !== canonicalDir ||
+      (await resolvedPath(identity[1] ?? "")) !== (await resolvedPath(sourceCommonDir))
+    ) {
+      return keep("is no longer this repository's worktree");
+    }
+
+    // A detached HEAD (also a stopped rebase) holds commits no branch points at; dropping the
+    // registration would drop them with it.
+    try {
+      await runGit(worktreeDir, ["symbolic-ref", "-q", "HEAD"]);
+    } catch {
+      return keep("has a detached HEAD (a rebase or a detached checkout), where commits would be lost");
+    }
+
+    // fsmonitor and the stat-tolerance settings can make `status` miss an edit, so pin them.
+    const statusOutput: string = await runGit(
+      worktreeDir,
+      [
+        "-c", "core.fsmonitor=false", "-c", "core.trustctime=true", "-c", "core.checkStat=default",
+        "status", "--porcelain", "--untracked-files=normal", "--ignored=matching", "--ignore-submodules=none",
+      ],
+      LOCAL_GIT_TIMEOUT_MS,
+      WORKTREE_CHECK_MAX_BUFFER_BYTES
+    );
+    const statusLines: string[] = statusOutput.split("\n").filter((line) => line !== "");
+    const ignoredPaths: string[] = statusLines.filter((line) => line.startsWith("!! ")).map((line) => line.slice(3));
+    const changedLines: string[] = statusLines.filter((line) => !line.startsWith("!! "));
+    if (changedLines.length > 0 || ignoredPaths.length > 0) {
+      const parts: string[] = [];
+      if (changedLines.length > 0) parts.push("uncommitted changes");
+      if (ignoredPaths.length > 0) parts.push(`ignored files (${capList(ignoredPaths)})`);
+      return `The worktree ${worktreeDir} has ${parts.join(" and ")}, so it was kept. Remove it yourself when you are done with it.`;
+    }
+
+    // Edits git was told to ignore (skip-worktree, assume-unchanged) never show in `status`.
+    const taggedOutput: string = await runGit(
+      worktreeDir, ["ls-files", "-v", "-z"], LOCAL_GIT_TIMEOUT_MS, WORKTREE_CHECK_MAX_BUFFER_BYTES
+    );
+    const hiddenEditPaths: string[] = [];
+    for (const record of taggedOutput.split("\0")) {
+      const tag: string = record.slice(0, 1);
+      const trackedPath: string = record.slice(2);
+      if (trackedPath === "" || !(tag === "S" || (tag >= "a" && tag <= "z"))) continue;
+      // Outside a sparse-checkout cone the file is absent, so there is nothing to lose.
+      if (await fs.lstat(path.join(worktreeDir, trackedPath)).then(() => true, () => false)) {
+        hiddenEditPaths.push(trackedPath);
+      }
+    }
+    if (hiddenEditPaths.length > 0) {
+      return keep(`has files git is told to ignore changes in (${capList(hiddenEditPaths)}) and may hold edits`);
+    }
+
+    const stagedOutput: string = await runGit(
+      worktreeDir, ["ls-files", "-s", "-z"], LOCAL_GIT_TIMEOUT_MS, WORKTREE_CHECK_MAX_BUFFER_BYTES
+    );
+    const trackedFiles: string[] = [];
+    for (const record of stagedOutput.split("\0")) {
+      const tabIndex: number = record.indexOf("\t");
+      if (tabIndex < 0) continue;
+      if (record.startsWith("160000 ")) return keep("contains submodules; remove it by hand");
+      const trackedFile: string = record.slice(tabIndex + 1);
+      // Git never writes such paths; a hand-made index could, and unlink would leave the worktree.
+      if (path.posix.isAbsolute(trackedFile) || trackedFile.split("/").some((part) => part === "" || part === "." || part === "..")) {
+        return keep("has an unexpected tracked path");
+      }
+      trackedFiles.push(trackedFile);
+    }
+    const trackedSet: Set<string> = new Set(trackedFiles);
+    const trackedDirectories: Set<string> = new Set();
+    for (const trackedFile of trackedFiles) {
+      for (let directory = path.posix.dirname(trackedFile); directory !== "."; directory = path.posix.dirname(directory)) {
+        trackedDirectories.add(directory);
+      }
+    }
+
+    // `status` never lists empty folders or a symlink standing where a folder was tracked, and
+    // either would leave the worktree half emptied. Check everything on disk first.
+    const extras: string[] = [];
+    const walk = async (relativeDirectory: string): Promise<void> => {
+      for (const dirent of await fs.readdir(path.join(worktreeDir, relativeDirectory), { withFileTypes: true })) {
+        const relative: string = relativeDirectory === "" ? dirent.name : `${relativeDirectory}/${dirent.name}`;
+        if (relativeDirectory === "" && dirent.name === ".git") continue;
+        if (dirent.isDirectory()) {
+          if (trackedDirectories.has(relative)) await walk(relative);
+          else extras.push(`${relative}/`);
+        } else if (!trackedSet.has(relative)) {
+          extras.push(relative);
+        }
+      }
+    };
+    await walk("");
+    if (extras.length > 0) {
+      return keep(`has files or folders git does not track (${capList(extras)})`);
+    }
+
+    // From here on tracked files are deleted; any failure is reported as a partial removal.
+    deleting = true;
+    for (const trackedFile of trackedFiles) {
+      try {
+        await fs.unlink(path.join(worktreeDir, trackedFile));
+      } catch (error) {
+        if (!isFileSystemError(error, "ENOENT")) throw error;
+      }
+    }
+    const directoriesDeepestFirst: string[] = [...trackedDirectories].sort(
+      (first, second) => second.split("/").length - first.split("/").length
+    );
+    for (const directory of directoriesDeepestFirst) {
+      try {
+        await fs.rmdir(path.join(worktreeDir, directory));
+      } catch (error) {
+        if (!isFileSystemError(error, "ENOENT", "ENOTEMPTY")) throw error;
+      }
+    }
+    // The gitlink file at the root is untracked, so it goes last and only if nothing else is left.
+    try {
+      const remaining: string[] = await fs.readdir(worktreeDir);
+      if (remaining.length === 1 && remaining[0] === ".git") {
+        const gitFile: string = path.join(worktreeDir, ".git");
+        const content: string = await fs.readFile(gitFile, "utf8");
+        if (content.startsWith("gitdir:")) {
+          savedGitFile = content;
+          await fs.unlink(gitFile);
+        }
+      }
+    } catch (error) {
+      if (!isFileSystemError(error, "ENOENT")) throw error;
+    }
+    let folderRemoved = false;
+    try {
+      await fs.rmdir(worktreeDir);
+      folderRemoved = true;
+    } catch (error) {
+      if (isFileSystemError(error, "ENOENT")) {
+        folderRemoved = true;
+      } else {
+        throw error;
+      }
+    }
+    if (folderRemoved) {
+      try {
+        await runGit(sourcePath, ["worktree", "remove", "--", worktreeDir]);
+      } catch (error) {
+        const stillListed: boolean = (await listWorktrees(sourcePath)).some(
+          (candidate) => candidate.path === registeredPath
+        );
+        if (stillListed) {
+          return `The worktree folder ${worktreeDir} was removed but git could not unregister it: ${(error as Error).message}`;
+        }
+      }
+    }
+    return null;
+  } catch (error) {
+    if (!deleting) {
+      return `The worktree ${worktreeDir} could not be checked and was kept: ${(error as Error).message}`;
+    }
+    let repairNote = "";
+    if (savedGitFile !== null) {
+      try {
+        await fs.writeFile(path.join(worktreeDir, ".git"), savedGitFile);
+      } catch {
+        repairNote = ' Its ".git" file could not be restored; run "git worktree repair" from the source repository.';
+      }
+    }
+    let leftBehind = "";
+    try {
+      const left: string[] = (await fs.readdir(worktreeDir)).filter((name) => name !== ".git");
+      leftBehind = left.length > 0 ? ` Left in the folder: ${capList(left)}.` : "";
+    } catch {
+      // The folder itself is gone; nothing to list.
+    }
+    return (
+      `The worktree ${worktreeDir} was partially removed and kept (${(error as Error).message}). ` +
+      `Its tracked files were deleted; restore them with "git restore ." inside it.${leftBehind}${repairNote}`
+    );
+  }
 }
 
 // Removes a worktree the dashboard created, only when nothing in it would be lost (never
@@ -191,41 +494,21 @@ async function removeWorktreeIfClean(
   if (shared) {
     return `The worktree ${worktreeDir} is still used by another instance, so it was kept.`;
   }
-  try {
-    const dirtyFiles: string = await runGit(worktreeDir, [
-      "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none",
-    ]);
-    if (dirtyFiles !== "") {
-      return `The worktree ${worktreeDir} has uncommitted changes, so it was kept. Remove it yourself when you are done with it.`;
-    }
-    // Run from the source folder: git refuses to remove the worktree it is running in.
-    await runGit(worktree.sourcePath, ["worktree", "remove", worktreeDir]);
-    return null;
-  } catch (error) {
-    return `The worktree ${worktreeDir} could not be removed and was kept: ${(error as Error).message}`;
-  }
+  return removeWorktreeSafely(worktree.sourcePath, worktreeDir);
 }
 
-// Branches checked out in *other* worktrees of this repo (the primary worktree, cwd
-// itself, is excluded: its checked-out branch is handled like any other candidate, not
-// specially skipped, so that a branch you happen to be sitting on can still be cleaned
-// up). Maps branch name to that worktree's path, so it can be offered for cleanup
-// (removing the worktree along with the branch).
+// Branches checked out in *other* worktrees of this repo, mapped to that worktree's path so
+// they can be offered for cleanup. Left out: the working tree of the location itself (found
+// through git's own toplevel, not path text, so a symlinked location or one in a subfolder of
+// the repo is recognised: its branch is handled like any other candidate so that a branch you
+// happen to be sitting on can still be cleaned up) and the repository's main checkout, which
+// is never removable.
 async function branchesCheckedOutInWorktrees(cwd: string): Promise<Map<string, string>> {
-  const stdout: string = await runGit(cwd, ["worktree", "list", "--porcelain"]);
-  const resolvedCwd: string = path.resolve(cwd);
+  const ownTopLevel: string = await resolvedPath(await runGit(cwd, ["rev-parse", "--show-toplevel"]));
   const branches: Map<string, string> = new Map();
-  let currentWorktreePath: string | null = null;
-  for (const line of stdout.split("\n")) {
-    const worktreeMatch: RegExpMatchArray | null = line.match(/^worktree (.+)$/);
-    if (worktreeMatch) {
-      currentWorktreePath = worktreeMatch[1];
-      continue;
-    }
-    const branchMatch: RegExpMatchArray | null = line.match(/^branch refs\/heads\/(.+)$/);
-    if (branchMatch && currentWorktreePath !== null && path.resolve(currentWorktreePath) !== resolvedCwd) {
-      branches.set(branchMatch[1], currentWorktreePath);
-    }
+  for (const entry of await listWorktrees(cwd)) {
+    if (entry.branch === null || entry.isMain || (await resolvedPath(entry.path)) === ownTopLevel) continue;
+    branches.set(entry.branch, entry.path);
   }
   return branches;
 }
@@ -244,14 +527,31 @@ async function findStaleBranches(cwd: string, instances: InstanceRecord[]): Prom
   }
 
   const worktreeBranches: Map<string, string> = await branchesCheckedOutInWorktrees(cwd);
-  // A worktree a registered instance works in must never be offered: cleanup force-removes it.
-  const instancePaths: Set<string> = new Set(
-    await Promise.all(instances.map((instance) => resolvedPath(instance.locationPath)))
-  );
+  // A worktree a registered instance works in, or in any folder under it, must never be
+  // offered. The repository's main checkout is protected the same way when an instance lives
+  // in it (it is never removable, but its branch should not be offered either).
+  const instancePaths: string[] = await Promise.all(instances.map((instance) => resolvedPath(instance.locationPath)));
+  const hasInstanceInside = async (folder: string): Promise<boolean> => {
+    const resolvedFolder: string = await resolvedPath(folder);
+    return instancePaths.some((instancePath) => isSameOrInside(resolvedFolder, instancePath));
+  };
   const usedBranches: Set<string> = new Set();
   for (const [branch, worktreePath] of worktreeBranches) {
-    if (instancePaths.has(await resolvedPath(worktreePath))) {
+    if (await hasInstanceInside(worktreePath)) {
       usedBranches.add(branch);
+    }
+  }
+  // The location's own working tree stays listed even with an instance in it: deleting its
+  // branch is refused with a 409 by the delete route, which explains why.
+  const ownTopLevel: string = await resolvedPath(await runGit(cwd, ["rev-parse", "--show-toplevel"]));
+  for (const entry of await listWorktrees(cwd)) {
+    if (
+      entry.isMain &&
+      entry.branch !== null &&
+      (await resolvedPath(entry.path)) !== ownTopLevel &&
+      (await hasInstanceInside(entry.path))
+    ) {
+      usedBranches.add(entry.branch);
     }
   }
   const candidates: { branch: string; worktreePath?: string }[] = branches
@@ -662,67 +962,105 @@ apiRouter.post(
       return;
     }
 
-    // Recompute candidates now, rather than trusting the client's earlier snapshot: the
-    // repo may have changed (new commits, a checkout, a new worktree) between when the
-    // list was fetched and when the user clicked delete.
-    const { candidates, currentBranch: checkedOutBranch } = await findStaleBranches(locationPath, state.instances);
-    const candidatesByName: Map<string, { branch: string; worktreePath?: string }> = new Map(
-      candidates.map((candidate) => [candidate.branch, candidate])
-    );
-    const invalidBranch: string | undefined = requestedBranches.find((branch) => !candidatesByName.has(branch));
-    if (invalidBranch !== undefined) {
-      response.status(400).json({ error: `'${invalidBranch}' is no longer a listed branch for this location.` });
-      return;
+    // Held for the whole operation: a creation that has not persisted yet finishes first and
+    // is then seen below, and nothing can start a worktree operation in between.
+    const releaseWorktreeOps: () => void = await acquireWorktreeOpsLock();
+    try {
+      await deleteStaleBranches(locationPath, requestedBranches, response);
+    } finally {
+      releaseWorktreeOps();
     }
+  })
+);
 
-    // Deleting the branch checked out in this location requires switching off it first.
-    if (checkedOutBranch !== null && requestedBranches.includes(checkedOutBranch)) {
-      const branches: string[] = await localBranches(locationPath).catch(() => []);
-      const switchTarget: string | null = localProtectedBranch(branches);
-      if (switchTarget === null) {
+// Body of the stale-branch delete; runs under the worktree-ops lock.
+async function deleteStaleBranches(locationPath: string, requestedBranches: string[], response: Response): Promise<void> {
+  // State is read again here, under the lock: the one read before it can predate an instance
+  // that was created while this request waited its turn.
+  const freshState: DashboardState = await loadState();
+
+  // Recompute candidates now, rather than trusting the client's earlier snapshot: the
+  // repo may have changed (new commits, a checkout, a new worktree) between when the
+  // list was fetched and when the user clicked delete.
+  const { candidates, currentBranch: checkedOutBranch } = await findStaleBranches(locationPath, freshState.instances);
+  const candidatesByName: Map<string, { branch: string; worktreePath?: string }> = new Map(
+    candidates.map((candidate) => [candidate.branch, candidate])
+  );
+  const invalidBranch: string | undefined = requestedBranches.find((branch) => !candidatesByName.has(branch));
+  if (invalidBranch !== undefined) {
+    response.status(400).json({ error: `'${invalidBranch}' is no longer a listed branch for this location.` });
+    return;
+  }
+
+  // Deleting the branch checked out in this location requires switching off it first, and a
+  // checkout moves the whole working tree: never while an instance works anywhere inside it.
+  if (checkedOutBranch !== null && requestedBranches.includes(checkedOutBranch)) {
+    const workingTree: string = await resolvedPath(await runGit(locationPath, ["rev-parse", "--show-toplevel"]));
+    for (const instance of freshState.instances) {
+      if (isSameOrInside(workingTree, await resolvedPath(instance.locationPath))) {
         response.status(409).json({
-          error: `Could not find a local main/master/develop/dev branch to switch to before deleting '${checkedOutBranch}'.`,
+          error: `'${checkedOutBranch}' is checked out in ${locationPath}, where the instance '${instance.label}' is working. Close that instance first.`,
         });
         return;
       }
-      try {
-        await runGit(locationPath, ["checkout", switchTarget]);
-      } catch (error) {
-        response
-          .status(409)
-          .json({ error: `Could not switch off '${checkedOutBranch}' before deleting it: ${(error as Error).message}` });
-        return;
-      }
     }
+    const branches: string[] = await localBranches(locationPath).catch(() => []);
+    const switchTarget: string | null = localProtectedBranch(branches);
+    if (switchTarget === null) {
+      response.status(409).json({
+        error: `Could not find a local main/master/develop/dev branch to switch to before deleting '${checkedOutBranch}'.`,
+      });
+      return;
+    }
+    try {
+      await runGit(locationPath, ["checkout", switchTarget]);
+    } catch (error) {
+      response
+        .status(409)
+        .json({ error: `Could not switch off '${checkedOutBranch}' before deleting it: ${(error as Error).message}` });
+      return;
+    }
+  }
 
-    const deleted: string[] = [];
-    const failed: { branch: string; error: string }[] = [];
-    let removedWorktree: boolean = false;
-    for (const branch of requestedBranches) {
-      const worktreePath: string | undefined = candidatesByName.get(branch)?.worktreePath;
-      try {
-        if (worktreePath !== undefined) {
-          // Checked out elsewhere: force-remove that worktree (discarding any uncommitted
-          // changes in it) before the branch itself can be deleted.
-          await runGit(locationPath, ["worktree", "remove", "--force", worktreePath]);
-          removedWorktree = true;
+  const deleted: string[] = [];
+  const failed: { branch: string; error: string }[] = [];
+  for (const branch of requestedBranches) {
+    const worktreePath: string | undefined = candidatesByName.get(branch)?.worktreePath;
+    try {
+      if (worktreePath !== undefined) {
+        // Checked out elsewhere. Look at the instances once more right before removing, then
+        // remove it only if nothing in it would be lost (never --force); otherwise it stays,
+        // the branch stays, and the reason is shown.
+        const latestInstances: InstanceRecord[] = (await loadState()).instances;
+        const resolvedWorktree: string = await resolvedPath(worktreePath);
+        let busyInstance: InstanceRecord | undefined;
+        for (const instance of latestInstances) {
+          if (isSameOrInside(resolvedWorktree, await resolvedPath(instance.locationPath))) {
+            busyInstance = instance;
+            break;
+          }
         }
-        await runGit(locationPath, ["branch", "-D", branch]);
-        deleted.push(branch);
-      } catch (error) {
-        failed.push({ branch, error: (error as Error).message });
+        if (busyInstance !== undefined) {
+          failed.push({
+            branch,
+            error: `The worktree ${worktreePath} is used by the instance '${busyInstance.label}', so it was kept.`,
+          });
+          continue;
+        }
+        const keptReason: string | null = await removeWorktreeSafely(locationPath, worktreePath);
+        if (keptReason !== null) {
+          failed.push({ branch, error: keptReason });
+          continue;
+        }
       }
+      await runGit(locationPath, ["branch", "-D", branch]);
+      deleted.push(branch);
+    } catch (error) {
+      failed.push({ branch, error: (error as Error).message });
     }
-    if (removedWorktree) {
-      try {
-        await runGit(locationPath, ["worktree", "prune"]);
-      } catch {
-        // Best-effort cleanup of any leftover worktree metadata
-      }
-    }
-    response.json({ deleted, failed });
-  })
-);
+  }
+  response.json({ deleted, failed });
+}
 
 apiRouter.get("/update-status", (_request, response) => {
   response.json(getUpdateStatus());
@@ -945,7 +1283,15 @@ apiRouter.post(
       return;
     }
 
-    const instanceId: string = randomUUID().slice(0, 8);
+    // A short id can collide with an existing instance, whose DELETE may be holding that
+    // session's lock while it waits for the worktree-ops lock this request is about to take;
+    // drawing a fresh id against the current state closes that cycle for every instance that
+    // exists now.
+    // ponytail: an id persisted between this draw and the lock is caught by the re-check after the lock is taken; one persisted after that is rejected by the commit check.
+    let instanceId: string = randomUUID().slice(0, 8);
+    while (state.instances.some((existing) => existing.id === instanceId || existing.tmuxSession === `ccdash-${instanceId}`)) {
+      instanceId = randomUUID().slice(0, 8);
+    }
     const instance: InstanceRecord = {
       id: instanceId,
       label: requestedLabel,
@@ -1001,24 +1347,37 @@ apiRouter.post(
 
     let persisted = false;
     let createdWorktreeDir: string | null = null;
+    let releaseWorktreeOps: (() => void) | null = null;
     // Best-effort and never forced: a failed launch must not leave a worktree behind, but must
-    // never discard work either. A branch created for it stays and is named in the error.
+    // never discard work either (removeWorktreeSafely keeps it when anything would be lost).
+    // A branch created for it stays and is named in the error.
     const removeCreatedWorktree = async (): Promise<string> => {
       if (createdWorktreeDir === null) return "";
-      try {
-        await runGit(locationPath, ["worktree", "remove", createdWorktreeDir]);
-        return branchAction?.type === "create" ? ` The new branch '${branchActionBranch}' was left in place.` : "";
-      } catch (removeError) {
-        return ` The worktree ${createdWorktreeDir} could not be removed: ${(removeError as Error).message}`;
-      }
+      const keptReason: string | null = await removeWorktreeSafely(locationPath, createdWorktreeDir);
+      if (keptReason !== null) return ` ${keptReason}`;
+      return branchAction?.type === "create" ? ` The new branch '${branchActionBranch}' was left in place.` : "";
     };
     try {
+      // Held from here, before any git call or checkout, until the instance is saved in state
+      // (or this handler ends): a stale-branch delete or an instance close can then never move a
+      // branch or remove a worktree between "decided" and "persisted". Always taken, branch
+      // action or not, since even a plain create saves a live instance in this location.
+      releaseWorktreeOps = await acquireWorktreeOpsLock();
+      // The state read in phase 1 may predate a create that held the lock before this one.
+      const currentInstances: InstanceRecord[] = (await loadState()).instances;
+      // An id persisted while this request waited would make the session lock below wait on a
+      // DELETE that is itself waiting for the lock held here; refuse before taking it.
+      if (currentInstances.some((existing) => existing.id === instance.id || existing.tmuxSession === instance.tmuxSession)) {
+        progress.fail("Could not register the new instance: id collision, please retry");
+        return;
+      }
+
       // Decided before anything touches git or the resume snapshot: a folder with a live session
       // must keep its branch, so the new instance gets a sibling worktree instead.
       let useWorktree = false;
       if (branchAction !== undefined) {
         let folderHasLiveInstance = false;
-        for (const existing of state.instances) {
+        for (const existing of currentInstances) {
           if (existing.locationPath === locationPath && (await getSessionPresence(existing.tmuxSession)) !== "absent") {
             folderHasLiveInstance = true;
             break;
@@ -1165,6 +1524,9 @@ apiRouter.post(
                 return { result: undefined, nextState: draft };
               });
               persisted = true;
+              // Saved, so every later worktree operation sees this instance; the rest of the
+              // launch (agent boot) no longer needs the lock.
+              releaseWorktreeOps?.();
               progress.stepDone("persist");
             },
             (step, phase) => {
@@ -1199,6 +1561,7 @@ apiRouter.post(
         `Could not create the instance: ${(error as Error).message}${persisted ? "" : await removeCreatedWorktree()}`
       );
     } finally {
+      releaseWorktreeOps?.();
       response.end();
     }
   })
@@ -1518,7 +1881,24 @@ apiRouter.delete(
         response.status(204).end();
         return;
       }
-      const warning: string | null = await removeWorktreeIfClean(preInstance.locationPath, worktree, removal.shared);
+      // Under the worktree-ops lock, with a fresh look at the instances: a creation that reused
+      // this worktree may have been saved while this request waited for its turn, and `shared`
+      // above predates it. Paths are compared resolved, so a symlinked registration counts.
+      const releaseWorktreeOps: () => void = await acquireWorktreeOpsLock();
+      let warning: string | null;
+      try {
+        const resolvedWorktree: string = await resolvedPath(preInstance.locationPath);
+        let sharedNow: boolean = removal.shared;
+        for (const other of (await loadState()).instances) {
+          if (isSameOrInside(resolvedWorktree, await resolvedPath(other.locationPath))) {
+            sharedNow = true;
+            break;
+          }
+        }
+        warning = await removeWorktreeIfClean(preInstance.locationPath, worktree, sharedNow);
+      } finally {
+        releaseWorktreeOps();
+      }
       if (warning === null) {
         response.status(204).end();
       } else {

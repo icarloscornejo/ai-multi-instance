@@ -145,7 +145,7 @@ export function CleanupBranchesModal({ location, onClose, onDeleted }: CleanupBr
                     {candidate.worktreePath !== undefined && (
                       <span
                         className="shrink-0 whitespace-nowrap rounded-full bg-raised-2 px-[6px] py-[2px] text-[9.5px] font-bold uppercase tracking-[.03em] text-diff-removed"
-                        title={`Checked out in another worktree at ${candidate.worktreePath}. Deleting it will remove that worktree folder, including any uncommitted changes in it.`}
+                        title={`Checked out in another worktree at ${candidate.worktreePath}. Deleting it removes that worktree folder only when it has nothing uncommitted, untracked or ignored in it; otherwise the folder and the branch are kept.`}
                       >
                         worktree
                       </span>
@@ -158,7 +158,11 @@ export function CleanupBranchesModal({ location, onClose, onDeleted }: CleanupBr
 
           {failedBranches.length > 0 && (
             <div className={errorTextClassName}>
-              Failed to delete: {failedBranches.map((failure) => failure.branch).join(", ")}
+              {failedBranches.map((failure) => (
+                <div key={failure.branch}>
+                  Kept {failure.branch}: {failure.error}
+                </div>
+              ))}
             </div>
           )}
           {deleteError !== null && <div className={errorTextClassName}>{deleteError}</div>}

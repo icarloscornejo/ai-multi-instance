@@ -531,6 +531,35 @@ describe("closing an instance never discards a worktree's files", () => {
     expect(await exists(path.join(worktree, "a.txt"))).toBe(true);
   });
 
+  it("regression: a worktree with uncommitted changes is kept, 200 with a warning, the record is still removed", async () => {
+    const repo = await repoIn("repo");
+    const worktree = addWorktree(repo, "feature/b");
+    await fs.writeFile(path.join(worktree, "a.txt"), "edited\n");
+    setState([repo], [worktreeInstance(repo, worktree, "feature/b")]);
+
+    const response = await closeInstance("inst0001");
+
+    expect(response.status).toBe(200);
+    expect((await response.json()).warning).toMatch(/uncommitted/i);
+    expect(await fs.readFile(path.join(worktree, "a.txt"), "utf8")).toBe("edited\n");
+    expect(stateInstances()).toHaveLength(0);
+  });
+
+  it("regression: two concurrent closes remove the worktree once, neither fails", async () => {
+    const repo = await repoIn("repo");
+    const worktree = addWorktree(repo, "feature/b");
+    setState([repo], [worktreeInstance(repo, worktree, "feature/b")]);
+
+    const statuses: number[] = (await Promise.all([closeInstance("inst0001"), closeInstance("inst0001")])).map(
+      (response) => response.status
+    );
+
+    expect(statuses.every((status) => status === 204 || status === 404)).toBe(true);
+    expect(statuses).toContain(204);
+    expect(await exists(worktree)).toBe(false);
+    expect(git(repo, "worktree", "list", "--porcelain")).not.toContain(worktree);
+  });
+
   it("regression: a clean worktree is removed and unregistered on close", async () => {
     const repo = await repoIn("repo");
     const worktree = addWorktree(repo, "feature/b");

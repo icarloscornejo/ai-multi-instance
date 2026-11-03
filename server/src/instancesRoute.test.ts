@@ -779,18 +779,8 @@ describe("POST /instances - sibling worktree when the folder already has a live 
     expect(vi.mocked(saveState)).not.toHaveBeenCalled();
   });
 
-  it("a failure after the worktree was added removes it without force and saves nothing", async () => {
-    initMock.mockRejectedValue(new Error("tmux new-session timed out"));
-    const events = await readNdjson(
-      await createInstanceRequest({ locationPath: SOURCE_FOLDER, label: "wt", branchAction: { type: "checkout", branch: "feature/x" } })
-    );
-    expect(events.at(-1)?.type).toBe("error");
-    const removals = gitCallsStartingWith("worktree", "remove");
-    expect(removals).toHaveLength(1);
-    expect(removals[0].args).toEqual(["worktree", "remove", FEATURE_DIR]);
-    expect(removals[0].args).not.toContain("--force");
-    expect(vi.mocked(saveState)).not.toHaveBeenCalled();
-  });
+  // The rollback of a failed launch removes the worktree through removeWorktreeSafely, which
+  // inspects the real folder; its cases (clean, ignored files) live in cleanupRoutes.real.test.ts.
 
   it("the same label inside an already registered worktree is rejected at commit", async () => {
     pathExistsOnly([SOURCE_FOLDER, FEATURE_DIR]);
@@ -824,37 +814,8 @@ describe("DELETE /instances/:id - worktree instances", () => {
     scriptGit({});
   });
 
-  it("clean created worktree: status checked inside it, removed from the source without force, 204", async () => {
-    stateWith(worktreeInstance());
-    const response = await deleteInstanceRequest("wt0001");
-
-    expect(response.status).toBe(204);
-    expect(gitCalls().find((call) => call.args[0] === "status")).toEqual({ cwd: FEATURE_DIR, args: statusArgs });
-    const removals = gitCallsStartingWith("worktree", "remove");
-    expect(removals).toEqual([{ cwd: SOURCE_FOLDER, args: ["worktree", "remove", FEATURE_DIR] }]);
-    expect(savedInstanceIds()).toEqual([]);
-  });
-
-  it("dirty worktree: kept, 200 with a warning, the record is still removed", async () => {
-    scriptGit({ status: " M file.ts\n" });
-    stateWith(worktreeInstance());
-    const response = await deleteInstanceRequest("wt0001");
-
-    expect(response.status).toBe(200);
-    expect(typeof (await response.json()).warning).toBe("string");
-    expect(gitCallsStartingWith("worktree", "remove")).toHaveLength(0);
-    expect(savedInstanceIds()).toEqual([]);
-  });
-
-  it("remove failure: 200 with a warning, the record is removed", async () => {
-    scriptGit({ remove: new GitError("fatal: cannot remove") });
-    stateWith(worktreeInstance());
-    const response = await deleteInstanceRequest("wt0001");
-
-    expect(response.status).toBe(200);
-    expect(typeof (await response.json()).warning).toBe("string");
-    expect(savedInstanceIds()).toEqual([]);
-  });
+  // Whether the worktree folder is clean, dirty, or removable depends on the real folder, so
+  // those cases (and the concurrent-delete one) run against real git in cleanupRoutes.real.test.ts.
 
   it("another instance at the same path shares the worktree: kept with a warning", async () => {
     stateWith(worktreeInstance(), worktreeInstance({ id: "wt0002", label: "other", tmuxSession: "ccdash-wt0002" }, false));
@@ -893,21 +854,6 @@ describe("DELETE /instances/:id - worktree instances", () => {
     expect(response.status).toBe(200);
     expect(typeof (await response.json()).warning).toBe("string");
     expect(savedInstanceIds()).toEqual([]);
-  });
-
-  it("two concurrent deletes remove the worktree once, the loser answers 204 without git", async () => {
-    let committedState: DashboardState = { ...baseState(), instances: [worktreeInstance()] } as DashboardState;
-    vi.mocked(loadState).mockImplementation(async () => committedState);
-    vi.mocked(saveState).mockImplementation(async (nextState: DashboardState) => {
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      committedState = structuredClone(nextState);
-    });
-
-    const responses = await Promise.all([deleteInstanceRequest("wt0001"), deleteInstanceRequest("wt0001")]);
-
-    expect(responses.map((response) => response.status)).toEqual([204, 204]);
-    expect(gitCallsStartingWith("worktree", "remove")).toHaveLength(1);
-    expect(gitCallsStartingWith("status")).toHaveLength(1);
   });
 
   it("an instance without a worktree still answers 204 and runs no git", async () => {
