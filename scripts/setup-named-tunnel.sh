@@ -55,7 +55,10 @@ CLOUDFLARED_HOME="${HOME}/.cloudflared"
 CERT_PEM="${CLOUDFLARED_HOME}/cert.pem"
 QUICK_TUNNEL_CONFIG="${CLOUDFLARED_HOME}/config.yml"
 METRICS_PORT="20241"
-PROTOCOL="auto"
+# http2, not cloudflared's default "auto": QUIC is UDP and many networks block or throttle it,
+# leaving the tunnel half connected (the quick tunnel in server/src/tunnel.ts forces http2 for
+# the same reason). http2 runs over plain TCP/TLS.
+PROTOCOL="http2"
 ORIGIN_SERVICE="http://127.0.0.1:3001"
 
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$1"; }
@@ -116,15 +119,17 @@ step "DNS route ${PUBLIC_HOSTNAME}"
 # rather than clobbering if a record for that hostname already exists and points somewhere else.
 # We deliberately do NOT pass --overwrite-dns: a pre-existing record is something the user has to
 # look at, not something this script should silently take over.
-if cloudflared tunnel route dns "${TUNNEL_NAME}" "${PUBLIC_HOSTNAME}" 2>/tmp/cf-route-dns.err; then
+ROUTE_DNS_ERR="$(mktemp)"
+trap 'rm -f "${ROUTE_DNS_ERR}"' EXIT
+if cloudflared tunnel route dns "${TUNNEL_NAME}" "${PUBLIC_HOSTNAME}" 2>"${ROUTE_DNS_ERR}"; then
   ok "DNS record for ${PUBLIC_HOSTNAME} points at this tunnel"
 else
-  if grep -qi "already exists\|record with that host" /tmp/cf-route-dns.err; then
+  if grep -qi "already exists\|record with that host" "${ROUTE_DNS_ERR}"; then
     warn "A DNS record for ${PUBLIC_HOSTNAME} already exists."
     echo   "      If it already points at THIS tunnel (${TUNNEL_ID}), you're fine, continuing."
     echo   "      If it points at something else, fix it in the Cloudflare dashboard before installing the service."
   else
-    cat /tmp/cf-route-dns.err >&2
+    cat "${ROUTE_DNS_ERR}" >&2
     die "cloudflared tunnel route dns failed (see above)."
   fi
 fi
@@ -143,6 +148,7 @@ cat > "${CONFIG_YML}" <<YAML
 # (which would break the built-in Quick Tunnel).
 tunnel: ${TUNNEL_ID}
 credentials-file: ${CREDENTIALS_FILE}
+# http2 (TCP) because QUIC (UDP) is blocked or throttled on many networks; same reason as the quick tunnel.
 protocol: ${PROTOCOL}
 metrics: 127.0.0.1:${METRICS_PORT}
 logfile: ${INSTALL_DIR}/data/cloudflared.log

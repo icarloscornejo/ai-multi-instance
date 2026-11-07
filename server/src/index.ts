@@ -27,7 +27,7 @@ import { registerHeartbeat, startHeartbeat } from "./heartbeat";
 import { startPrEventsPoller } from "./prEventsPoller";
 import { countSystemDynamicPtys, getPtmxMax } from "./ptyCapacity";
 import { apiRouter } from "./routes";
-import { getTunnelMode } from "./namedTunnel";
+import { getTunnelMode, migrateNamedTunnelProtocol } from "./namedTunnel";
 import { isLocalRequestHost } from "./requestHost";
 import { formatCrashLine, startServerLog } from "./serverLog";
 import { loadState, tmuxTmpdirRecordPath } from "./store";
@@ -336,5 +336,9 @@ httpServer.listen(serverPort, serverHost, () => {
   // also what makes a transaction interrupted by a `tsx` restart self-heal with no user action:
   // see updateTransaction.ts's header comment and updater.ts's reconcileFrontendPublishOnStartup.
   void reconcileFrontendPublishOnStartup();
+  // The unhandledRejection handler above exits the process, so a failed migration must be caught here.
+  migrateNamedTunnelProtocol().catch((error: unknown) => {
+    console.error(`[tunnel] protocol migration failed: ${describeError(error)}`);
+  });
   startPrEventsPoller();
 });

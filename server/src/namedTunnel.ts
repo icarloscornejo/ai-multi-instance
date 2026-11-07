@@ -155,8 +155,11 @@ function currentUid(): number {
   return typeof process.getuid === "function" ? process.getuid() : 0;
 }
 
-export function buildKickstartArgs(uid: number): string[] {
-  return ["kickstart", `gui/${uid}/${LAUNCHD_LABEL}`];
+// kill: true adds -k, which stops the running job and starts it again in one launchd operation
+// (what `npm run tunnel:restart` does), so a restart does not depend on racing KeepAlive.
+export function buildKickstartArgs(uid: number, options: { kill?: boolean } = {}): string[] {
+  const target = `gui/${uid}/${LAUNCHD_LABEL}`;
+  return options.kill === true ? ["kickstart", "-k", target] : ["kickstart", target];
 }
 
 export function buildKillArgs(uid: number): string[] {
@@ -345,4 +348,107 @@ export async function stopNamedTunnel(): Promise<TunnelStatus> {
     }
   }
   return computeStatus();
+}
+
+// ---- protocol migration ------------------------------------------------------------------
+
+export type ProtocolMigrationResult =
+  | { kind: "no-named-tunnel" }
+  | { kind: "no-config" }
+  | { kind: "unchanged" }
+  | { kind: "migrated"; from: "auto" | "unset"; restarted: boolean };
+
+// Only a bare `protocol: auto` is rewritten. Any other protocol line (http2, an explicit quic,
+// a quoted value, a trailing comment) is a choice or a hand edit we do not guess at, and adding
+// a second `protocol:` key next to it could make cloudflared refuse the file.
+const BARE_AUTO_PROTOCOL_LINE: RegExp = /^protocol:[ \t]*auto[ \t]*(\r?)$/m;
+const ANY_PROTOCOL_LINE: RegExp = /^protocol:/m;
+const INGRESS_LINE: RegExp = /^ingress:/m;
+
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function restartConnectorWithKickstart(): Promise<void> {
+  const { code } = await runLaunchctl(buildKickstartArgs(currentUid(), { kill: true }));
+  if (code !== 0) {
+    throw new Error(`launchctl kickstart exited ${code}`);
+  }
+}
+
+// cloudflared QUIC (UDP) is blocked or throttled on many networks, so installs made before the
+// setup script switched to http2 are rewritten once at server start. Everything is resolved from
+// `directory`, so it never reads the quick tunnel config or the credentials file.
+export async function migrateNamedTunnelProtocol(
+  options: { directory?: string; restartConnector?: () => Promise<void> } = {}
+): Promise<ProtocolMigrationResult> {
+  const directory: string = options.directory ?? namedTunnelDirectory;
+  const restartConnector: () => Promise<void> = options.restartConnector ?? restartConnectorWithKickstart;
+
+  if (!(await pathExists(path.join(directory, "tunnel.json")))) {
+    return { kind: "no-named-tunnel" };
+  }
+  const configPath: string = path.join(directory, "config.yml");
+  let original: string;
+  try {
+    original = await fs.readFile(configPath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { kind: "no-config" };
+    }
+    throw error;
+  }
+
+  let migrated: string;
+  let from: "auto" | "unset";
+  if (BARE_AUTO_PROTOCOL_LINE.test(original)) {
+    migrated = original.replace(
+      BARE_AUTO_PROTOCOL_LINE,
+      (_match: string, carriageReturn: string) => `protocol: http2${carriageReturn}`
+    );
+    from = "auto";
+  } else if (ANY_PROTOCOL_LINE.test(original)) {
+    return { kind: "unchanged" };
+  } else {
+    const lineEnding: string = original.includes("\r\n") ? "\r\n" : "\n";
+    const ingressMatch: RegExpExecArray | null = INGRESS_LINE.exec(original);
+    if (ingressMatch !== null) {
+      migrated = `${original.slice(0, ingressMatch.index)}protocol: http2${lineEnding}${original.slice(ingressMatch.index)}`;
+    } else {
+      const needsLineEnding: boolean = original.length > 0 && !original.endsWith("\n");
+      migrated = `${original}${needsLineEnding ? lineEnding : ""}protocol: http2${lineEnding}`;
+    }
+    from = "unset";
+  }
+
+  // Temp file + rename so a crash mid-write can never leave launchd a truncated config.yml.
+  const temporaryPath: string = `${configPath}.tmp-${process.pid}`;
+  try {
+    await fs.writeFile(temporaryPath, migrated, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    await fs.rename(temporaryPath, configPath);
+  } catch (error) {
+    await fs.rm(temporaryPath, { force: true });
+    throw error;
+  }
+  console.log(`[tunnel] migrated named tunnel protocol ${from} -> http2`);
+
+  // A stopped tunnel (no sentinel) is not restarted: that would bring it back up against the
+  // user's wish. It picks up http2 on its next start.
+  let restarted = false;
+  if (await pathExists(path.join(directory, "enabled"))) {
+    try {
+      await restartConnector();
+      restarted = true;
+    } catch (error) {
+      console.error(
+        `[tunnel] could not restart connector after protocol migration: ${(error as Error).message}. Run: npm run tunnel:restart`
+      );
+    }
+  }
+  return { kind: "migrated", from, restarted };
 }

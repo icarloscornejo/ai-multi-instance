@@ -118,6 +118,15 @@ describe("launchctl argument construction", () => {
     expect(buildKickstartArgs(501)).toEqual(["kickstart", "gui/501/com.ai-multi-instance.tunnel"]);
     expect(buildKillArgs(501)).toEqual(["kill", "SIGTERM", "gui/501/com.ai-multi-instance.tunnel"]);
   });
+
+  it("adds -k only when the caller asks to kill the running job during kickstart", () => {
+    expect(buildKickstartArgs(501, { kill: true })).toEqual([
+      "kickstart",
+      "-k",
+      "gui/501/com.ai-multi-instance.tunnel",
+    ]);
+    expect(buildKickstartArgs(501)).toEqual(["kickstart", "gui/501/com.ai-multi-instance.tunnel"]);
+  });
 });
 
 describe("start / stop transitions", () => {
