@@ -40,11 +40,11 @@ import {
 } from "./mobileSession";
 import { reconcileFetchedInstances, shouldApplyRefresh } from "./instanceSync";
 import { retryDelayMs } from "./retry";
+import { restartNotice, type RestartNotice } from "./restartAction";
 import type {
   CreateInstancePayload,
   DashboardConfig,
   Instance,
-  RestartResult,
   UpdateInstancePayload,
   UpdateStatus,
 } from "./types";
@@ -61,6 +61,10 @@ const INSTANCES_REFRESH_INTERVAL_MS = 5_000;
 // A GET that hangs (slow tunnel, dead connection) must not hold the single in-flight slot
 // forever, or every later poll would be skipped and the tab would never resync.
 const INSTANCES_REFRESH_TIMEOUT_MS = 10_000;
+// Carlos: waiting longer than this for a restart answer feels stuck. The server keeps going if
+// it is slower; the notice then says to check the terminal.
+const RESTART_ANSWER_DEADLINE_MS = 10_000;
+const RESTART_NOTICE_VISIBLE_MS = 6_000;
 
 export function App() {
   const [config, setConfig] = useState<DashboardConfig | null>(null);
@@ -75,6 +79,7 @@ export function App() {
   // The state file vanishes after /exit and reappears for the new process while the request is
   // still running, so the button is gated by this flag, not by the agent state.
   const [restartingInstanceIds, setRestartingInstanceIds] = useState<ReadonlySet<string>>(new Set());
+  const [restartNoticeShown, setRestartNoticeShown] = useState<RestartNotice | null>(null);
   const [loadFailure, setLoadFailure] = useState<"connection" | "server" | null>(null);
   // Mirrors loadFailure for the wake-retry handler below, which is registered once and
   // would otherwise close over the initial (stale) value instead of the live one.
@@ -630,22 +635,28 @@ export function App() {
     return deleteResult;
   };
 
-  const confirmRestart = async (): Promise<RestartResult> => {
+  // The dialog closes at once; the sidebar shows the pending state and the outcome comes back as a notice.
+  const confirmRestart = async (): Promise<void> => {
     if (restartRequest === null) {
-      throw new ApiError("No instance selected.", 400);
+      return;
     }
-    const targetId: string = restartRequest.id;
-    setRestartingInstanceIds((previousIds) => new Set(previousIds).add(targetId));
-    try {
-      return await api.restartInstance(targetId);
-    } finally {
-      setRestartingInstanceIds((previousIds) => {
-        const remainingIds: Set<string> = new Set(previousIds);
-        remainingIds.delete(targetId);
-        return remainingIds;
-      });
-    }
+    const target: Instance = restartRequest;
+    setRestartRequest(null);
+    setRestartingInstanceIds((previousIds) => new Set(previousIds).add(target.id));
+    const notice: RestartNotice = await restartNotice(target.label, api.restartInstance(target.id), RESTART_ANSWER_DEADLINE_MS);
+    setRestartingInstanceIds((previousIds) => {
+      const remainingIds: Set<string> = new Set(previousIds);
+      remainingIds.delete(target.id);
+      return remainingIds;
+    });
+    setRestartNoticeShown(notice);
   };
+
+  useEffect(() => {
+    if (restartNoticeShown === null) return;
+    const timer = setTimeout(() => setRestartNoticeShown(null), RESTART_NOTICE_VISIBLE_MS);
+    return () => clearTimeout(timer);
+  }, [restartNoticeShown]);
 
   const reorderInstances = (orderedIds: string[]): void => {
     setInstances((previousInstances) => {
@@ -847,7 +858,18 @@ export function App() {
       )}
 
       {restartRequest !== null && (
-        <RestartConfirmModal instance={restartRequest} onConfirm={confirmRestart} onClose={() => setRestartRequest(null)} />
+        <RestartConfirmModal instance={restartRequest} onConfirm={() => void confirmRestart()} onClose={() => setRestartRequest(null)} />
+      )}
+
+      {restartNoticeShown !== null && (
+        <div
+          role="status"
+          className={`fixed bottom-[16px] right-[16px] z-50 max-w-[360px] rounded-[8px] border border-border-strong bg-surface px-[12px] py-[8px] text-[12px] leading-[1.5] shadow-lg ${
+            restartNoticeShown.tone === "ok" ? "text-txt-body" : restartNoticeShown.tone === "warn" ? "text-status-warn" : "text-diff-removed"
+          }`}
+        >
+          {restartNoticeShown.text}
+        </div>
       )}
 
       {deleteRequest !== null && (
