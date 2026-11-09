@@ -347,6 +347,10 @@ export async function setSessionEnvironment(sessionName: string, name: string, v
   await runTmux(["set-environment", "-t", sessionName, name, value]);
 }
 
+export async function unsetSessionEnvironment(sessionName: string, name: string): Promise<void> {
+  await runTmux(["set-environment", "-u", "-t", sessionName, name]);
+}
+
 // tmux "wait-for" channels are a named, server-side semaphore: "-S" signals a channel (never
 // blocks), a bare "wait-for <channel>" blocks until signaled - or returns immediately if the
 // channel was already signaled first, so callers on either side of this pair never race each
@@ -424,6 +428,42 @@ export async function getOriginalPanePid(sessionName: string): Promise<number> {
   const original = pickOriginalPane(output);
   if (original === null) throw new TmuxError(`No pane found for session ${sessionName}`);
   return original.panePid;
+}
+
+export async function getOriginalPaneId(sessionName: string): Promise<string> {
+  const output: string = await runTmux(["list-panes", "-s", "-t", sessionName, "-F", "#{pane_id} #{pane_pid}"]);
+  const original = pickOriginalPane(output);
+  if (original === null) throw new TmuxError(`No pane found for session ${sessionName}`);
+  return original.paneId;
+}
+
+// -J joins wrapped lines, so a long resume hint stays on one line.
+export async function capturePane(target: string, lines: number): Promise<string> {
+  return runTmux(["capture-pane", "-p", "-J", "-t", target, "-S", `-${lines}`]);
+}
+
+// Pane sends can carry the launch command or typed text, and tmux echoes argv in its errors,
+// so a failure becomes a fixed message that keeps only whether the call timed out.
+async function sendToPane(target: string, sendKeysArguments: string[]): Promise<void> {
+  try {
+    await runTmux(["send-keys", "-t", target, ...sendKeysArguments]);
+  } catch (error) {
+    throw new TmuxError("Could not send keys to the tmux pane", error instanceof TmuxError && error.killed);
+  }
+}
+
+export async function sendTextToPane(target: string, text: string): Promise<void> {
+  await sendToPane(target, ["-l", text]);
+}
+
+export async function sendEnterToPane(target: string): Promise<void> {
+  await sendToPane(target, ["Enter"]);
+}
+
+// Shift+Tab, tmux's name for it, is the only key the restart flow needs besides Enter.
+export async function sendKeyToPane(target: string, key: "BTab"): Promise<void> {
+  if (key !== "BTab") throw new TmuxError("Refusing to send a key outside the allow-list");
+  await sendToPane(target, [key]);
 }
 
 // TMUX_TMPDIRs the dashboard pinned before the current one (see resolveTmuxTmpdir in

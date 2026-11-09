@@ -84,7 +84,18 @@ describe("classifyPane", () => {
       agentPid: 301,
       startedAtMs: NOW_MS - 120_000,
       resumeId: "abcdef12",
+      paneJobArgs: "/bin/bash /Users/x/bin/claude-me --resume abcdef12",
     });
+  });
+
+  it("exposes the args of the pane job process, the launcher row, for the restart command", () => {
+    const rows = [shell, row(300, 100, 300, 300, "/bin/bash /Users/x/bin/claude-me --model opusplan -n Label"), row(301, 300, 300, 300, "claude --model opusplan")];
+
+    expect(classifyPane(rows, 100, NOW_MS)).toMatchObject({ kind: "agent", paneJobPid: 300, paneJobArgs: "/bin/bash /Users/x/bin/claude-me --model opusplan -n Label" });
+  });
+
+  it("exposes the pane shell args for exec claude, where the shell is the agent", () => {
+    expect(classifyPane([row(100, 1, 100, 100, "claude --model x")], 100, NOW_MS)).toMatchObject({ kind: "agent", paneJobPid: 100, paneJobArgs: "claude --model x" });
   });
 
   it("finds an npm-installed agent running as node", () => {
@@ -107,11 +118,18 @@ describe("classifyPane", () => {
 
   it("reports none for an idle prompt with a background child", () => {
     const idleShell = row(100, 1, 100, 100, "-zsh");
-    expect(classifyPane([idleShell, row(250, 100, 250, 100, "gitstatusd")], 100, NOW_MS)).toEqual({ kind: "none" });
+    expect(classifyPane([idleShell, row(250, 100, 250, 100, "gitstatusd")], 100, NOW_MS)).toEqual({ kind: "none", shellOwnsForeground: true });
   });
 
   it("reports none for a non-agent foreground program", () => {
-    expect(classifyPane([shell, row(300, 100, 300, 300, "vim notes.txt")], 100, NOW_MS)).toEqual({ kind: "none" });
+    expect(classifyPane([shell, row(300, 100, 300, 300, "vim notes.txt")], 100, NOW_MS)).toEqual({ kind: "none", shellOwnsForeground: false });
+  });
+
+  it("does not let a wrapper that lingers in the foreground count as the shell owning it", () => {
+    // claude exited but the bash wrapper still holds the terminal: the loader line would go to its stdin.
+    const rows = [shell, row(300, 100, 300, 300, "/bin/bash /Users/x/bin/claude-me --model x")];
+
+    expect(classifyPane(rows, 100, NOW_MS)).toEqual({ kind: "none", shellOwnsForeground: false });
   });
 
   it("handles exec claude, where the pane shell itself is the agent", () => {

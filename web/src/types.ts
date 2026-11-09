@@ -159,6 +159,18 @@ export type ReviewRequest =
 
 export type AgentState = "waiting" | "working" | "idle";
 
+export interface RestartResult {
+  ok: true;
+  sessionId: string;
+  hintSessionId?: string;
+  replacedSessionId?: string;
+  versionBefore: string | null;
+  versionAfter: string | null;
+  autoMode: "not-applicable" | "on" | "unconfirmed";
+  currentMode?: string;
+  commandSource: "process" | "instance" | "hint";
+}
+
 export type AgentStatesResponse = Record<string, { state: AgentState; updatedAt: string }>;
 
 export interface LiveStatus {

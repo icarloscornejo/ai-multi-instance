@@ -120,6 +120,76 @@ async function readAgentEnvironment(agent: AgentFound): Promise<AgentEnvironment
   return environment;
 }
 
+export type ConfigDirReading = { kind: "set"; dir: string } | { kind: "unset" } | { kind: "unreadable" };
+
+export interface AgentEnvironmentReading {
+  configDir: ConfigDirReading;
+  hasInstanceId: boolean;
+}
+
+type PsRunner = (argv: string[]) => Promise<string>;
+
+const runPs: PsRunner = async (argv) => (await execFileAsync("ps", argv, { timeout: 5_000 })).stdout;
+
+function stripTrailingSlashes(directory: string): string {
+  return directory.replace(/\/+$/, "");
+}
+
+// An unset CLAUDE_CONFIG_DIR means Claude's default profile, which is what the statusline stores.
+export function sameProfile(running: ConfigDirReading, instanceConfigDir: string | undefined): boolean {
+  if (instanceConfigDir === undefined || running.kind === "unreadable") return false;
+  const runningDir: string = running.kind === "set" ? running.dir : path.join(os.homedir(), ".claude");
+  return stripTrailingSlashes(runningDir) === stripTrailingSlashes(instanceConfigDir);
+}
+
+// Fresh read each call, never cached. Only the suffix ps eww adds after the args is searched,
+// so a -n value that looks like CLAUDE_CONFIG_DIR=... cannot pose as the environment.
+export async function readAgentConfigDir(agentPid: number, run: PsRunner = runPs): Promise<AgentEnvironmentReading> {
+  try {
+    const args: string = (await run(["-ww", "-o", "args=", "-p", String(agentPid)])).trim();
+    const withEnvironment: string = (await run(["eww", "-o", "command=", "-p", String(agentPid)])).trim();
+    if (!withEnvironment.startsWith(args) || withEnvironment.slice(args.length).trim() === "") {
+      return { configDir: { kind: "unreadable" }, hasInstanceId: false };
+    }
+    const environment: string = withEnvironment.slice(args.length);
+    const match = / CLAUDE_CONFIG_DIR=(.*?)(?= [A-Za-z_][A-Za-z0-9_]*=|\s*$)/.exec(environment);
+    return {
+      configDir: match === null ? { kind: "unset" } : { kind: "set", dir: stripTrailingSlashes(match[1]) },
+      hasInstanceId: / AI_MULTI_INSTANCE_ID=/.test(environment),
+    };
+  } catch {
+    // The error can carry the whole environment, so nothing from it is kept.
+    return { configDir: { kind: "unreadable" }, hasInstanceId: false };
+  }
+}
+
+export async function readAgentCwd(agentPid: number): Promise<string | null> {
+  const { stdout } = await execFileAsync("lsof", ["-a", "-d", "cwd", "-Fn", "-p", String(agentPid)], { timeout: 5_000 });
+  return stdout.split("\n").find((line) => line.startsWith("n"))?.slice(1) ?? null;
+}
+
+export async function readAgentArgs(agentPid: number): Promise<string> {
+  return (await runPs(["-ww", "-o", "args=", "-p", String(agentPid)])).trim();
+}
+
+// Newest transcript of the cwd inside an explicitly resolved profile, never a guessed ~/.claude.
+export async function pickClaudeTranscript(
+  profileDir: string,
+  cwd: string,
+  ownedSessionIds: ReadonlySet<string>
+): Promise<string | null> {
+  const projectDir: string = path.join(profileDir, "projects", claudeProjectDirName(cwd));
+  const names: string[] = (await fs.readdir(projectDir).catch(() => [])).filter((name) => name.endsWith(".jsonl"));
+  let best: { sessionId: string; mtimeMs: number } | null = null;
+  for (const name of names) {
+    const sessionId: string = name.slice(0, -".jsonl".length);
+    if (ownedSessionIds.has(sessionId)) continue;
+    const stats = await fs.stat(path.join(projectDir, name)).catch(() => null);
+    if (stats !== null && (best === null || stats.mtimeMs > best.mtimeMs)) best = { sessionId, mtimeMs: stats.mtimeMs };
+  }
+  return best?.sessionId ?? null;
+}
+
 // Claude names a project's transcript folder after the launch cwd with every character that is
 // not alphanumeric replaced by "-" (so "AORUM Strategies" becomes "AORUM-Strategies").
 export function claudeProjectDirName(cwd: string): string {
@@ -137,7 +207,7 @@ interface TranscriptPick {
 
 const transcriptPickCache: Map<string, { dirMtimeMs: number; pick: TranscriptPick | null }> = new Map();
 
-async function pickClaudeTranscript(
+async function pickTranscriptForAgent(
   projectDir: string,
   agent: AgentFound,
   ownedSessionIds: ReadonlySet<string>
@@ -232,7 +302,7 @@ export async function claudeFallback(agent: AgentFound, ownedSessionIds: Readonl
   const { configDir: detectedConfigDir, cwd } = await readAgentEnvironment(agent);
   if (cwd === null) return null;
   const configDir: string = detectedConfigDir ?? path.join(os.homedir(), ".claude");
-  const pick = await pickClaudeTranscript(
+  const pick = await pickTranscriptForAgent(
     path.join(configDir, "projects", claudeProjectDirName(cwd)),
     agent,
     ownedSessionIds

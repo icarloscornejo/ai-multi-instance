@@ -17,6 +17,7 @@ import {
 } from "./prEvents";
 import { collectGitlabEvents, isSafeProjectPath, isValidGitlabHost, parseGitlabMr } from "./prEventsGitlab";
 import { reviewRequestFor, type ReviewRequest } from "./reviewRequests";
+import { isRestartInProgress } from "./sessionRestart";
 import { withSessionLock } from "./sessionLock";
 import { loadState, stateFilePath, writeStateFileAtomic } from "./store";
 import { clientActivitySeconds, getPaneCurrentPath, pasteToSession } from "./tmux";
@@ -69,6 +70,8 @@ export interface PrEventsPollerDeps {
   clientActivity: (tmuxSession: string) => Promise<number | null>;
   paste: (tmuxSession: string, text: string) => Promise<{ submitted: boolean }>;
   withLock: <T>(tmuxSession: string, run: () => Promise<T>) => Promise<T>;
+  // Optional: while a restart owns the pane, delivery leaves the queue for the next sweep.
+  isRestarting?: (tmuxSession: string) => boolean;
   settleMs?: number;
 }
 
@@ -679,6 +682,7 @@ async function deliverOne(deps: PrEventsPollerDeps, instanceId: string, tmuxSess
   // Every condition is checked again inside the session lock, right before typing: the state the
   // sweep started from can be seconds old, and a paste into the wrong moment is not undoable.
   await deps.withLock(tmuxSession, async () => {
+    if (deps.isRestarting?.(tmuxSession) === true) return;
     const fresh: InstanceRecord | undefined = (await deps.loadState()).instances.find((candidate) => candidate.id === instanceId);
     if (fresh === undefined || !isPollable(fresh)) return;
     const entry: PrEventsEntry | undefined = memory?.instances[instanceId];
@@ -698,6 +702,8 @@ async function deliverOne(deps: PrEventsPollerDeps, instanceId: string, tmuxSess
       recentClientActivity: clientIdleSeconds !== null && clientIdleSeconds * 1000 < settleMs,
     });
     if (!allowed) return;
+    // A restart can begin during the awaits above, so the flag is read again right before typing.
+    if (deps.isRestarting?.(tmuxSession) === true) return;
     const batch: PrEvent[] = [...entry.queue];
     try {
       await deps.paste(fresh.tmuxSession, formatMessage(entry.prNumber, batch, entry.provider ?? "github"));
@@ -779,6 +785,7 @@ function realDeps(): PrEventsPollerDeps {
     clientActivity: clientActivitySeconds,
     paste: pasteToSession,
     withLock: withSessionLock,
+    isRestarting: isRestartInProgress,
   };
 }
 

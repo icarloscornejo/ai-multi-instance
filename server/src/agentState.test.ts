@@ -39,6 +39,20 @@ describe("parseAgentStateFile", () => {
     expect(parseAgentStateFile(stateFile({ state }))).toMatchObject({ state, paneJobPid: 4242, updatedAt: "2026-11-02T10:00:00Z" });
   });
 
+  it("keeps the session id the hook wrote, so a restart can resume the right conversation", () => {
+    expect(parseAgentStateFile(stateFile({ sessionId: "0198aaaa-bbbb-4ccc-8ddd-eeeeffff0001" }))).toMatchObject({
+      sessionId: "0198aaaa-bbbb-4ccc-8ddd-eeeeffff0001",
+    });
+  });
+
+  it.each([
+    ["missing", stateFile({ sessionId: undefined })],
+    ["a number", stateFile({ sessionId: 7 })],
+    ["null", stateFile({ sessionId: null })],
+  ])("reports a null session id when it is %s, without invalidating the file", (_name, raw) => {
+    expect(parseAgentStateFile(raw)).toMatchObject({ state: "waiting", paneJobPid: 4242, sessionId: null });
+  });
+
   it.each([
     ["an unknown state string", stateFile({ state: "blocked" })],
     ["a non-string state", stateFile({ state: 3 })],

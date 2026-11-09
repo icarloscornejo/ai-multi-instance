@@ -10,6 +10,7 @@ import { MobileKeyBar } from "./components/MobileKeyBar";
 import { MobileTerminalChrome } from "./components/MobileTerminalChrome";
 import { NewInstanceModal } from "./components/NewInstanceModal";
 import { RequiredUpdateBanner } from "./components/RequiredUpdateBanner";
+import { RestartConfirmModal } from "./components/RestartConfirmModal";
 import { ServerErrorScreen } from "./components/ServerErrorScreen";
 import { SetupScreen } from "./components/SetupScreen";
 import { Sidebar } from "./components/Sidebar";
@@ -43,6 +44,7 @@ import type {
   CreateInstancePayload,
   DashboardConfig,
   Instance,
+  RestartResult,
   UpdateInstancePayload,
   UpdateStatus,
 } from "./types";
@@ -69,6 +71,10 @@ export function App() {
   const [updateViewOpen, setUpdateViewOpen] = useState<boolean>(false);
   const [autoApplyOnOpen, setAutoApplyOnOpen] = useState<boolean>(false);
   const [deleteRequest, setDeleteRequest] = useState<Instance | null>(null);
+  const [restartRequest, setRestartRequest] = useState<Instance | null>(null);
+  // The state file vanishes after /exit and reappears for the new process while the request is
+  // still running, so the button is gated by this flag, not by the agent state.
+  const [restartingInstanceIds, setRestartingInstanceIds] = useState<ReadonlySet<string>>(new Set());
   const [loadFailure, setLoadFailure] = useState<"connection" | "server" | null>(null);
   // Mirrors loadFailure for the wake-retry handler below, which is registered once and
   // would otherwise close over the initial (stale) value instead of the live one.
@@ -624,6 +630,23 @@ export function App() {
     return deleteResult;
   };
 
+  const confirmRestart = async (): Promise<RestartResult> => {
+    if (restartRequest === null) {
+      throw new ApiError("No instance selected.", 400);
+    }
+    const targetId: string = restartRequest.id;
+    setRestartingInstanceIds((previousIds) => new Set(previousIds).add(targetId));
+    try {
+      return await api.restartInstance(targetId);
+    } finally {
+      setRestartingInstanceIds((previousIds) => {
+        const remainingIds: Set<string> = new Set(previousIds);
+        remainingIds.delete(targetId);
+        return remainingIds;
+      });
+    }
+  };
+
   const reorderInstances = (orderedIds: string[]): void => {
     setInstances((previousInstances) => {
       const instanceById: Map<string, Instance> = new Map(
@@ -705,6 +728,9 @@ export function App() {
           onNewInstance={() => setIsNewInstanceModalOpen(true)}
           onUpdate={updateInstance}
           onCloseRequest={setDeleteRequest}
+          agentState={agentStates[activeInstance.id]}
+          restartPending={restartingInstanceIds.has(activeInstance.id)}
+          onRestartRequest={setRestartRequest}
           prEventsInfo={prEvents[activeInstance.id]}
         />
       )}
@@ -799,6 +825,9 @@ export function App() {
             gitBranch={activeGitBranch}
             onUpdate={updateInstance}
             onDeleteRequest={setDeleteRequest}
+            agentState={agentStates[activeInstance.id]}
+            restartPending={restartingInstanceIds.has(activeInstance.id)}
+            onRestartRequest={setRestartRequest}
             prEventsInfo={prEvents[activeInstance.id]}
           />
         )}
@@ -815,6 +844,10 @@ export function App() {
           onCreate={createInstance}
           onClose={() => setIsNewInstanceModalOpen(false)}
         />
+      )}
+
+      {restartRequest !== null && (
+        <RestartConfirmModal instance={restartRequest} onConfirm={confirmRestart} onClose={() => setRestartRequest(null)} />
       )}
 
       {deleteRequest !== null && (

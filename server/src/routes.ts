@@ -56,6 +56,8 @@ import { isValidGitlabHost, isValidTokenEnvName, normalizeGitlabHostKey } from "
 import { LaunchProgress } from "./launchProgress";
 import { initializeInstanceSession } from "./terminal";
 import { withSessionLock } from "./sessionLock";
+import { realRestartDeps } from "./restartDeps";
+import { handleRestartRequest, restartClaudeSession } from "./sessionRestart";
 import { getTunnelStatus, readTunnelLog, startTunnel, stopTunnel } from "./tunnel";
 import { getNamedTunnelStatus, getTunnelMode, startNamedTunnel, stopNamedTunnel } from "./namedTunnel";
 import { clientAddressOf, isLocalRequest, isLocalRequestHost } from "./requestHost";
@@ -1718,6 +1720,20 @@ apiRouter.get(
     const branch: string | null = await currentBranch(cwd);
 
     response.json(branch === null ? { cwd } : { cwd, branch });
+  })
+);
+
+// The handler owns single-flight, the status mapping and the one fixed log line.
+apiRouter.post(
+  "/instances/:id/restart",
+  wrapAsync(async (request, response) => {
+    const restartDeps = realRestartDeps();
+    const { status, body } = await handleRestartRequest(String(request.params.id), {
+      loadInstance: async (instanceId) => (await loadState()).instances.find((candidate) => candidate.id === instanceId),
+      restart: (instance) => restartClaudeSession(instance, restartDeps),
+      log: (line) => console.log(`[server] ${line}`),
+    });
+    response.status(status).json(body);
   })
 );
 

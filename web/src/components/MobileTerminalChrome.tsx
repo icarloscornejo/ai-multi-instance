@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { Instance, PrEventsResponse, UpdateInstancePayload } from "../types";
+import type { AgentState, Instance, PrEventsResponse, UpdateInstancePayload } from "../types";
 import { ActionSheet } from "./ActionSheet";
 import { BottomSheet } from "./BottomSheet";
 import { InstanceSettingsSheet } from "./InstanceSettingsSheet";
@@ -12,6 +12,9 @@ interface MobileTerminalChromeProps {
   onNewInstance: () => void;
   onUpdate: (instanceId: string, payload: UpdateInstancePayload) => void;
   onCloseRequest: (instance: Instance) => void;
+  agentState: AgentState | undefined;
+  restartPending: boolean;
+  onRestartRequest: (instance: Instance) => void;
   prEventsInfo?: PrEventsResponse[string];
 }
 
@@ -23,6 +26,9 @@ export function MobileTerminalChrome({
   onNewInstance,
   onUpdate,
   onCloseRequest,
+  agentState,
+  restartPending,
+  onRestartRequest,
   prEventsInfo,
 }: MobileTerminalChromeProps) {
   const [switcherOpen, setSwitcherOpen] = useState<boolean>(false);
@@ -120,6 +126,9 @@ export function MobileTerminalChrome({
           instance={instance}
           onUpdate={onUpdate}
           onDeleteRequest={onCloseRequest}
+          agentState={agentState}
+          restartPending={restartPending}
+          onRestartRequest={onRestartRequest}
           onClose={() => setSettingsOpen(false)}
           prEventsInfo={prEventsInfo}
         />

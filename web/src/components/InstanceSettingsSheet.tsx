@@ -7,7 +7,8 @@ import {
   formatCompactNumber,
   usagePctColorClass,
 } from "../liveStatusFormatting";
-import type { Instance, PrEventsResponse, UpdateInstancePayload } from "../types";
+import type { AgentState, Instance, PrEventsResponse, UpdateInstancePayload } from "../types";
+import { restartBlockReason } from "../restartAction";
 import { BottomSheet } from "./BottomSheet";
 import { BranchGitLine } from "./BranchGitLine";
 import { prEventsHeading } from "../prEvents";
@@ -18,6 +19,9 @@ interface InstanceSettingsSheetProps {
   instance: Instance;
   onUpdate: (instanceId: string, payload: UpdateInstancePayload) => void;
   onDeleteRequest: (instance: Instance) => void;
+  agentState: AgentState | undefined;
+  restartPending: boolean;
+  onRestartRequest: (instance: Instance) => void;
   onClose: () => void;
   prEventsInfo?: PrEventsResponse[string];
 }
@@ -31,7 +35,17 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
-export function InstanceSettingsSheet({ instance, onUpdate, onDeleteRequest, onClose, prEventsInfo }: InstanceSettingsSheetProps) {
+export function InstanceSettingsSheet({
+  instance,
+  onUpdate,
+  onDeleteRequest,
+  agentState,
+  restartPending,
+  onRestartRequest,
+  onClose,
+  prEventsInfo,
+}: InstanceSettingsSheetProps) {
+  const restartBlocked: string | null = restartBlockReason(agentState, restartPending);
   const worktreeInfo = worktreeLabel(instance);
   const [labelDraft, setLabelDraft] = useState<string>(instance.label);
   const [commandDraft, setCommandDraft] = useState<string>(instance.command);
@@ -189,6 +203,22 @@ export function InstanceSettingsSheet({ instance, onUpdate, onDeleteRequest, onC
             )}
           </div>
         )}
+
+        <div className="flex flex-col gap-[4px]">
+          <button
+            type="button"
+            onClick={() => {
+              onClose();
+              onRestartRequest(instance);
+            }}
+            disabled={restartBlocked !== null}
+            title={restartBlocked ?? "Restart the session and resume the conversation"}
+            className="self-start rounded-sm px-[6px] py-[10px] text-[13px] font-semibold text-txt-secondary hover:bg-raised hover:text-txt-bright disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
+          >
+            ↻ Restart session
+          </button>
+          {restartBlocked !== null && <div className="px-[6px] text-[11px] text-txt-dimmer">{restartBlocked}</div>}
+        </div>
 
         <button
           type="button"

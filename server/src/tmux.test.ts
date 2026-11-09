@@ -18,9 +18,14 @@ vi.mock("node:child_process", () => {
 import { execFile } from "node:child_process";
 import {
   TmuxError,
+  capturePane,
   clientActivitySeconds,
   createSession,
+  getOriginalPaneId,
   pasteToSession,
+  sendEnterToPane,
+  sendKeyToPane,
+  sendTextToPane,
   getSessionPresence,
   isDuplicateSessionError,
   isSessionInitIncomplete,
@@ -451,5 +456,71 @@ describe("clientActivitySeconds", () => {
     runTmuxMock.mockResolvedValue({ stdout, stderr: "" });
 
     expect(await clientActivitySeconds("ccdash-abc")).toBeNull();
+  });
+});
+
+describe("pane-targeted helpers for restart", () => {
+  it("getOriginalPaneId lists the panes of the session and returns the lowest pane id", async () => {
+    runTmuxMock.mockResolvedValue({ stdout: "%12 500\n%7 300\n%9 400", stderr: "" });
+
+    expect(await getOriginalPaneId("ccdash-abc")).toBe("%7");
+    expect(runTmuxMock).toHaveBeenCalledWith("tmux", expect.arrayContaining(["list-panes", "-t", "ccdash-abc"]), expect.anything());
+  });
+
+  it("getOriginalPaneId rejects when the session has no pane", async () => {
+    runTmuxMock.mockResolvedValue({ stdout: "", stderr: "" });
+
+    await expect(getOriginalPaneId("ccdash-abc")).rejects.toBeInstanceOf(Error);
+  });
+
+  it("capturePane builds exactly the joined-lines capture argv for the target", async () => {
+    runTmuxMock.mockResolvedValue({ stdout: "line one\nline two", stderr: "" });
+
+    const text = await capturePane("%7", 80);
+
+    expect(text).toBe("line one\nline two");
+    expect(runTmuxMock).toHaveBeenCalledWith("tmux", ["capture-pane", "-p", "-J", "-t", "%7", "-S", "-80"], expect.anything());
+  });
+
+  it("sendKeyToPane sends BTab to the pane as a key name", async () => {
+    runTmuxMock.mockResolvedValue({ stdout: "", stderr: "" });
+
+    await sendKeyToPane("%7", "BTab");
+
+    expect(runTmuxMock).toHaveBeenCalledWith("tmux", ["send-keys", "-t", "%7", "BTab"], expect.anything());
+  });
+
+  it("sendKeyToPane refuses any key outside the allow-list and sends nothing", async () => {
+    for (const key of ["Enter", "C-c", "Escape", "BTab; kill-server"]) {
+      await expect(sendKeyToPane("%7", key as "BTab")).rejects.toBeInstanceOf(Error);
+    }
+    expect(runTmuxMock).not.toHaveBeenCalled();
+  });
+
+  it("sendTextToPane types the text literally into the pane and never presses Enter", async () => {
+    runTmuxMock.mockResolvedValue({ stdout: "", stderr: "" });
+
+    await sendTextToPane("%7", "/exit");
+
+    expect(runTmuxMock).toHaveBeenCalledTimes(1);
+    expect(runTmuxMock).toHaveBeenCalledWith("tmux", ["send-keys", "-t", "%7", "-l", "/exit"], expect.anything());
+  });
+
+  it("sendEnterToPane presses only Enter in the pane", async () => {
+    runTmuxMock.mockResolvedValue({ stdout: "", stderr: "" });
+
+    await sendEnterToPane("%7");
+
+    expect(runTmuxMock).toHaveBeenCalledWith("tmux", ["send-keys", "-t", "%7", "Enter"], expect.anything());
+  });
+
+  it("a failing pane send surfaces a fixed message that does not echo the typed text", async () => {
+    runTmuxMock.mockRejectedValue(execError({ message: "Command failed: tmux send-keys -l SECRET_VALUE", stderr: "SECRET_VALUE" }));
+
+    const error: unknown = await sendTextToPane("%7", "SECRET_VALUE").catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(JSON.stringify(error)).not.toContain("SECRET_VALUE");
+    expect((error as Error).message).not.toContain("SECRET_VALUE");
   });
 });

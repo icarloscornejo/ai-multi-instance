@@ -653,6 +653,53 @@ describe("deliverSweep", () => {
     expect(getPrEventsStatus().aaa111?.pending).toBe(0);
   });
 
+  it("skips the paste and keeps the whole queue while a restart is in progress, then delivers after it ends", async () => {
+    let restarting = true;
+    const checked: string[] = [];
+    const h = ready({
+      isRestarting: (session: string) => {
+        checked.push(session);
+        return restarting;
+      },
+    });
+
+    await deliverSweep(h.deps);
+
+    expect(h.paste).not.toHaveBeenCalled();
+    expect(h.entry("aaa111").queue).toHaveLength(2);
+    expect(checked).toContain("ccdash-aaa111");
+
+    restarting = false;
+    await deliverSweep(h.deps);
+
+    expect(h.paste).toHaveBeenCalledTimes(1);
+    expect(h.entry("aaa111").queue).toEqual([]);
+  });
+
+  it("pastes nothing when a restart begins between the pane probe and the paste, and keeps the queue", async () => {
+    let restarting = false;
+    const h = ready({
+      isRestarting: () => restarting,
+      probePane: async () => {
+        restarting = true;
+        return claudeAgent(4242);
+      },
+    });
+
+    await deliverSweep(h.deps);
+
+    expect(h.paste).not.toHaveBeenCalled();
+    expect(h.entry("aaa111").queue).toHaveLength(2);
+  });
+
+  it("delivers as before when no isRestarting dependency is wired", async () => {
+    const h = ready();
+
+    await deliverSweep(h.deps);
+
+    expect(h.paste).toHaveBeenCalledTimes(1);
+  });
+
   it("delivers when the idle state is three hours old", async () => {
     const h = ready({ readAgentState: async () => ({ state: "idle", updatedAt: new Date(NOW - 3 * 3_600_000).toISOString(), paneJobPid: 4242 }) });
 

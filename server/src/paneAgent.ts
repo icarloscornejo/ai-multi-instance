@@ -30,8 +30,10 @@ export type PaneAgent =
       agentPid: number;
       startedAtMs: number;
       resumeId: string | null;
+      // Optional so hand-written fixtures stay valid; set by classifyPane for the restart flow.
+      paneJobArgs?: string;
     }
-  | { kind: "none" }
+  | { kind: "none"; shellOwnsForeground?: boolean }
   | { kind: "unknown" };
 
 // "[[dd-]hh:]mm:ss", the only format ps -o etime= prints. Used instead of lstart= because
@@ -112,7 +114,7 @@ export function classifyPane(rows: ProcessRow[], panePid: number, nowMs: number)
     paneRow.pgid === foregroundGroup
       ? paneRow
       : rows.find((row) => row.ppid === panePid && row.pgid === foregroundGroup);
-  if (paneJobRow === undefined) return { kind: "none" };
+  if (paneJobRow === undefined) return { kind: "none", shellOwnsForeground: false };
 
   // Breadth-first so a wrapper (claude-me -> claude) resolves to the shallowest match, and the
   // pid reported as the agent is the process whose env and cwd actually describe the session.
@@ -129,6 +131,7 @@ export function classifyPane(rows: ProcessRow[], panePid: number, nowMs: number)
         agentPid: current.pid,
         startedAtMs: nowMs - current.elapsedSeconds * 1000,
         resumeId: extractResumeId(current.args),
+        paneJobArgs: paneJobRow.args,
       };
     }
     for (const child of rows) {
@@ -138,7 +141,7 @@ export function classifyPane(rows: ProcessRow[], panePid: number, nowMs: number)
       }
     }
   }
-  return { kind: "none" };
+  return { kind: "none", shellOwnsForeground: paneRow.pgid === foregroundGroup };
 }
 
 // -ww: piped macOS ps truncates every line to ~79 columns, which cuts the script name off an
@@ -151,9 +154,13 @@ const PROBE_TIMEOUT_MS = 5_000;
 const CACHE_TTL_MS = 1_500;
 const cache: Map<string, { at: number; result: PaneAgent }> = new Map();
 
-export async function findPaneAgent(tmuxSession: string, nowMs: number = Date.now()): Promise<PaneAgent> {
+export async function findPaneAgent(
+  tmuxSession: string,
+  nowMs: number = Date.now(),
+  options: { bypassCache?: boolean } = {}
+): Promise<PaneAgent> {
   const cached = cache.get(tmuxSession);
-  if (cached !== undefined && nowMs - cached.at < CACHE_TTL_MS) return cached.result;
+  if (options.bypassCache !== true && cached !== undefined && nowMs - cached.at < CACHE_TTL_MS) return cached.result;
   let result: PaneAgent;
   try {
     const panePid: number = await getOriginalPanePid(tmuxSession);

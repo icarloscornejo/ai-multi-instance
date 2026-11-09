@@ -8,9 +8,10 @@ import {
   formatShortResetTime,
   usagePctColorClass,
 } from "../liveStatusFormatting";
-import type { Instance, LiveStatus, PrEventsResponse, UpdateInstancePayload } from "../types";
+import type { AgentState, Instance, LiveStatus, PrEventsResponse, UpdateInstancePayload } from "../types";
 import { BranchGitLine } from "./BranchGitLine";
 import { prEventsHeading } from "../prEvents";
+import { restartBlockReason } from "../restartAction";
 import { PrEventsControl } from "./PrEventsControl";
 import { worktreeLabel } from "../worktreeLabel";
 
@@ -34,6 +35,9 @@ interface SidebarProps {
   gitBranch: string | null;
   onUpdate: (instanceId: string, payload: UpdateInstancePayload) => void;
   onDeleteRequest: (instance: Instance) => void;
+  agentState: AgentState | undefined;
+  restartPending: boolean;
+  onRestartRequest: (instance: Instance) => void;
   prEventsInfo?: PrEventsResponse[string];
 }
 
@@ -117,7 +121,18 @@ function CopyButton({ value, title }: { value: string; title: string }) {
   );
 }
 
-export function Sidebar({ instance, liveStatus, gitBranch, onUpdate, onDeleteRequest, prEventsInfo }: SidebarProps) {
+export function Sidebar({
+  instance,
+  liveStatus,
+  gitBranch,
+  onUpdate,
+  onDeleteRequest,
+  agentState,
+  restartPending,
+  onRestartRequest,
+  prEventsInfo,
+}: SidebarProps) {
+  const restartBlocked: string | null = restartBlockReason(agentState, restartPending);
   const [commandDraft, setCommandDraft] = useState<string>(instance.command);
 
   // When switching tabs the sidebar shows a different instance: resync the draft
@@ -326,10 +341,23 @@ export function Sidebar({ instance, liveStatus, gitBranch, onUpdate, onDeleteReq
         </div>
       )}
 
+      <div className="mt-auto flex flex-col gap-[4px] border-t border-border pt-[10px]">
+        <button
+          type="button"
+          onClick={() => onRestartRequest(instance)}
+          disabled={restartBlocked !== null}
+          title={restartBlocked ?? "Restart the session and resume the conversation"}
+          className="self-start rounded-sm px-[6px] py-[6px] text-[12px] font-semibold text-txt-secondary hover:bg-raised hover:text-txt-bright disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
+        >
+          ↻ Restart session
+        </button>
+        {restartBlocked !== null && <div className="px-[6px] text-[11px] text-txt-dimmer">{restartBlocked}</div>}
+      </div>
+
       <button
         type="button"
         onClick={() => onDeleteRequest(instance)}
-        className="mt-auto self-start rounded-sm border-t border-border px-[6px] py-[10px] text-[12px] font-semibold text-diff-removed hover:bg-diff-removed-dim"
+        className="self-start rounded-sm border-t border-border px-[6px] py-[10px] text-[12px] font-semibold text-diff-removed hover:bg-diff-removed-dim"
       >
         ✕ Delete instance
       </button>

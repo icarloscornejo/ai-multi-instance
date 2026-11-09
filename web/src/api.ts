@@ -6,6 +6,7 @@ import type {
   LanAddress,
   AgentStatesResponse,
   PrEventsResponse,
+  RestartResult,
   LiveStatus,
   LocationBranches,
   LocationInfo,
@@ -39,9 +40,9 @@ async function requestJson<T>(url: string, options: RequestInit = {}): Promise<T
   if (response.status === 204) {
     return undefined as T;
   }
-  const body = (await response.json().catch(() => ({}))) as { error?: string };
+  const body = (await response.json().catch(() => ({}))) as { error?: string; relaunchSent?: boolean };
   if (!response.ok) {
-    throw new ApiError(body.error ?? `Error ${response.status}`, response.status);
+    throw new ApiError(body.error ?? `Error ${response.status}`, response.status, body.relaunchSent === true);
   }
   return body as T;
 }
@@ -160,6 +161,9 @@ export const api = {
   // 204 means a plain delete; 200 carries a warning (a worktree that was kept).
   deleteInstance: async (instanceId: string): Promise<{ warning?: string }> =>
     (await requestJson<{ warning?: string } | undefined>(`/api/instances/${instanceId}`, { method: "DELETE" })) ?? {},
+
+  restartInstance: (instanceId: string): Promise<RestartResult> =>
+    requestJson(`/api/instances/${instanceId}/restart`, { method: "POST" }),
 
   getTunnel: (): Promise<TunnelStatus> => requestJson("/api/tunnel"),
 

@@ -9,6 +9,8 @@ export type AgentState = "waiting" | "working" | "idle";
 export interface ParsedAgentStateFile {
   state: AgentState;
   paneJobPid: number;
+  // Optional so hand-built fixtures stay valid; the parser always sets it.
+  sessionId?: string | null;
   updatedAt: string;
 }
 
@@ -34,11 +36,11 @@ export function parseAgentStateFile(raw: string): ParsedAgentStateFile | null {
     return null;
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
-  const { state, paneJobPid, updatedAt } = parsed as Record<string, unknown>;
+  const { state, paneJobPid, updatedAt, sessionId } = parsed as Record<string, unknown>;
   if (typeof state !== "string" || !AGENT_STATES.includes(state)) return null;
   if (typeof paneJobPid !== "number" || !Number.isFinite(paneJobPid)) return null;
   if (typeof updatedAt !== "string" || Number.isNaN(Date.parse(updatedAt))) return null;
-  return { state: state as AgentState, paneJobPid, updatedAt };
+  return { state: state as AgentState, paneJobPid, sessionId: typeof sessionId === "string" ? sessionId : null, updatedAt };
 }
 
 // A missing file is the normal "no state yet"; anything else is a real fault worth a log line.
@@ -54,8 +56,10 @@ export function readAgentStateFile(instanceId: string): Promise<string | null> {
 // What the instance's pane is running right now. A custom command is whatever the user typed:
 // "no known agent" says nothing about it, so unless a known agent is actually found there it is
 // served from its snapshot like before instead of being reported as not running.
-export async function probePaneAgent(instance: InstanceRecord): Promise<PaneAgent> {
-  const found: PaneAgent = await findPaneAgent(instance.tmuxSession);
+export async function probePaneAgent(instance: InstanceRecord, options: { bypassCache?: boolean } = {}): Promise<PaneAgent> {
+  const found: PaneAgent = await (options.bypassCache === true
+    ? findPaneAgent(instance.tmuxSession, Date.now(), options)
+    : findPaneAgent(instance.tmuxSession));
   return instance.provider === "custom" && found.kind !== "agent" ? { kind: "unknown" } : found;
 }
 
