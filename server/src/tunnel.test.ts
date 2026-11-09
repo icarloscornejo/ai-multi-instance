@@ -160,6 +160,36 @@ describe("startTunnel state machine", () => {
     expect(fakeChild.kill).toHaveBeenCalled();
   });
 
+  it("treats a 302 to Cloudflare Access login as ok: the gate answers for a real, reachable hostname", async () => {
+    const { startTunnel } = await import("./tunnel");
+    fetchMock.mockResolvedValue(
+      new Response("", {
+        status: 302,
+        headers: { location: "https://team.cloudflareaccess.com/cdn-cgi/access/login/host?kid=abc" },
+      })
+    );
+
+    const startPromise = startTunnel();
+    await vi.waitFor(() => expect(spawnMock).toHaveBeenCalled());
+    emitUrl("https://random-words-here.trycloudflare.com");
+
+    const result = await startPromise;
+    expect(result.state).toBe("running");
+    expect(result.error).toBeNull();
+  });
+
+  it("still fails a 302 that does not point at Cloudflare Access", async () => {
+    const { startTunnel } = await import("./tunnel");
+    fetchMock.mockResolvedValue(new Response("", { status: 302, headers: { location: "https://evil.example.com/" } }));
+
+    const startPromise = startTunnel();
+    await vi.waitFor(() => expect(spawnMock).toHaveBeenCalled());
+    emitUrl("https://random-words-here.trycloudflare.com");
+
+    const result = await startPromise;
+    expect(result.state).toBe("error");
+  });
+
   it("clears phase and warning on stopTunnel", async () => {
     const { startTunnel, stopTunnel, getTunnelStatus } = await import("./tunnel");
     fetchMock.mockResolvedValue(new Response(APP_SHELL_BODY, { status: 200 }));

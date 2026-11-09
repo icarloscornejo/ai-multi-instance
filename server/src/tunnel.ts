@@ -179,6 +179,17 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function isCloudflareAccessRedirect(location: string | null): boolean {
+  if (location === null) {
+    return false;
+  }
+  try {
+    return new URL(location).hostname.endsWith(".cloudflareaccess.com");
+  } catch {
+    return false;
+  }
+}
+
 async function verifyEdgeOnce(url: string): Promise<EdgeVerifyResult> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), EDGE_VERIFY_ATTEMPT_TIMEOUT_MS);
@@ -187,6 +198,12 @@ async function verifyEdgeOnce(url: string): Promise<EdgeVerifyResult> {
     // GET /; an unexpected 3xx should fail verification rather than be silently followed.
     const response = await fetch(url, { redirect: "manual", cache: "no-store", signal: controller.signal });
     const body: string = (await response.text()).slice(0, PREFLIGHT_BODY_CAP_BYTES);
+    // Cloudflare Access sits in front of the named-tunnel hostname and answers an
+    // unauthenticated probe with a 302 to its own login host. That proves DNS, TLS and the
+    // edge are live; it cannot prove the ingress reaches this app (Access answers first).
+    if (response.status === 302 && isCloudflareAccessRedirect(response.headers.get("location"))) {
+      return { outcome: "ok" };
+    }
     if (classifyPreflight(response.status, body) === "ok") {
       return { outcome: "ok" };
     }
