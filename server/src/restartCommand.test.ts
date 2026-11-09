@@ -267,12 +267,12 @@ const FOOTERS: Record<Exclude<ScreenMode, "unknown">, string> = {
 
 function screen(
   mode: ScreenMode,
-  options: { above?: string[]; input?: string; extraFooter?: string[]; trailingBlankRows?: number } = {}
+  options: { above?: string[]; input?: string; extraFooter?: string[]; trailingBlankRows?: number; topRule?: string } = {}
 ): string {
   const footer = mode === "unknown" ? "  something unrelated in the footer" : FOOTERS[mode];
   return [
     ...(options.above ?? ["● Done with the change."]),
-    RULE,
+    options.topRule ?? RULE,
     options.input ?? "❯ ",
     RULE,
     footer,
@@ -319,6 +319,20 @@ describe("screen helpers", () => {
   it("sees a draft in the prompt", () => {
     expect(isPromptEmpty(screen("default", { input: "❯ fix the failing test" }))).toBe(false);
     expect(isPromptEmpty(screen("default", { input: "> /exi" }))).toBe(false);
+  });
+
+  it("reads the box of a named session, whose top rule carries the name (claude -n)", () => {
+    const namedRule = `${"─".repeat(60)} :.::.: Auto-CC :.::.: ─`;
+
+    expect(isPromptEmpty(screen("auto", { topRule: namedRule, extraFooter: STATUSLINE }))).toBe(true);
+    expect(currentMode(screen("auto", { topRule: namedRule }))).toBe("auto");
+    expect(isPromptEmpty(screen("auto", { topRule: namedRule, input: "❯ draft" }))).toBe(false);
+  });
+
+  it("does not take a conversation line that mentions a name as a rule", () => {
+    const text = screen("default", { above: ["● The name goes in ── Auto-CC ─ after the rule."] });
+
+    expect(isPromptEmpty(text)).toBe(true);
   });
 
   it("treats a screen without an input box as not empty, the safe side", () => {

@@ -14,7 +14,8 @@ const RESUME_VALUE_FLAGS = new Set(["--resume", "-r", "--session-id"]);
 const RESUME_EQUALS_PREFIXES = ["--resume=", "--session-id="];
 const RESUME_BARE_FLAGS = new Set(["--continue", "-c"]);
 const ANSI_PATTERN = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
-const RULE_PATTERN = /^\s*─{10,}\s*$/;
+// A session started with -n draws its name inside the top rule ("──── Auto-CC ─"), so the label is optional.
+const RULE_PATTERN = /^\s*─{10,}(?: .+ ─+)?\s*$/;
 const BUSY_LINES_ABOVE_BOX = 3;
 
 export function isValidSessionId(value: string): boolean {
