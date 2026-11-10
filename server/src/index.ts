@@ -27,6 +27,7 @@ import { registerHeartbeat, startHeartbeat } from "./heartbeat";
 import { startPrEventsPoller } from "./prEventsPoller";
 import { countSystemDynamicPtys, getPtmxMax } from "./ptyCapacity";
 import { apiRouter } from "./routes";
+import { waitForRestartsToFinish } from "./sessionRestart";
 import { getTunnelMode, migrateNamedTunnelProtocol } from "./namedTunnel";
 import { isLocalRequestHost } from "./requestHost";
 import { formatCrashLine, startServerLog } from "./serverLog";
@@ -59,12 +60,21 @@ process.on("unhandledRejection", (reason: unknown) => {
   process.exit(1);
 });
 
+// A Restart takes up to ~60 s in its worst case (exit wait plus relaunch verification).
+const RESTART_DRAIN_MS = 60_000;
+const RESTART_FLUSH_MS = 1_500;
+
 // Distinguishes "crashed" from "you ran npm run service:stop" in the log. This handler overrides
 // the default SIGTERM termination, so it must exit explicitly; tunnel.ts:513's own
 // process.on("exit") cloudflared cleanup still runs after this exit() call.
 process.on("SIGTERM", () => {
   console.error("--- server stopping (SIGTERM) ---");
-  process.exit(0);
+  // A Restart in flight finishes first (bounded), so its answer reaches the browser and the pane is not left half done.
+  void waitForRestartsToFinish(RESTART_DRAIN_MS).then(() => {
+    // The restart's response is written just after it is marked done; closing lets that write flush.
+    httpServer.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), RESTART_FLUSH_MS).unref();
+  });
 });
 
 // Extra diagnostic context appended ONLY to the console line (via recordAttachFailure's lazy

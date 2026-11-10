@@ -142,6 +142,20 @@ export function sameProfile(running: ConfigDirReading, instanceConfigDir: string
   return stripTrailingSlashes(runningDir) === stripTrailingSlashes(instanceConfigDir);
 }
 
+// The profile's config dir, or null when it is unknown: callers must not guess ~/.claude then.
+export function resolveProfileDir(profile: ConfigDirReading): string | null {
+  if (profile.kind === "unreadable") return null;
+  return profile.kind === "set" ? profile.dir : path.join(os.homedir(), ".claude");
+}
+
+// Claude writes a session's transcript only with its first message, so no file means no conversation.
+export async function claudeTranscriptExists(profileDir: string, cwd: string, sessionId: string): Promise<boolean> {
+  return fs.access(path.join(profileDir, "projects", claudeProjectDirName(cwd), `${sessionId}.jsonl`)).then(
+    () => true,
+    () => false
+  );
+}
+
 // Fresh read each call, never cached. Only the suffix ps eww adds after the args is searched,
 // so a -n value that looks like CLAUDE_CONFIG_DIR=... cannot pose as the environment.
 export async function readAgentConfigDir(agentPid: number, run: PsRunner = runPs): Promise<AgentEnvironmentReading> {

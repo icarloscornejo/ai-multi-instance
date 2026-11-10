@@ -40,7 +40,7 @@ import {
 } from "./mobileSession";
 import { reconcileFetchedInstances, shouldApplyRefresh } from "./instanceSync";
 import { retryDelayMs } from "./retry";
-import { restartNotice, type RestartNotice } from "./restartAction";
+import { restartNotice, shouldApplyLateNotice, type RestartNotice } from "./restartAction";
 import type {
   CreateInstancePayload,
   DashboardConfig,
@@ -80,6 +80,9 @@ export function App() {
   // still running, so the button is gated by this flag, not by the agent state.
   const [restartingInstanceIds, setRestartingInstanceIds] = useState<ReadonlySet<string>>(new Set());
   const [restartNoticeShown, setRestartNoticeShown] = useState<RestartNotice | null>(null);
+  // Which restart the shown notice belongs to, so a late answer never overwrites another restart's notice.
+  const restartNoticeOwner = useRef<string | null>(null);
+  const restartSequence = useRef(0);
   const [loadFailure, setLoadFailure] = useState<"connection" | "server" | null>(null);
   // Mirrors loadFailure for the wake-retry handler below, which is registered once and
   // would otherwise close over the initial (stale) value instead of the live one.
@@ -643,18 +646,29 @@ export function App() {
     const target: Instance = restartRequest;
     setRestartRequest(null);
     setRestartingInstanceIds((previousIds) => new Set(previousIds).add(target.id));
-    const notice: RestartNotice = await restartNotice(target.label, api.restartInstance(target.id), RESTART_ANSWER_DEADLINE_MS);
+    restartSequence.current += 1;
+    const owner = `restart-${restartSequence.current}`;
+    const showNotice = (shown: RestartNotice): void => {
+      restartNoticeOwner.current = owner;
+      setRestartNoticeShown(shown);
+    };
+    const notice: RestartNotice = await restartNotice(target.label, api.restartInstance(target.id), RESTART_ANSWER_DEADLINE_MS, (lateNotice) => {
+      if (shouldApplyLateNotice(restartNoticeOwner.current, owner)) showNotice(lateNotice);
+    });
     setRestartingInstanceIds((previousIds) => {
       const remainingIds: Set<string> = new Set(previousIds);
       remainingIds.delete(target.id);
       return remainingIds;
     });
-    setRestartNoticeShown(notice);
+    showNotice(notice);
   };
 
   useEffect(() => {
     if (restartNoticeShown === null) return;
-    const timer = setTimeout(() => setRestartNoticeShown(null), RESTART_NOTICE_VISIBLE_MS);
+    const timer = setTimeout(() => {
+      restartNoticeOwner.current = null;
+      setRestartNoticeShown(null);
+    }, RESTART_NOTICE_VISIBLE_MS);
     return () => clearTimeout(timer);
   }, [restartNoticeShown]);
 

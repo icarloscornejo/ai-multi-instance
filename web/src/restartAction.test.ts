@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ApiError } from "./apiError";
-import { restartBlockReason, restartNotice } from "./restartAction";
+import { restartBlockReason, restartNotice, shouldApplyLateNotice } from "./restartAction";
 import type { RestartResult } from "./types";
 
 describe("restartBlockReason", () => {
@@ -78,5 +78,61 @@ describe("restartNotice", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("says a session with no conversation yet was started fresh, as a plain success", async () => {
+    const notice = await restartNotice("Auto-CC", Promise.resolve({ ...result, sessionId: null, startedFresh: "no-conversation" }), 10_000);
+
+    expect(notice.tone).toBe("ok");
+    expect(notice.text).toMatch(/started fresh, there was no conversation yet/i);
+  });
+
+  it("warns when the conversation could not be resumed and a fresh session was started instead", async () => {
+    const notice = await restartNotice("Auto-CC", Promise.resolve({ ...result, startedFresh: "resume-failed" }), 10_000);
+
+    expect(notice.tone).toBe("warn");
+    expect(notice.text).toMatch(/could not resume the conversation, started fresh/i);
+  });
+
+  it("hands the real answer to onLate when it arrives after the deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveRequest: (value: RestartResult) => void = () => undefined;
+      const request = new Promise<RestartResult>((resolve) => {
+        resolveRequest = resolve;
+      });
+      const onLate = vi.fn();
+      const pending = restartNotice("Auto-CC", request, 10_000, onLate);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await pending;
+      expect(onLate).not.toHaveBeenCalled();
+
+      resolveRequest({ ...result, startedFresh: "resume-failed" });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(onLate).toHaveBeenCalledTimes(1);
+      expect(onLate.mock.calls[0][0].text).toMatch(/could not resume the conversation/i);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not call onLate when the answer arrives in time", async () => {
+    const onLate = vi.fn();
+    await restartNotice("Auto-CC", Promise.resolve(result), 10_000, onLate);
+    await Promise.resolve();
+
+    expect(onLate).not.toHaveBeenCalled();
+  });
+});
+
+describe("shouldApplyLateNotice", () => {
+  it("applies a late notice over its own placeholder or onto an empty slot", () => {
+    expect(shouldApplyLateNotice("restart-1", "restart-1")).toBe(true);
+    expect(shouldApplyLateNotice(null, "restart-1")).toBe(true);
+  });
+
+  it("never overwrites the notice of another restart", () => {
+    expect(shouldApplyLateNotice("restart-2", "restart-1")).toBe(false);
   });
 });

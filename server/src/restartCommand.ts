@@ -131,13 +131,15 @@ export function buildRestartCommand(options: {
   includeInstanceId: boolean;
   configDir: string | undefined;
   tokens: string[];
-  sessionId: string;
+  // null starts a fresh conversation: there is nothing to resume.
+  sessionId: string | null;
 }): string {
-  if (!SESSION_ID_PATTERN.test(options.sessionId)) throw new Error("Invalid session id");
+  if (options.sessionId !== null && !SESSION_ID_PATTERN.test(options.sessionId)) throw new Error("Invalid session id");
   const parts: string[] = [];
   if (options.includeInstanceId) parts.push(`AI_MULTI_INSTANCE_ID=${quoteForShell(options.instanceId)}`);
   if (options.configDir) parts.push(`CLAUDE_CONFIG_DIR=${quoteForShell(options.configDir)}`);
-  parts.push(...options.tokens.map(quoteForShell), "--resume", quoteForShell(options.sessionId));
+  parts.push(...options.tokens.map(quoteForShell));
+  if (options.sessionId !== null) parts.push("--resume", quoteForShell(options.sessionId));
   return parts.join(" ");
 }
 
@@ -189,7 +191,8 @@ export function currentMode(paneText: string): ScreenMode {
   if (/accept edits on/i.test(footer)) return "accept-edits";
   if (/plan mode on/i.test(footer)) return "plan";
   if (/bypass permissions on/i.test(footer)) return "bypass";
-  if (/\? for shortcuts/i.test(footer)) return "default";
+  // Newer Claude versions label the default mode "manual mode on" instead of showing the shortcuts hint.
+  if (/\? for shortcuts|manual mode on/i.test(footer)) return "default";
   return "unknown";
 }
 

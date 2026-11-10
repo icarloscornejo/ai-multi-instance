@@ -1,8 +1,7 @@
-import os from "node:os";
 import path from "node:path";
-import { sameProfile, type AgentEnvironmentReading } from "./agentFallback";
+import { resolveProfileDir, sameProfile, type AgentEnvironmentReading } from "./agentFallback";
 import type { ParsedAgentStateFile } from "./agentState";
-import { LAUNCH_COMMAND_ENV_NAME } from "./launch";
+import { LAUNCH_COMMAND_ENV_NAME, wrapWithFreshFallback } from "./launch";
 import type { AgentFound, PaneAgent } from "./paneAgent";
 import {
   buildRestartCommand,
@@ -57,7 +56,10 @@ export class RestartError extends Error {
 
 export interface RestartResult {
   ok: true;
-  sessionId: string;
+  // null when the session was started fresh.
+  sessionId: string | null;
+  // "no-conversation": there was nothing to resume. "resume-failed": the resume failed and the shell started fresh.
+  startedFresh?: "no-conversation" | "resume-failed";
   hintSessionId?: string;
   replacedSessionId?: string;
   versionBefore: string | null;
@@ -85,9 +87,10 @@ export interface RestartDeps {
   readAgentEnvironment: (agentPid: number) => Promise<AgentEnvironmentReading>;
   readAgentArgs: (agentPid: number) => Promise<string>;
   snapshotSessionId: (instance: InstanceRecord) => Promise<string | null>;
+  transcriptExists: (profileDir: string, cwd: string, sessionId: string) => Promise<boolean>;
   pickTranscript: (profileDir: string, cwd: string, ownedSessionIds: ReadonlySet<string>) => Promise<string | null>;
   ownedSessionIds: (instance: InstanceRecord) => Promise<Set<string>>;
-  buildInstanceCommand: (instance: InstanceRecord, sessionId: string) => string;
+  buildInstanceCommand: (instance: InstanceRecord, sessionId: string | null) => string;
   loaderInvocation: string;
   withPaneTypingLock: <T>(session: string, run: () => Promise<T>) => Promise<T>;
   sleep: (milliseconds: number) => Promise<void>;
@@ -106,11 +109,24 @@ const ALIVE_AFTER_MS = 4_000;
 const SCREEN_DRAWN_TIMEOUT_MS = 15_000;
 const MAX_MODE_PRESSES = 8;
 const MIN_CLIENT_IDLE_SECONDS = 2;
+// After a resumed agent vanishes the shell has this long to start the fresh fallback.
+const FALLBACK_START_WAIT_MS = 5_000;
 
 const restartsInProgress: Set<string> = new Set();
 
 export function isRestartInProgress(tmuxSession: string): boolean {
   return restartsInProgress.has(tmuxSession);
+}
+
+// A stop signal (tsx watch restarts the server on any file change, including edits made by the very
+// session being restarted) used to cut the request and could leave a pane half done. Shutdown waits here.
+export async function waitForRestartsToFinish(timeoutMs: number, pollMs = 100): Promise<boolean> {
+  const deadline: number = Date.now() + timeoutMs;
+  while (restartsInProgress.size > 0) {
+    if (Date.now() >= deadline) return false;
+    await new Promise<void>((resolve) => setTimeout(resolve, pollMs));
+  }
+  return true;
 }
 
 const STATUS_BY_CODE: Record<RestartErrorCode, number> = {
@@ -135,7 +151,7 @@ export function restartErrorStatus(code: RestartErrorCode): number {
 
 interface CommandPlan {
   source: RestartResult["commandSource"];
-  render: (sessionId: string) => string;
+  render: (sessionId: string | null) => string;
 }
 
 function countExitMarkers(paneText: string): number {
@@ -259,6 +275,7 @@ async function runRestart(instance: InstanceRecord, deps: RestartDeps): Promise<
 
   // Weaker id sources are read now, while the profile and cwd can still be asked of the live agent.
   const stateId: string | null = typeof firstState.sessionId === "string" && isValidSessionId(firstState.sessionId) ? firstState.sessionId : null;
+  const profileDir: string | null = resolveProfileDir(environment.configDir);
   let snapshotId: string | null = null;
   let weakId: string | null = null;
   if (stateId === null) {
@@ -266,17 +283,18 @@ async function runRestart(instance: InstanceRecord, deps: RestartDeps): Promise<
     snapshotId = snapshot !== null && isValidSessionId(snapshot) ? snapshot : null;
   }
   if (stateId === null && snapshotId === null) {
-    const profile = environment.configDir;
-    if (instance.sessionId && isValidSessionId(instance.sessionId) && sameProfile(profile, instance.configDir)) {
+    if (instance.sessionId && isValidSessionId(instance.sessionId) && sameProfile(environment.configDir, instance.configDir)) {
       weakId = instance.sessionId;
-    } else if (profile.kind !== "unreadable") {
-      const profileDir: string = profile.kind === "set" ? profile.dir : path.join(os.homedir(), ".claude");
+    } else if (profileDir !== null) {
       const picked: string | null = await deps.pickTranscript(profileDir, agentCwd, await deps.ownedSessionIds(instance));
       weakId = picked !== null && isValidSessionId(picked) ? picked : null;
     }
   }
 
   let finalStateId: string | null = stateId;
+  let candidateId: string | null = null;
+  // An unreadable profile cannot be searched, so it counts as "may have one": the shell fallback is the net.
+  let candidateHasTranscript = true;
   await deps.withPaneTypingLock(session, async () => {
     const finalState: ParsedAgentStateFile = requireIdle(await deps.readAgentState(instance), agent);
     if (typeof finalState.sessionId === "string" && isValidSessionId(finalState.sessionId)) finalStateId = finalState.sessionId;
@@ -288,6 +306,9 @@ async function runRestart(instance: InstanceRecord, deps: RestartDeps): Promise<
       throw new RestartError("client-active", "Someone is typing in this session right now; try again in a moment.");
     }
     await requireSamePane(deps, session, paneId);
+    // Claude writes no transcript until the first message, and --resume of a missing one fails and exits.
+    candidateId = finalStateId ?? snapshotId ?? weakId;
+    if (candidateId !== null && profileDir !== null) candidateHasTranscript = await deps.transcriptExists(profileDir, agentCwd, candidateId);
     await deps.sendText(paneId, "/exit");
     // Same pacing as pasteToSession: an Enter sent at once can be swallowed by the input.
     await deps.sleep(EXIT_GAP_MS);
@@ -324,19 +345,35 @@ async function runRestart(instance: InstanceRecord, deps: RestartDeps): Promise<
     sessionId = weakId;
   }
 
+  // A candidate with no transcript has nothing to resume. Claude prints a hint only when a transcript
+  // exists, so a different hint id is a conversation worth keeping.
+  let resume: boolean = sessionId === null || sessionId !== candidateId || candidateHasTranscript;
+  if (!resume && hint !== null) {
+    if (hint.sessionId !== sessionId) {
+      replacedSessionId = sessionId ?? undefined;
+      hintSessionId = undefined;
+      sessionId = hint.sessionId;
+    }
+    resume = true;
+  }
+  // With a readable profile, no id and no hint means no conversation; an unreadable one cannot rule it out.
+  const startedFresh: boolean = sessionId === null ? profileDir !== null : !resume;
+
   const plan: CommandPlan | null = planCommand(instance, flatArgs, environment, hint?.command ?? null, deps);
   const missing: RestartMissing[] = [];
   if (plan === null) missing.push("command");
-  if (sessionId === null) missing.push("sessionId");
-  if (plan === null || sessionId === null) {
+  if (sessionId === null && !startedFresh) missing.push("sessionId");
+  if (plan === null || (sessionId === null && !startedFresh)) {
     // Fixed wording per item: the UI shows only the message, and values must never reach it.
     const lacking: string = missing.map((item) => (item === "command" ? "the launch command" : "the session id")).join(" and ");
     throw new RestartError("missing", `Nothing was relaunched: ${lacking} could not be found; start Claude again from the terminal.`, { missing });
   }
 
   const paneCwd: string = await deps.getPaneCurrentPath(paneId);
-  const rendered: string = plan.render(sessionId);
-  const launchCommand: string = paneCwd === agentCwd ? rendered : `cd -- ${quoteForShell(agentCwd)} && ${rendered}`;
+  // The shell itself starts fresh if the resume dies at once, so no second keystroke reaches the pane.
+  const rendered: string = startedFresh || sessionId === null ? plan.render(null) : wrapWithFreshFallback(plan.render(sessionId), plan.render(null));
+  // Braces keep a failed cd from running the first half of the fallback in the wrong directory.
+  const launchCommand: string = paneCwd === agentCwd ? rendered : `cd -- ${quoteForShell(agentCwd)} && { ${rendered}; }`;
 
   await deps.withPaneTypingLock(session, async () => {
     await requireSamePane(deps, session, paneId);
@@ -360,16 +397,20 @@ async function runRestart(instance: InstanceRecord, deps: RestartDeps): Promise<
     }
   });
 
-  const relaunched: AgentFound = await verifyRelaunch(instance, deps, paneId, agent.paneJobPid);
+  const resumed: boolean = !startedFresh && sessionId !== null;
+  const relaunched: AgentFound = await verifyRelaunch(instance, deps, paneId, agent.paneJobPid, resumed);
   const versionAfter: string | null = await deps.readAgentArgs(relaunched.agentPid).then(versionFromPath, () => null);
+  // The running process tells which half of the wrapper ran; without its args the resume is assumed to have held.
+  const fellBackToFresh: boolean = resumed && relaunched.paneJobArgs !== undefined && !/(^| )--resume( |=)/.test(relaunched.paneJobArgs);
 
   const result: RestartResult = {
     ok: true,
-    sessionId,
+    sessionId: startedFresh ? null : sessionId,
     versionBefore,
     versionAfter,
     autoMode: "not-applicable",
     commandSource: plan.source,
+    ...(startedFresh ? { startedFresh: "no-conversation" as const } : fellBackToFresh ? { startedFresh: "resume-failed" as const } : {}),
     ...(hintSessionId !== undefined ? { hintSessionId } : {}),
     ...(replacedSessionId !== undefined ? { replacedSessionId } : {}),
   };
@@ -383,11 +424,19 @@ async function runRestart(instance: InstanceRecord, deps: RestartDeps): Promise<
   }
 }
 
-async function verifyRelaunch(instance: InstanceRecord, deps: RestartDeps, paneId: string, previousPaneJobPid: number): Promise<AgentFound> {
+async function verifyRelaunch(
+  instance: InstanceRecord,
+  deps: RestartDeps,
+  paneId: string,
+  previousPaneJobPid: number,
+  resumed: boolean
+): Promise<AgentFound> {
   const session: string = instance.tmuxSession;
   const deadline: number = deps.now() + VERIFY_TIMEOUT_MS;
   let seen: AgentFound | null = null;
   let seenAtMs = 0;
+  let agentsLost = 0;
+  let lostAtMs = 0;
   while (deps.now() < deadline) {
     const probe: PaneAgent = await deps.probePane(instance, { bypassCache: true });
     if (probe.kind === "unknown" && (await deps.getSessionPresence(session)) === "absent") {
@@ -395,13 +444,22 @@ async function verifyRelaunch(instance: InstanceRecord, deps: RestartDeps, paneI
     }
     await requireSamePane(deps, session, paneId);
     if (probe.kind === "agent" && probe.provider === "claude" && probe.paneJobPid !== previousPaneJobPid) {
-      if (seen === null) {
+      // A new pid means the fallback replaced the resumed process between two polls: start its clock over.
+      if (seen === null || seen.paneJobPid !== probe.paneJobPid) {
         seen = probe;
         seenAtMs = deps.now();
       }
       if (deps.now() - seenAtMs >= ALIVE_AFTER_MS) return seen;
     } else if (seen !== null && probe.kind !== "unknown") {
-      throw new RestartError("relaunch-failed", "The relaunched session exited right away; check the conversation id and flags.");
+      agentsLost += 1;
+      // A resumed agent that dies at once is the shell's cue to start the fresh one; only one such handover exists.
+      if (!resumed || agentsLost > 1) {
+        throw new RestartError("relaunch-failed", "The relaunched session exited right away; check the conversation id and flags.");
+      }
+      seen = null;
+      lostAtMs = deps.now();
+    } else if (agentsLost > 0 && probe.kind === "none" && probe.shellOwnsForeground === true && deps.now() - lostAtMs >= FALLBACK_START_WAIT_MS) {
+      throw new RestartError("relaunch-failed", "The relaunched session exited right away and no fresh session followed.");
     }
     await deps.sleep(VERIFY_POLL_MS);
   }

@@ -288,6 +288,12 @@ describe("screen helpers", () => {
     expect(currentMode(screen(mode))).toBe(mode);
   });
 
+  it("reads the default mode from the manual-mode footer newer Claude versions draw instead of the shortcuts hint", () => {
+    const text = ["● Done.", "─".repeat(72), "❯ ", "─".repeat(72), "  Opus 5.5 (High) | 0/1m (0%)", "  ⏸ manual mode on"].join("\n");
+
+    expect(currentMode(text)).toBe("default");
+  });
+
   it("returns unknown, never raw screen text, for an unrecognized footer", () => {
     expect(currentMode(screen("unknown"))).toBe("unknown");
     expect(["default", "accept-edits", "plan", "bypass", "auto", "unknown"]).toContain(currentMode("anything at all"));
@@ -391,5 +397,21 @@ describe("sanitizeError", () => {
   it("gives the same fixed text for different errors and for non-errors", () => {
     expect(sanitizeError(new Error("one"))).toBe(sanitizeError(new Error("two")));
     expect(sanitizeError("a string")).toBe(sanitizeError(undefined));
+  });
+});
+
+describe("buildRestartCommand without a session id", () => {
+  it("omits --resume entirely when there is no conversation to resume", () => {
+    const command = buildRestartCommand({
+      instanceId: "abc123",
+      includeInstanceId: true,
+      configDir: "/Users/example/.claude-me",
+      tokens: ["/bin/bash", "/Users/example/bin/claude-me", "-n", "Auto-MI"],
+      sessionId: null,
+    });
+
+    expect(command).toBe(
+      `AI_MULTI_INSTANCE_ID='abc123' CLAUDE_CONFIG_DIR='/Users/example/.claude-me' ${["/bin/bash", "/Users/example/bin/claude-me", "-n", "Auto-MI"].map(quoteForShell).join(" ")}`
+    );
   });
 });

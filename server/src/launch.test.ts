@@ -1,5 +1,6 @@
+import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
-import { buildLoaderInvocation, buildReadyChannelName, buildShellOnlyReadyCommand } from "./launch";
+import { buildLoaderInvocation, buildReadyChannelName, buildShellOnlyReadyCommand, wrapWithFreshFallback } from "./launch";
 import type { InstanceRecord } from "./types";
 
 function instance(overrides: Partial<InstanceRecord> = {}): InstanceRecord {
@@ -47,5 +48,25 @@ describe("buildShellOnlyReadyCommand", () => {
 
   it("puts the agent shims on PATH first, so a hand-started agent in a shell-only instance reports to the sidebar", () => {
     expect(buildShellOnlyReadyCommand("c")).toMatch(/^export PATH='\/.*\/scripts\/shims':"\$PATH"; clear;/);
+  });
+});
+
+describe("wrapWithFreshFallback", () => {
+  const run = (script: string): string => execFileSync("sh", ["-c", script], { encoding: "utf8" });
+
+  it("runs the fresh command when the resume command fails at once", () => {
+    expect(run(wrapWithFreshFallback("echo resume; false", "echo fresh")).split("\n").filter(Boolean)).toEqual(["resume", "fresh"]);
+  });
+
+  it("does not run the fresh command when the resume command succeeds", () => {
+    expect(run(wrapWithFreshFallback("echo resume", "echo fresh")).trim()).toBe("resume");
+  });
+
+  it("does not fall back when a failing command ran for longer than the window", () => {
+    expect(run(wrapWithFreshFallback("sleep 4; false", "echo fresh")).trim()).toBe("");
+  }, 15_000);
+
+  it("runs nothing at all when a cd in front of the grouped wrapper fails", () => {
+    expect(run(`cd -- /no/such/dir/for/this/test 2>/dev/null && { ${wrapWithFreshFallback("echo resume", "echo fresh")}; }; true`).trim()).toBe("");
   });
 });

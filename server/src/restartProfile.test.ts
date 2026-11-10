@@ -2,7 +2,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { claudeProjectDirName, pickClaudeTranscript, readAgentConfigDir, sameProfile } from "./agentFallback";
+import { claudeProjectDirName, claudeTranscriptExists, pickClaudeTranscript, readAgentConfigDir, resolveProfileDir, sameProfile } from "./agentFallback";
 
 const FAKE_TOKEN: string = String("faketoken_for_tests_0123456789abcdef");
 const DEFAULT_PROFILE = path.join(os.homedir(), ".claude");
@@ -148,5 +148,46 @@ describe("pickClaudeTranscript", () => {
     const profile = await profileWithTranscripts("/Users/example/other", [{ id: "33333333-cccc-4ccc-8ccc-000000000003", ageSeconds: 5 }]);
 
     await expect(pickClaudeTranscript(profile, "/Users/example/repo", new Set())).resolves.toBeNull();
+  });
+});
+
+describe("resolveProfileDir", () => {
+  it("uses the set directory as is", () => {
+    expect(resolveProfileDir({ kind: "set", dir: "/Users/example/.claude-me" })).toBe("/Users/example/.claude-me");
+  });
+
+  it("falls back to ~/.claude only for an unset profile", () => {
+    expect(resolveProfileDir({ kind: "unset" })).toBe(DEFAULT_PROFILE);
+  });
+
+  it("returns null for an unreadable profile instead of guessing", () => {
+    expect(resolveProfileDir({ kind: "unreadable" })).toBeNull();
+  });
+});
+
+describe("claudeTranscriptExists", () => {
+  const cwd = "/Users/example/repo";
+  const sessionId = "11111111-aaaa-4aaa-8aaa-000000000001";
+
+  async function profileWith(files: string[]): Promise<string> {
+    const profile = await fs.mkdtemp(path.join(os.tmpdir(), "restart-transcript-"));
+    temporaryDirectories.push(profile);
+    const projectDirectory = path.join(profile, "projects", claudeProjectDirName(cwd));
+    await fs.mkdir(projectDirectory, { recursive: true });
+    for (const file of files) await fs.writeFile(path.join(projectDirectory, file), "{}\n");
+    return profile;
+  }
+
+  it("is true when the transcript of that id exists in that profile and cwd", async () => {
+    await expect(claudeTranscriptExists(await profileWith([`${sessionId}.jsonl`]), cwd, sessionId)).resolves.toBe(true);
+  });
+
+  it("is false when only another id has a transcript, or the folder is missing", async () => {
+    await expect(claudeTranscriptExists(await profileWith(["22222222-bbbb-4bbb-8bbb-000000000002.jsonl"]), cwd, sessionId)).resolves.toBe(false);
+    await expect(claudeTranscriptExists(path.join(os.tmpdir(), "restart-no-such-profile"), cwd, sessionId)).resolves.toBe(false);
+  });
+
+  it("is false in another profile that has no transcript of its own", async () => {
+    await expect(claudeTranscriptExists(await profileWith([]), cwd, sessionId)).resolves.toBe(false);
   });
 });

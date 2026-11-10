@@ -5,6 +5,7 @@ import type { AgentEnvironmentReading } from "./agentFallback";
 import type { ParsedAgentStateFile } from "./agentState";
 import type { PaneAgent } from "./paneAgent";
 import type { ScreenMode } from "./restartCommand";
+import { wrapWithFreshFallback } from "./launch";
 import { withSessionLock } from "./sessionLock";
 import {
   RestartError,
@@ -12,6 +13,7 @@ import {
   isRestartInProgress,
   restartClaudeSession,
   restartErrorStatus,
+  waitForRestartsToFinish,
   type RestartDeps,
   type RestartErrorCode,
   type RestartResult,
@@ -40,6 +42,7 @@ const LOADER_LINE = "source /Users/example/scripts/instance-loader.sh";
 const SETTINGS = String.raw`{"statusLine":{"type":"command","command":"/Users/example/line.sh"},"env":{"API_KEY":"${FAKE_TOKEN}"},"hooks":{"Stop":[{"command":"say \"hi {x}\" now"}]}}`;
 const PS_ARGS = `/bin/bash /Users/example/bin/claude-me --model opusplan --effort medium --settings ${SETTINGS} -n Auto-MI`;
 
+const UNREADABLE_PROFILE: AgentEnvironmentReading = { configDir: { kind: "unreadable" }, hasInstanceId: true };
 const RULE = "─".repeat(72);
 const FOOTERS: Record<Exclude<ScreenMode, "unknown">, string> = {
   default: "  ? for shortcuts",
@@ -88,6 +91,10 @@ interface World {
   failSetEnvironment?: Error;
   failLoaderText?: Error;
   failLoaderEnter?: Error;
+  // Whether a transcript exists for the id (default true); a function sees the lookup arguments.
+  transcript?: boolean | ((profileDir: string, cwd: string, sessionId: string) => boolean);
+  // The first launch with --resume dies at once; the shell then runs the fresh command (or nothing follows).
+  resumeFails?: "fresh-follows" | "nothing-follows";
   deps?: Partial<RestartDeps>;
 }
 
@@ -141,7 +148,19 @@ function harness(world: World = {}) {
     resumeId: null,
     paneJobArgs: world.paneJobArgs ?? PS_ARGS,
   } as PaneAgent;
-  const newAgent: PaneAgent = { kind: "agent", provider: "claude", paneJobPid: 400, agentPid: 401, startedAtMs: 0, resumeId: null, paneJobArgs: PS_ARGS } as PaneAgent;
+  const resumeCommandSent = (): boolean => envSets.length > 0 && envSets[envSets.length - 1].value.includes("--resume");
+  const secondAgent: PaneAgent = { kind: "agent", provider: "claude", paneJobPid: 500, agentPid: 501, startedAtMs: 0, resumeId: null, paneJobArgs: PS_ARGS } as PaneAgent;
+  const firstLifeEndMs = startDelayMs + 1000;
+  const fallbackStartMs = firstLifeEndMs + 800;
+  const transcriptLookups: string[] = [];
+  function newAgent(): PaneAgent {
+    const args = resumeCommandSent() ? `${PS_ARGS} --resume ${STATE_ID}` : PS_ARGS;
+    return { kind: "agent", provider: "claude", paneJobPid: 400, agentPid: 401, startedAtMs: 0, resumeId: null, paneJobArgs: args } as PaneAgent;
+  }
+  function relaunchedPaneJobPid(): number {
+    const since = relaunchAt === null ? 0 : clock - relaunchAt;
+    return world.resumeFails === "fresh-follows" && resumeCommandSent() && since >= fallbackStartMs ? 500 : 400;
+  }
   const preScreen: string = world.preScreen ?? screen(world.preMode ?? "default");
 
   function modeNow(): ScreenMode {
@@ -226,7 +245,12 @@ function harness(world: World = {}) {
       if (relaunchAt !== null) {
         const since = clock - relaunchAt;
         if (since < (world.unknownProbeMs ?? 0)) return { kind: "unknown" } as PaneAgent;
-        if (since >= startDelayMs && (world.dieAfterMs === undefined || since < startDelayMs + world.dieAfterMs)) return newAgent;
+        if (world.resumeFails !== undefined && resumeCommandSent()) {
+          if (since >= startDelayMs && since < firstLifeEndMs) return newAgent();
+          if (world.resumeFails === "fresh-follows" && since >= fallbackStartMs) return secondAgent;
+          return { kind: "none", shellOwnsForeground: true } as PaneAgent;
+        }
+        if (since >= startDelayMs && (world.dieAfterMs === undefined || since < startDelayMs + world.dieAfterMs)) return newAgent();
         return { kind: "none", shellOwnsForeground: true } as PaneAgent;
       }
       if (exitEnterAt !== null && clock >= exitEnterAt + exitDelayMs) {
@@ -237,7 +261,7 @@ function harness(world: World = {}) {
     readAgentState: async () => {
       events.push("state");
       stateReads += 1;
-      if (relaunchAt !== null) return clock - relaunchAt >= startDelayMs ? stateFile(400) : null;
+      if (relaunchAt !== null) return clock - relaunchAt >= startDelayMs ? stateFile(relaunchedPaneJobPid()) : null;
       if (exitEnterAt !== null) return null;
       if (typeof world.state === "function") return world.state(stateReads);
       if (world.state !== undefined) return world.state;
@@ -248,8 +272,14 @@ function harness(world: World = {}) {
       return world.cwd === undefined ? CWD : world.cwd;
     },
     readAgentEnvironment: async () => world.environment ?? { configDir: { kind: "set", dir: PROFILE }, hasInstanceId: true },
-    readAgentArgs: async (pid) => (pid === 401 ? "/Users/example/.local/share/claude/versions/2.1.311" : "/Users/example/.local/share/claude/versions/2.1.310"),
+    readAgentArgs: async (pid) => (pid === 401 || pid === 501 ?"/Users/example/.local/share/claude/versions/2.1.311" : "/Users/example/.local/share/claude/versions/2.1.310"),
     snapshotSessionId: async () => world.snapshotId ?? null,
+    transcriptExists: async (profileDir, cwd, sessionId) => {
+      events.push("transcript");
+      transcriptLookups.push(`${profileDir}|${cwd}|${sessionId}`);
+      const configured = world.transcript ?? true;
+      return typeof configured === "function" ? configured(profileDir, cwd, sessionId) : configured;
+    },
     pickTranscript: vi.fn(async () => world.transcriptId ?? null),
     ownedSessionIds: async () => new Set<string>(),
     buildInstanceCommand: (_instance, sessionId) => `INSTANCE_BUILDER ${sessionId}`,
@@ -277,6 +307,7 @@ function harness(world: World = {}) {
     envSets,
     unsets,
     probeOptions,
+    transcriptLookups,
     targets,
     cwdPids,
     pickTranscript: deps.pickTranscript as unknown as ReturnType<typeof vi.fn>,
@@ -604,7 +635,7 @@ describe("restartClaudeSession: command sources and the exit hint", () => {
     const { h, result } = await succeeds({ paneJobArgs: unparseableArgs });
 
     expect(result.commandSource).toBe("instance");
-    expect(h.envSets[0].value).toBe(`INSTANCE_BUILDER ${STATE_ID}`);
+    expect(h.envSets[0].value).toBe(wrapWithFreshFallback(`INSTANCE_BUILDER ${STATE_ID}`, "INSTANCE_BUILDER null"));
   });
 
   it("given_a_launcher_that_only_shares_a_prefix_with_the_instance_command_then_the_builder_is_not_used", async () => {
@@ -717,7 +748,7 @@ describe("restartClaudeSession: command sources and the exit hint", () => {
     const scrollback = `❯ /exit\nResume this session with:\nclaude --resume ${OLD_HINT_ID}\n$ claude\n`;
     const preScreen = `${scrollback}${screen("default")}`;
 
-    const { h, error } = await refused({ stateSessionId: null, preScreen, exitScreen: preScreen }, "missing");
+    const { h, error } = await refused({ stateSessionId: null, preScreen, exitScreen: preScreen, environment: UNREADABLE_PROFILE }, "missing");
 
     expect(error.missing).toEqual(["sessionId"]);
     expect(h.noRelaunch()).toBe(true);
@@ -725,7 +756,7 @@ describe("restartClaudeSession: command sources and the exit hint", () => {
 
   it("given_no_command_and_no_id_when_exiting_then_nothing_is_relaunched_and_the_error_names_both", async () => {
     const { h, error } = await refused(
-      { paneJobArgs: unparseableArgs, instance: { command: "claude-in" }, stateSessionId: null },
+      { paneJobArgs: unparseableArgs, instance: { command: "claude-in" }, stateSessionId: null, environment: UNREADABLE_PROFILE },
       "missing"
     );
 
@@ -744,7 +775,7 @@ describe("restartClaudeSession: command sources and the exit hint", () => {
   });
 
   it("given_only_the_id_missing_then_the_message_names_the_id_and_not_the_command", async () => {
-    const { error } = await refused({ stateSessionId: null }, "missing");
+    const { error } = await refused({ stateSessionId: null, environment: UNREADABLE_PROFILE }, "missing");
 
     expect(error.message).toContain("session id");
     expect(error.message).not.toContain("launch command");
@@ -977,6 +1008,138 @@ describe("restartClaudeSession: the command never leaks", () => {
   });
 });
 
+describe("restartClaudeSession: sessions with no conversation yet", () => {
+  const lookupBeforeExit = (events: string[]): boolean => {
+    const lookup = events.indexOf("transcript");
+    return lookup !== -1 && lookup < events.indexOf("text:/exit");
+  };
+
+  it("given_a_transcript_for_the_session_id_when_restarting_then_it_resumes_with_a_fresh_fallback_and_is_not_reported_fresh", async () => {
+    const { h, result } = await succeeds();
+
+    expect(h.transcriptLookups).toEqual([`${PROFILE}|${CWD}|${STATE_ID}`]);
+    expect(h.envSets[0].value).toContain(`--resume '${STATE_ID}'`);
+    expect(h.envSets[0].value).toContain("__resume_started=");
+    expect(result.sessionId).toBe(STATE_ID);
+    expect(result).not.toHaveProperty("startedFresh");
+  });
+
+  it("given_no_transcript_for_the_session_id_when_restarting_then_the_check_runs_before_exit_and_the_relaunch_has_no_resume", async () => {
+    const { h, result } = await succeeds({ transcript: false });
+
+    expect(lookupBeforeExit(h.events)).toBe(true);
+    expect(h.envSets[0].value).not.toMatch(/--resume|--continue|--session-id| -c | -r /);
+    expect(h.envSets[0].value).not.toContain("__resume_started=");
+    expect(h.envSets[0].value).toContain("'-n' 'Auto-MI'");
+    expect(h.texts).toEqual(["/exit", LOADER_LINE]);
+    expect(result).toMatchObject({ ok: true, sessionId: null, startedFresh: "no-conversation" });
+  });
+
+  it("given_a_launch_command_that_already_has_resume_flags_and_no_transcript_then_all_of_them_are_dropped", async () => {
+    const { h } = await succeeds({ transcript: false, paneJobArgs: PS_ARGS.replace("--model", "--resume abcdef12-0000 --continue --model") });
+
+    expect(h.envSets[0].value).not.toMatch(/--resume|--continue/);
+  });
+
+  it("given_no_transcript_and_the_instance_builder_when_restarting_then_the_builder_gets_no_session_id", async () => {
+    const { h, result } = await succeeds({ transcript: false, paneJobArgs: "/bin/bash /Users/example/bin/claude-me --model x stray-prompt-word" });
+
+    expect(result.commandSource).toBe("instance");
+    expect(h.envSets[0].value).toContain("INSTANCE_BUILDER null");
+    expect(h.envSets[0].value).not.toContain(STATE_ID);
+  });
+
+  it("given_a_state_id_without_transcript_and_a_hint_with_another_id_then_the_hint_conversation_is_resumed", async () => {
+    const { h, result } = await succeeds({
+      transcript: (_dir, _cwd, sessionId) => sessionId !== STATE_ID,
+      exitScreen: exitWithHint(`claude-me --resume ${HINT_ID}`),
+    });
+
+    expect(h.envSets[0].value).toContain(`--resume '${HINT_ID}'`);
+    expect(result).toMatchObject({ sessionId: HINT_ID, replacedSessionId: STATE_ID });
+    expect(result).not.toHaveProperty("startedFresh");
+  });
+
+  it("given_no_transcript_found_but_a_hint_for_the_same_id_then_the_hint_proves_the_conversation_and_it_is_resumed", async () => {
+    const { h, result } = await succeeds({ transcript: false, exitScreen: exitWithHint(`claude-me --resume ${STATE_ID}`) });
+
+    expect(h.envSets[0].value).toContain(`--resume '${STATE_ID}'`);
+    expect(result.sessionId).toBe(STATE_ID);
+    expect(result).not.toHaveProperty("startedFresh");
+  });
+
+  it("given_only_a_hint_id_then_no_transcript_lookup_happens_and_the_hint_is_resumed", async () => {
+    const { h, result } = await succeeds({ stateSessionId: null, transcript: false, exitScreen: exitWithHint(`claude-me --resume ${HINT_ID}`) });
+
+    expect(h.transcriptLookups).toEqual([]);
+    expect(h.envSets[0].value).toContain(`--resume '${HINT_ID}'`);
+    expect(result.sessionId).toBe(HINT_ID);
+  });
+
+  it("given_no_id_at_all_and_a_readable_profile_then_it_relaunches_fresh_instead_of_leaving_the_shell", async () => {
+    const { h, result } = await succeeds({ stateSessionId: null });
+
+    expect(h.envSets[0].value).not.toContain("--resume");
+    expect(result).toMatchObject({ sessionId: null, startedFresh: "no-conversation" });
+  });
+
+  it("given_a_session_on_another_profile_then_the_transcript_is_looked_up_in_that_profile_dir", async () => {
+    const otherProfile = "/Users/example/.claude-other";
+    const { h } = await succeeds({ environment: { configDir: { kind: "set", dir: otherProfile }, hasInstanceId: true }, instance: { configDir: otherProfile } });
+
+    expect(h.transcriptLookups).toEqual([`${otherProfile}|${CWD}|${STATE_ID}`]);
+    expect(h.transcriptLookups.join("")).not.toContain(path.join(os.homedir(), ".claude"));
+  });
+
+  it("given_an_unset_profile_then_the_transcript_is_looked_up_in_the_default_profile_dir", async () => {
+    const { h } = await succeeds({ environment: { configDir: { kind: "unset" }, hasInstanceId: true } });
+
+    expect(h.transcriptLookups).toEqual([`${path.join(os.homedir(), ".claude")}|${CWD}|${STATE_ID}`]);
+  });
+
+  it("given_an_unreadable_profile_then_no_lookup_is_made_and_the_resume_with_its_fallback_is_attempted", async () => {
+    const { h, result } = await succeeds({ environment: UNREADABLE_PROFILE, transcript: false });
+
+    expect(h.transcriptLookups).toEqual([]);
+    expect(h.envSets[0].value).toContain(`--resume '${STATE_ID}'`);
+    expect(result).not.toHaveProperty("startedFresh");
+  });
+
+  it("given_a_pane_in_another_directory_then_the_fallback_wrapper_is_grouped_so_a_failed_cd_runs_nothing", async () => {
+    const { h } = await succeeds({ paneCwd: "/Users/example/elsewhere" });
+
+    expect(h.envSets[0].value.startsWith(`cd -- '${CWD}' && { `)).toBe(true);
+    expect(h.envSets[0].value.endsWith("; }")).toBe(true);
+  });
+
+  it("given_a_resume_that_dies_at_once_and_a_fresh_start_that_follows_then_one_loader_line_is_typed_and_a_warning_is_reported", async () => {
+    const { h, result } = await succeeds({ resumeFails: "fresh-follows" });
+
+    expect(h.texts).toEqual(["/exit", LOADER_LINE]);
+    expect(h.envSets).toHaveLength(1);
+    expect(result).toMatchObject({ ok: true, sessionId: STATE_ID, startedFresh: "resume-failed" });
+  });
+
+  it("given_a_resume_that_dies_and_nothing_following_then_it_fails_within_seconds_not_after_the_thirty_second_timeout", async () => {
+    const { h, error } = await refused({ resumeFails: "nothing-follows" }, "relaunch-failed");
+
+    expect(h.texts).toEqual(["/exit", LOADER_LINE]);
+    expect(h.clock() - (h.relaunchAt() ?? 0)).toBeLessThan(15_000);
+    expect(error.relaunchSent).toBeUndefined();
+  });
+
+  it("given_a_fresh_relaunch_that_dies_then_it_is_still_a_relaunch_failure", async () => {
+    await refused({ transcript: false, dieAfterMs: 2000 }, "relaunch-failed");
+  });
+
+  it("given_auto_mode_before_and_a_fresh_fallback_then_auto_mode_is_still_restored", async () => {
+    const { h, result } = await succeeds({ resumeFails: "fresh-follows", preMode: "auto" });
+
+    expect(result.autoMode).toBe("on");
+    expect(h.keys.length).toBeGreaterThan(0);
+  });
+});
+
 describe("handleRestartRequest and restartErrorStatus", () => {
   const instance = baseInstance();
   const okResult: RestartResult = { ok: true, sessionId: STATE_ID, versionBefore: null, versionAfter: null, autoMode: "not-applicable", commandSource: "process" };
@@ -1060,6 +1223,43 @@ describe("handleRestartRequest and restartErrorStatus", () => {
     finishFirst(okResult);
     expect((await first).status).toBe(200);
     expect(isRestartInProgress(SESSION)).toBe(false);
+  });
+
+  it("given_no_restart_running_then_waiting_for_restarts_to_finish_returns_at_once", async () => {
+    await expect(waitForRestartsToFinish(1000, 5)).resolves.toBe(true);
+  });
+
+  it("given_a_restart_running_when_the_server_is_told_to_stop_then_the_wait_ends_only_after_the_restart_finishes", async () => {
+    let finishRestart: (result: RestartResult) => void = () => undefined;
+    const restart = vi.fn(() => new Promise<RestartResult>((resolve) => (finishRestart = resolve)));
+    const { deps } = handlerDeps(restart);
+    const running = handleRestartRequest("abc123", deps);
+    await vi.waitFor(() => expect(restart).toHaveBeenCalledTimes(1));
+
+    let waitEnded = false;
+    const waiting = waitForRestartsToFinish(5000, 5).then((finished) => {
+      waitEnded = true;
+      return finished;
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    expect(waitEnded).toBe(false);
+
+    finishRestart(okResult);
+    await running;
+    await expect(waiting).resolves.toBe(true);
+  });
+
+  it("given_a_restart_that_never_finishes_then_the_wait_gives_up_at_its_limit", async () => {
+    let finishRestart: (result: RestartResult) => void = () => undefined;
+    const restart = vi.fn(() => new Promise<RestartResult>((resolve) => (finishRestart = resolve)));
+    const { deps } = handlerDeps(restart);
+    const running = handleRestartRequest("abc123", deps);
+    await vi.waitFor(() => expect(restart).toHaveBeenCalledTimes(1));
+
+    await expect(waitForRestartsToFinish(30, 5)).resolves.toBe(false);
+
+    finishRestart(okResult);
+    await running;
   });
 
   it("given_a_restart_that_throws_then_the_in_progress_flag_is_cleared", async () => {

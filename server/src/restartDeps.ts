@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { pickClaudeTranscript, readAgentArgs, readAgentConfigDir, readAgentCwd } from "./agentFallback";
+import { claudeTranscriptExists, pickClaudeTranscript, readAgentArgs, readAgentConfigDir, readAgentCwd } from "./agentFallback";
 import { parseAgentStateFile, probePaneAgent, readAgentStateFile } from "./agentState";
 import { buildLoaderInvocation } from "./launch";
 import { listSiblingSnapshots, ownedSessionIds, persistableSession, snapshotDirectory, type Snapshot } from "./liveStatus";
@@ -51,9 +51,10 @@ export function realRestartDeps(): RestartDeps {
       const agent = await probePaneAgent(instance, { bypassCache: true });
       return persistableSession(instance, snapshot, agent)?.sessionId ?? null;
     },
+    transcriptExists: claudeTranscriptExists,
     pickTranscript: pickClaudeTranscript,
     ownedSessionIds: async (instance) => ownedSessionIds(await listSiblingSnapshots(), instance.id, Date.now()),
-    buildInstanceCommand: buildProviderLaunchCommand,
+    buildInstanceCommand: (instance, sessionId) => buildProviderLaunchCommand(instance, sessionId ?? undefined),
     loaderInvocation: buildLoaderInvocation(),
     withPaneTypingLock: withSessionLock,
     sleep: (milliseconds) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)),

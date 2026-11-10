@@ -8,6 +8,15 @@ import { buildProviderLaunchCommand, PROVIDERS, quoteForShell } from "./provider
 // which may also exit non-zero) will have run well past it, so it never falls back.
 const RESUME_FAILURE_WINDOW_SECONDS = 3;
 
+// Runs the resume command and, when it fails within the window, the fresh one in its place.
+export function wrapWithFreshFallback(resumeCommand: string, freshCommand: string): string {
+  return (
+    `__resume_started=$(date +%s); ${resumeCommand}; __resume_code=$?; ` +
+    `if [ "$__resume_code" -ne 0 ] && [ "$(($(date +%s) - __resume_started))" -lt ${RESUME_FAILURE_WINDOW_SECONDS} ]; then ` +
+    `${freshCommand}; fi`
+  );
+}
+
 export function buildLaunchCommand(
   instance: InstanceRecord,
   options: { resumeSessionId?: string } = {}
@@ -17,12 +26,7 @@ export function buildLaunchCommand(
     return freshCommand;
   }
 
-  const resumeCommand: string = buildProviderLaunchCommand(instance, options.resumeSessionId);
-  return (
-    `__resume_started=$(date +%s); ${resumeCommand}; __resume_code=$?; ` +
-    `if [ "$__resume_code" -ne 0 ] && [ "$(($(date +%s) - __resume_started))" -lt ${RESUME_FAILURE_WINDOW_SECONDS} ]; then ` +
-    `${freshCommand}; fi`
-  );
+  return wrapWithFreshFallback(buildProviderLaunchCommand(instance, options.resumeSessionId), freshCommand);
 }
 
 // The name the real launch command travels under in the tmux session's environment - see

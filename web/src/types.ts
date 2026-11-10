@@ -161,7 +161,9 @@ export type AgentState = "waiting" | "working" | "idle";
 
 export interface RestartResult {
   ok: true;
-  sessionId: string;
+  // null when the session was started fresh.
+  sessionId: string | null;
+  startedFresh?: "no-conversation" | "resume-failed";
   hintSessionId?: string;
   replacedSessionId?: string;
   versionBefore: string | null;
