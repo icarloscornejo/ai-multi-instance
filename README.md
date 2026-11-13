@@ -1,124 +1,91 @@
-# AI Multi-Instance
+<h1 align="center">AI Multi-Instance</h1>
 
-**Version:** 1.13.3
+<p align="center"><b>All your agents. One tab.</b></p>
 
-Local dashboard for running Claude Code, Codex CLI, Cursor Agent, custom commands, and shell sessions in parallel. Every instance is a real tmux-backed terminal, so it survives browser and dashboard restarts. Works well from a phone browser too, with its own password-protected home, terminal, and settings screens.
+<p align="center">
+  Run Claude Code, Codex, Cursor and plain shells side by side, from your desk or your phone.
+</p>
 
-## Installation (clean machine)
+<p align="center">
+  <img alt="Version" src="https://img.shields.io/badge/version-2.0.1-0071e3">
+  <img alt="macOS" src="https://img.shields.io/badge/macOS-tmux-1d1d1f?logo=apple&logoColor=white">
+  <img alt="Node.js" src="https://img.shields.io/badge/Node.js-20.11%2B-5FA04E?logo=nodedotjs&logoColor=white">
+  <img alt="Agents" src="https://img.shields.io/badge/agents-Claude%20%7C%20Codex%20%7C%20Cursor-D97757">
+  <img alt="Local-first" src="https://img.shields.io/badge/local--first-runs%20on%20your%20Mac-1d1d1f">
+</p>
 
-The setup script installs dashboard dependencies and detects supported AI CLIs. It does not install or authenticate any provider; when Cursor Agent is present, it adds a local statusline wrapper so its live session metrics can appear in the dashboard.
+AI Multi-Instance is a local dashboard for running many AI coding agents at
+once. Every instance is a real terminal backed by tmux, so closing the browser,
+or even restarting the dashboard, never kills a session. Open it at
+`http://ai.local`, or from your phone, and pick up right where you left off.
+
+## Many agents, zero juggling.
+
+**Any agent, any folder.** Claude Code, Codex CLI, Cursor Agent, a custom
+command, or just a shell. Open as many instances as you want, even several in
+the same folder.
+
+**Sessions that don't die.** Every instance lives in tmux. Close the tab, close
+the browser, restart the dashboard: when you come back, each terminal
+reconnects with all its output intact.
+
+**See what each one is doing.** The sidebar shows the model, context, cost and
+rate limits of whatever agent is running in each pane right now, even one you
+started by hand.
+
+**Restart and resume.** Restart an instance and its agent picks up the same
+conversation: Claude by session ID, Codex by its session UUID, Cursor by chat
+ID.
+
+**From your phone, too.** On a phone the dashboard becomes its own app: instance
+cards, full-screen terminals, bottom sheets, and a row of helper keys above
+the keyboard that you can reorder.
+
+**Reach it from anywhere.** A Cloudflare tunnel gives you a public URL, behind
+a password, with no port forwarding. Quick and temporary, or on your own
+domain.
+
+## Get started
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/icarloscornejo/claude-multi-instance/main/setup.sh || curl -fsSL -H 'Accept: application/vnd.github.raw' https://api.github.com/repos/icarloscornejo/claude-multi-instance/contents/setup.sh || curl -fsSL https://cdn.jsdelivr.net/gh/icarloscornejo/claude-multi-instance@main/setup.sh)"
 ```
 
-The command tries sources in order: `raw.githubusercontent.com`, the GitHub API (different host, always fresh), and the jsDelivr mirror (CDN, may cache up to 12 hours). This survives the 429 rate-limit error typical on corporate networks with a shared IP.
+The script installs everything, sets the dashboard up as a service that starts
+at login, and ends with a checklist of anything left to do by hand. Then open
+<http://ai.local>.
 
-If the repo is already cloned, the one-liner is not needed: `bash ~/claude-multi-instance/setup.sh` does the same thing and self-updates.
+1. **Add your folders** in Settings: the places where terminals will open.
+2. **Press `+`** to create an instance: pick a folder, a name and an agent.
+3. **That's it.** Close the browser whenever you want; nothing stops.
 
-The script does not touch Claude Code authentication: the dashboard inherits the shell environment as-is (Vertex AI included). At the end it prints a checklist of what remains to be done manually.
-
-## Usage
-
-On macOS, `setup.sh` installs the dashboard as a launchd service (see [below](#the-dev-service-midev)): it starts at login, restarts itself, and runs the server plus the frontend build with hot reload. Nothing to start by hand; open <http://ai.local> (`http://localhost` also works). Existing installations may continue using <http://claude.local>.
-
-If you skipped the service (or want to run the dashboard in a terminal), stop it first because both use ports 3001/5173:
-
-```bash
-midev stop                    # only if the service is installed
-cd ~/claude-multi-instance
-npm run dev
-```
-
-1. **Initial setup** (once, or from the `Settings` button): add the folder paths where terminals will open. You can open multiple instances in the same folder at once; there is no per-folder limit.
-2. **New instance** (the `+` button): pick a location, name the instance, and choose Claude Code, Codex CLI, Cursor Agent, a custom command, or shell only. Provider-specific model and effort fields are shown only when supported.
-3. **Closing the browser does not kill anything**: sessions live in tmux. When you reopen the dashboard, each tab reconnects to its session with all output intact.
-4. **Delete an instance** (from the instance sidebar): closes the tmux session. The folder and its contents are untouched on disk.
-5. **Terminal zoom**: `A-` / `A+` buttons or `Cmd +` / `Cmd -` with focus inside the terminal. The size persists per instance.
-6. **Update** (button in the tab bar): fetches the latest version from GitHub and applies it (fast-forward + npm install) if there are no local changes in the folder. Server/web code changes hot-reload automatically (`tsx watch` and Vite); other changes (dependencies, config) need a restart (`midev`, or `npm run dev` again if you run it by hand). Sessions live in tmux so relaunching does not interrupt anything.
-
-If the server crashes, `data/server.log` (or `data/server-dev.log` under `npm run dev`) has a stack trace - it didn't before, and figuring out *why* the dashboard went down used to mean nothing to go on.
-
-### The dev service (`midev`)
-
-`scripts/dev-service.sh` runs `npm run dev:all` (server with `tsx watch` plus `vite build --watch`) as a launchd LaunchAgent that starts at login and restarts the whole thing when any part dies or hangs. `setup.sh` installs it and adds a `midev` function to your zsh config, so a new terminal has:
-
-```bash
-midev            # restart everything (also loads the job if it was stopped)
-midev stop       # stop it (it comes back at the next login, or with midev)
-midev log        # tail data/dev-service.log
-midev status     # job state and whether :3001 / :5173 answer
-midev uninstall  # remove it for good
-midev setup      # (re)install it; safe to rerun, this is the retry command the warnings print
-```
-
-Things worth knowing:
-
-- Opt out with `AI_MULTI_INSTANCE_SKIP_SERVICE=1 bash setup.sh` (pass it on every run, or `setup.sh` installs it again).
-- On a machine with no dashboard password the service still installs, and the setup checklist warns that the dashboard runs without one (Caddy exposes it on your LAN). If a password is configured, the service refuses to stay installed unless it can confirm that the login still requires it.
-- It also refuses to install if it would change the tmux socket dir (which kills live sessions) or run without a UTF-8 locale. If agent sessions work in `~/Desktop`, `~/Documents` or similar, macOS may block them under launchd until `/bin/bash` has Full Disk Access; `setup.sh` runs a probe and says so.
-- On a clean machine `setup.sh` adds `brew shellenv` to your `~/.zprofile` if needed, because launchd's login shell would otherwise not find `npm`.
-
-### The alternative supervised service
-
-`npm run service:install` is the older optional mode: a launchd service running plain `npm start` (no hot reload, no frontend watcher). It cannot coexist with the dev service (same ports, both start at login): `midev uninstall` first, and `npm run service:uninstall` before going back.
-
-```bash
-npm run service:install    # sets it up as a per-user launchd service and starts it
-npm run service:uninstall  # removes it
-npm run service:status     # is it running, and what's its PID
-npm run service:stop       # stop it (e.g. before npm run dev)
-npm run service:restart    # restart it (e.g. after a server/src/ update, which the service doesn't hot-reload)
-npm run service:start      # start it again
-npm run service:log        # tail data/server.log
-```
-
-## Mobile
-
-On a phone or narrow viewport the dashboard switches to a dedicated mobile shell instead of the desktop split view:
-
-- **Home screen**: instance cards instead of the desktop sidebar's status dots, tap a card to open its terminal full-screen.
-- **Terminal navigation**: full-screen per instance, with the phone's back gesture/button popping back to the home screen via browser history instead of closing the app.
-- **Sheets**: bottom sheets and action sheets replace desktop modals for instance settings and actions, plus a keyboard accessory bar with common terminal keys above the on-screen keyboard. Which keys show and their order are configurable per device from Settings > Helper keys (drag to reorder, toggle to show/hide, at least one stays enabled).
-- **Theme**: Light/Dark/System preference, applied live.
-- **Password gate**: when a password is set (see Remote access below), a lock screen guards both the API and the WebSocket connection before any instance data loads.
-
-## Remote access (tunnel)
-
-A way to reach the dashboard beyond `http://ai.local` on the same machine. Both modes serve the same frontend Express publishes to `web/dist` (Caddy proxies straight to the server, there is no Vite in this path), and both are only useful with the password gate on: set a password first (stored hashed with scrypt in `data/auth-password.json`, or via the `DASHBOARD_PASSWORD` env var) so the public URL isn't wide open.
-
-- **Quick Tunnel** (default, zero-config): start a `cloudflared tunnel --url` from the dashboard's Setup screen to get a temporary public `*.trycloudflare.com` URL, no port forwarding, account, or domain needed. The URL changes every time the tunnel restarts, and it rides a single edge connection. It points at Caddy, requires Caddy to be running, and fails with an actionable error if it isn't.
-- **Named Tunnel** (opt-in, needs a Cloudflare-managed domain): a stable hostname on a domain you own, up to four HA edge connections, and a connector that runs as its own launchd service so it survives restarts of the Node process and the machine. The hostname convention this project uses is `<machine>-mi.<your-domain>` (one label under the apex, so free Universal SSL covers it), e.g. `protom4-mi.example.com`. Setup is one command:
-
-  ```
-  cloudflared login                                          # once per machine, if you haven't
-  bash scripts/setup-named-tunnel.sh protom4-mi.example.com  # tunnel + DNS + config + installs the connector
-  ```
-
-  That creates the tunnel and DNS route, writes the config under `data/named-tunnel/`, then installs and starts the connector service. The dashboard switches to named mode with no restart, and its Setup screen shows Start/Stop for the named tunnel (still ai.local only). `npm run tunnel:stop` keeps it down across reboot; `npm run tunnel:log` / `tunnel:status` for diagnostics. To leave named mode, `npm run tunnel:uninstall` and delete `data/named-tunnel/tunnel.json`. Pass `--no-install` to `setup-named-tunnel.sh` to write the config only. The named tunnel points cloudflared straight at the server (`127.0.0.1:3001`), bypassing Caddy, and its config never lands at `~/.cloudflared/config.yml` (which would break the Quick Tunnel).
-
-## How it works
-
-- **Backend** (`server/`): Node + Express + ws. Each instance is a tmux session (`ccdash-<id>`) created in its location folder. The browser attaches via WebSocket: the server spawns a pty running `tmux attach-session` and bridges the two. Detach on tab close, session stays alive.
-- **Frontend** (`web/`): React + Vite + xterm.js + Tailwind, dev server on port 5173. `setup.sh` adds `ai.local` to `/etc/hosts` and configures [Caddy](https://caddyserver.com) to proxy port 80 to the dashboard server (port 3001), which serves the built frontend from `web/dist`.
-- **State** (`data/instances.json`): instance registry and config, persists across restarts.
-- **Providers**: a small adapter layer builds valid launch and resume commands for each CLI. Custom commands are executed exactly as entered.
-- **Resume**: Claude uses its session ID, Codex captures the UUID from local session metadata, and Cursor creates and stores a chat ID before launch.
-- **Live data**: Claude exposes context, cost, and limits; Codex exposes context and rate limits from its local events; Cursor exposes its native statusline data (model, session, context percentage/window, input/output tokens, branch, and Git changes). Cursor account limits and billing data are not collected. Custom commands show only stable data they make available.
-- **Following the session in the pane**: the sidebar shows whatever agent runs in the instance's pane right now, not only the one the dashboard launched. Every pane gets `server/scripts/shims` first on `PATH`, so a `claude`, `claude-me` or `codex` you start by hand reports to the dashboard like a dashboard launch does. The server tells which agent is in the foreground from the pane's process tree (`server/src/paneAgent.ts`) and only trusts a snapshot written by that same process. If an agent never reported (started around the shims, or by an instance that was already open before this existed), the sidebar reads its model and context from its own transcript or rollout, and labels it as such. With nothing running it says so instead of showing the last session. Rate limits are the account's, so instances of the same Claude profile share the freshest reading; stale values are dimmed and a window that already reset is hidden. Instances opened before this was deployed pick up the shims the next time they are relaunched.
-- **Cursor status line**: setup configures a small local wrapper in `~/.cursor/cli-config.json` so the dashboard can receive Cursor's live structured statusline payload. If you already configured a custom Cursor statusline, its command is preserved in `~/.cursor/ai-multi-instance-statusline.json` and continues to render normally.
-- **Authentication**: none by default for the CLIs themselves, tmux starts your login shell so each one inherits its normal credentials and environment. The dashboard's own password gate (`server/src/auth.ts`) is opt-in: it activates once a password is set (UI or `DASHBOARD_PASSWORD`), and protects both the HTTP API and the WebSocket upgrade with a signed cookie.
-- **Quick Tunnel** (`server/src/tunnel.ts`): manages the `cloudflared` child process, parses the assigned `*.trycloudflare.com` URL from its stderr log, and exposes start/stop and status to the Setup screen. It points cloudflared at Caddy (`http://localhost:80` with an `ai.local` host header), the same upstream `ai.local` uses.
-- **Named Tunnel** (`server/src/namedTunnel.ts`): active when `data/named-tunnel/tunnel.json` exists. cloudflared runs as a launchd LaunchAgent (`com.ai-multi-instance.tunnel`), not a child of the server; a sentinel file (`data/named-tunnel/enabled`) watched by the plist's `KeepAlive.PathState` expresses start/stop intent, and status is read from cloudflared's local `/ready` endpoint plus an end-to-end check of the public URL. Because the connector outlives the server, the named-tunnel path also fails closed: if the password ever disappears while the connector is up, requests to the public hostname are refused (`server/src/requestHost.ts`), the auth cookie is issued `Secure` on that host, and the tunnel controls themselves are locked to local/LAN callers server-side.
+To restart it, type `midev`. To update, press Update in the tab bar.
 
 ## Requirements
 
-macOS with tmux, jq, node 20.11+, and Caddy. At least one AI CLI is optional; shell-only and custom-command instances work without one. `cloudflared` (for the remote tunnel) is optional, install it only if you want that feature.
+macOS with tmux, jq, Node 20.11+ and Caddy. AI CLIs are optional: shell and
+custom-command instances work without one. Install and sign in to each agent
+you want to use with its own instructions first:
 
-Supported executable defaults:
+| Agent | Command |
+|---|---|
+| Claude Code | `claude` |
+| Codex CLI | `codex` |
+| Cursor Agent | `agent` |
 
-- Claude Code: `claude`
-- Codex CLI: `codex`
-- Cursor Agent: `agent`
+`cloudflared` is only needed for remote access.
 
-Install and authenticate those tools using their official instructions before selecting the corresponding provider.
+## Your machine, your sessions.
+
+Everything runs on your Mac. Each agent uses its own login, unchanged. The
+dashboard password is optional on your desk; set one before you turn on
+remote access. It is stored hashed, it guards both the page and the live
+terminal connection, and the named tunnel refuses public requests if the
+password ever goes away.
+
+## Learn more
+
+- [Services and remote access](docs/services-and-remote.md): the `midev`
+  service, running it by hand, updates, Quick and Named tunnels.
+- [How it works](docs/how-it-works.md): tmux bridge, providers, resume, live
+  data, the password gate and the tunnels inside.
