@@ -62,7 +62,7 @@ async function renderOriginalStatusline(input, payload) {
   }
 
   const model = stringAt(payload, ["model", "display_name"]) ?? stringAt(payload, ["model", "displayName"]) ?? "Cursor";
-  const contextPct = contextPercentage(payload);
+  const { pct: contextPct } = await effectiveContext(payload);
   process.stdout.write(contextPct === undefined ? model : `${model} · ${Math.round(contextPct)}% context`);
 }
 
@@ -110,15 +110,15 @@ async function writeSnapshot(payload, { instanceId, idSource, paneJobPid }) {
       ? previous
       : {};
   const cwd = stringAt(payload, ["workspace", "current_dir"]) ?? stringAt(payload, ["cwd"]);
-  const contextSize = numberAt(payload, ["context_window", "context_window_size"]);
-  const contextPct = contextPercentage(payload);
+  const { size: contextSize, pct: contextPct, modelSize } = await effectiveContext(payload);
+  const rawContextPct = contextPercentage(payload);
   const inputTokens =
     numberAt(payload, ["context_window", "total_input_tokens"]) ??
     numberAt(payload, ["context_window", "current_usage", "input_tokens"]);
   const outputTokens = numberAt(payload, ["context_window", "total_output_tokens"]);
   const contextUsed =
     numberAt(payload, ["context_window", "used_tokens"]) ??
-    (contextSize !== undefined && contextPct !== undefined ? Math.round((contextSize * contextPct) / 100) : undefined);
+    (modelSize !== undefined && rawContextPct !== undefined ? Math.round((modelSize * rawContextPct) / 100) : undefined);
   const model =
     stringAt(payload, ["model", "display_name"]) ??
     stringAt(payload, ["model", "displayName"]) ??
@@ -177,6 +177,47 @@ async function gitStatus(cwd) {
   } catch {
     return {};
   }
+}
+
+// Compaction fires at autoCompactWindow, so a smaller cap replaces the model window as the
+// denominator. With no applicable cap the values are exactly what the payload reports.
+// Memoized so the settings files are read at most once per run, and not at all when a custom
+// status line already rendered.
+// The cache lives on the function, not in a module-level let: the top-level await above runs
+// before this part of the module is evaluated, and a let would still be in its dead zone.
+function effectiveContext(payload) {
+  effectiveContext.cached ??= computeEffectiveContext(payload);
+  return effectiveContext.cached;
+}
+
+async function computeEffectiveContext(payload) {
+  const modelSize = numberAt(payload, ["context_window", "context_window_size"]);
+  const rawPct = contextPercentage(payload);
+  if (modelSize === undefined || modelSize <= 0) return { size: modelSize, pct: rawPct, modelSize };
+  const cap = await readAutoCompactWindow(payload);
+  if (cap === undefined || cap >= modelSize) return { size: modelSize, pct: rawPct, modelSize };
+  return { size: cap, pct: rawPct === undefined ? undefined : (rawPct * modelSize) / cap, modelSize };
+}
+
+// Claude Code's precedence: local over project over user, first valid file wins. A missing,
+// malformed or unusable file is skipped. Project settings are only searched at the payload
+// cwd, so a session that cd'd into a subfolder falls back to the model window.
+async function readAutoCompactWindow(payload) {
+  const cwd = stringAt(payload, ["workspace", "current_dir"]) ?? stringAt(payload, ["cwd"]);
+  const configDir = process.env.CLAUDE_CONFIG_DIR?.trim() || path.join(os.homedir(), ".claude");
+  const candidates = [
+    ...(cwd ? [path.join(cwd, ".claude", "settings.local.json"), path.join(cwd, ".claude", "settings.json")] : []),
+    path.join(configDir, "settings.json"),
+  ];
+  for (const candidate of candidates) {
+    try {
+      const value = JSON.parse(await fs.readFile(candidate, "utf8"))?.autoCompactWindow;
+      if (typeof value === "number" && Number.isFinite(value) && value >= 1) return Math.floor(value);
+    } catch {
+      // Missing, unreadable or invalid settings must never break the status line.
+    }
+  }
+  return undefined;
 }
 
 function contextPercentage(payload) {

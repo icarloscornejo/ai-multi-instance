@@ -45,6 +45,19 @@ ai_resolve_pane_identity || exit 0
 
 size=$(echo "$input" | jq -r '.context_window.context_window_size // 200000')
 [ "$size" -eq 0 ] 2>/dev/null && size=200000
+
+# Compaction fires at autoCompactWindow, so that cap is the real window. Same precedence as
+# Claude Code (local over project over user); a file that is missing, malformed or holds no
+# usable number is skipped. Only the payload cwd is searched for project settings.
+for cap_file in "$cwd/.claude/settings.local.json" "$cwd/.claude/settings.json" "$settings_path"; do
+  [ -f "$cap_file" ] || continue
+  cap=$(jq -s 'if length == 1 then .[0] else empty end
+    | if type == "object" and (.autoCompactWindow | type) == "number" and .autoCompactWindow >= 1
+      then (.autoCompactWindow | floor) else empty end' "$cap_file" 2>/dev/null) || cap=""
+  [[ "$cap" =~ ^[0-9]+$ ]] || continue
+  [ "$cap" -lt "$size" ] 2>/dev/null && size=$cap
+  break
+done
 input_tokens=$(echo "$input" | jq -r '.context_window.current_usage.input_tokens // 0')
 cache_create=$(echo "$input" | jq -r '.context_window.current_usage.cache_creation_input_tokens // 0')
 cache_read=$(echo "$input" | jq -r '.context_window.current_usage.cache_read_input_tokens // 0')
